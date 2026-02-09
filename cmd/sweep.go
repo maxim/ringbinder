@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 
@@ -53,6 +54,9 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	defer database.Close()
 
 	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s := scanner.NewScanner()
 	results := make(chan scanner.FileInfo, 100)
 
@@ -101,18 +105,29 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		} else if existing.Deleted {
 			// Was soft-deleted, now reappeared
 			checksumChanged := existing.Checksum != cs
-			if err := database.RestoreDocument(existing.ID, cs, fi.ModTime, pageCount, checksumChanged); err != nil {
+			mtimeChanged := !existing.ModifiedAt.Equal(fi.ModTime)
+			ocrPending := existing.OCRPending || (checksumChanged && mtimeChanged)
+			if err := database.RestoreDocument(existing.ID, cs, fi.ModTime, pageCount, ocrPending); err != nil {
 				return fmt.Errorf("restore document: %w", err)
 			}
 			restoredCount++
-		} else if existing.Checksum != cs {
-			// Content changed (checksum differs)
-			if err := database.UpdateDocument(existing.ID, cs, fi.ModTime, pageCount); err != nil {
-				return fmt.Errorf("update document: %w", err)
-			}
-			updatedCount++
 		} else {
-			unchangedCount++
+			checksumChanged := existing.Checksum != cs
+			mtimeChanged := !existing.ModifiedAt.Equal(fi.ModTime)
+			ocrPending := existing.OCRPending || (checksumChanged && mtimeChanged)
+
+			if checksumChanged || mtimeChanged {
+				if err := database.UpdateDocument(existing.ID, cs, fi.ModTime, pageCount, ocrPending); err != nil {
+					return fmt.Errorf("update document: %w", err)
+				}
+				if checksumChanged {
+					updatedCount++
+				} else {
+					unchangedCount++
+				}
+			} else {
+				unchangedCount++
+			}
 		}
 	}
 

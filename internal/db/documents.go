@@ -75,23 +75,27 @@ func (db *DB) InsertDocument(path, checksum string, createdAt, modifiedAt time.T
 	return res.LastInsertId()
 }
 
-func (db *DB) UpdateDocument(id int64, checksum string, modifiedAt time.Time, pageCount int) error {
+func (db *DB) UpdateDocument(id int64, checksum string, modifiedAt time.Time, pageCount int, ocrPending bool) error {
+	ocrPendingInt := 0
+	if ocrPending {
+		ocrPendingInt = 1
+	}
 	_, err := db.Exec(
-		`UPDATE documents SET checksum = ?, modified_at = ?, page_count = ?, ocr_pending = 1
+		`UPDATE documents SET checksum = ?, modified_at = ?, page_count = ?, ocr_pending = ?
 		 WHERE id = ?`,
-		checksum, modifiedAt.Format(time.RFC3339Nano), pageCount, id)
+		checksum, modifiedAt.Format(time.RFC3339Nano), pageCount, ocrPendingInt, id)
 	return err
 }
 
-func (db *DB) RestoreDocument(id int64, checksum string, modifiedAt time.Time, pageCount int, checksumChanged bool) error {
-	ocrPending := 0
-	if checksumChanged {
-		ocrPending = 1
+func (db *DB) RestoreDocument(id int64, checksum string, modifiedAt time.Time, pageCount int, ocrPending bool) error {
+	ocrPendingInt := 0
+	if ocrPending {
+		ocrPendingInt = 1
 	}
 	_, err := db.Exec(
 		`UPDATE documents SET checksum = ?, modified_at = ?, page_count = ?, ocr_pending = ?, deleted = 0
 		 WHERE id = ?`,
-		checksum, modifiedAt.Format(time.RFC3339Nano), pageCount, ocrPending, id)
+		checksum, modifiedAt.Format(time.RFC3339Nano), pageCount, ocrPendingInt, id)
 	return err
 }
 

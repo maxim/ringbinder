@@ -76,6 +76,36 @@ func TestSearch_MultiWordMatchesNonContiguous(t *testing.T) {
 	}
 }
 
+func TestSearch_ReturnsPageCount(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	docID, err := database.InsertDocument("/docs/multi.pdf", "checksum", now, now, 7)
+	if err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+	if err := database.UpsertPage(docID, 3, "searchable content", nil); err != nil {
+		t.Fatalf("UpsertPage() error = %v", err)
+	}
+
+	results, err := database.Search("searchable")
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Search() returned %d rows, want 1", len(results))
+	}
+	if results[0].PageCount != 7 {
+		t.Fatalf("result page_count = %d, want 7", results[0].PageCount)
+	}
+}
+
 func TestReplaceDocumentPages_Atomic(t *testing.T) {
 	t.Parallel()
 

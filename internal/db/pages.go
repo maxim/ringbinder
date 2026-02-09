@@ -22,6 +22,7 @@ type PageInput struct {
 type SearchResult struct {
 	Path      string
 	PageIndex int
+	PageCount int
 	Snippet   string
 }
 
@@ -84,7 +85,7 @@ func (db *DB) ReplaceDocumentPages(documentID int64, pages []PageInput) (err err
 func (db *DB) Search(query string) ([]SearchResult, error) {
 	ftsQuery := buildFTSQuery(query)
 	rows, err := db.Query(
-		`SELECT d.path, p.page_index,
+		`SELECT d.path, p.page_index, d.page_count,
 		        snippet(pages_fts, 0, '>>>', '<<<', '...', 48) as snippet
 		 FROM pages_fts
 		 JOIN pages p ON p.id = pages_fts.rowid
@@ -101,7 +102,7 @@ func (db *DB) Search(query string) ([]SearchResult, error) {
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		if err := rows.Scan(&r.Path, &r.PageIndex, &r.Snippet); err != nil {
+		if err := rows.Scan(&r.Path, &r.PageIndex, &r.PageCount, &r.Snippet); err != nil {
 			return nil, err
 		}
 		results = append(results, r)

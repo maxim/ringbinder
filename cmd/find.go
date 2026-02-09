@@ -2,14 +2,20 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
+	"github.com/maxim/ringbinder/internal/format"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
+var findVerbose bool
+
 func init() {
+	findCmd.Flags().BoolVarP(&findVerbose, "verbose", "v", false, "Show text snippets")
 	rootCmd.AddCommand(findCmd)
 }
 
@@ -40,10 +46,7 @@ func runFind(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	for _, r := range results {
-		fmt.Printf("%s (page %d)\n  %s\n\n", r.Path, r.PageIndex+1, r.Snippet)
-	}
-
-	fmt.Printf("%d result(s) found.\n", len(results))
+	color := isatty.IsTerminal(os.Stdout.Fd())
+	fmt.Print(format.FormatFindResults(results, findVerbose, color))
 	return nil
 }

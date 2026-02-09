@@ -3,6 +3,8 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -79,7 +81,7 @@ func (db *DB) RestoreDocument(id int64, checksum string, modifiedAt time.Time, p
 	return err
 }
 
-func (db *DB) SoftDeleteMissing(seenPaths map[string]bool) (int, error) {
+func (db *DB) SoftDeleteMissing(seenPaths map[string]bool, roots []string) (int, error) {
 	rows, err := db.Query("SELECT id, path FROM documents WHERE deleted = 0")
 	if err != nil {
 		return 0, err
@@ -92,6 +94,9 @@ func (db *DB) SoftDeleteMissing(seenPaths map[string]bool) (int, error) {
 		var path string
 		if err := rows.Scan(&id, &path); err != nil {
 			return 0, err
+		}
+		if !pathWithinRoots(path, roots) {
+			continue
 		}
 		if !seenPaths[path] {
 			toDelete = append(toDelete, id)
@@ -108,6 +113,29 @@ func (db *DB) SoftDeleteMissing(seenPaths map[string]bool) (int, error) {
 	}
 
 	return len(toDelete), nil
+}
+
+func pathWithinRoots(path string, roots []string) bool {
+	if len(roots) == 0 {
+		return true
+	}
+
+	cleanPath := filepath.Clean(path)
+	for _, root := range roots {
+		cleanRoot := filepath.Clean(root)
+		if cleanPath == cleanRoot {
+			return true
+		}
+		rootWithSep := cleanRoot
+		if !strings.HasSuffix(rootWithSep, string(filepath.Separator)) {
+			rootWithSep += string(filepath.Separator)
+		}
+		if strings.HasPrefix(cleanPath, rootWithSep) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (db *DB) PendingDocuments() ([]Document, error) {

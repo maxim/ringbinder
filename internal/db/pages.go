@@ -13,6 +13,12 @@ type PageRecord struct {
 	Annotations json.RawMessage
 }
 
+type PageInput struct {
+	PageIndex   int
+	Markdown    string
+	Annotations json.RawMessage
+}
+
 type SearchResult struct {
 	Path      string
 	PageIndex int
@@ -35,9 +41,48 @@ func (db *DB) DeletePagesForDocument(documentID int64) error {
 	return err
 }
 
+func (db *DB) ReplaceDocumentPages(documentID int64, pages []PageInput) (err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, page := range pages {
+		if _, err = tx.Exec(
+			`INSERT INTO pages (document_id, page_index, markdown, annotations)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(document_id, page_index) DO UPDATE SET
+			   markdown = excluded.markdown,
+			   annotations = excluded.annotations`,
+			documentID, page.PageIndex, page.Markdown, string(page.Annotations)); err != nil {
+			return err
+		}
+	}
+
+	if _, err = tx.Exec(
+		"DELETE FROM pages WHERE document_id = ? AND page_index >= ?",
+		documentID, len(pages)); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec("UPDATE documents SET ocr_pending = 0 WHERE id = ?", documentID); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (db *DB) Search(query string) ([]SearchResult, error) {
-	// Quote query as a plain-text phrase to avoid FTS5 syntax errors on punctuation
-	quoted := `"` + strings.ReplaceAll(query, `"`, `""`) + `"`
+	ftsQuery := buildFTSQuery(query)
 	rows, err := db.Query(
 		`SELECT d.path, p.page_index,
 		        snippet(pages_fts, 0, '>>>', '<<<', '...', 48) as snippet
@@ -47,7 +92,7 @@ func (db *DB) Search(query string) ([]SearchResult, error) {
 		 WHERE pages_fts MATCH ?
 		   AND d.deleted = 0
 		 ORDER BY bm25(pages_fts)
-		 LIMIT 50`, quoted)
+		 LIMIT 50`, ftsQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -65,4 +110,18 @@ func (db *DB) Search(query string) ([]SearchResult, error) {
 		return nil, err
 	}
 	return results, nil
+}
+
+func buildFTSQuery(query string) string {
+	tokens := strings.Fields(query)
+	if len(tokens) == 0 {
+		return `""`
+	}
+
+	quoted := make([]string, len(tokens))
+	for i, token := range tokens {
+		quoted[i] = `"` + strings.ReplaceAll(token, `"`, `""`) + `"`
+	}
+
+	return strings.Join(quoted, " AND ")
 }

@@ -37,8 +37,7 @@ func runCost(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	client := ocr.NewMistralClient("")
-	price := client.PricePerPage()
+	price := ocr.MistralPricePerPage()
 	cost := float64(totalPages) * price
 
 	fmt.Printf("Pending OCR: %d documents, %d pages\n", docCount, totalPages)

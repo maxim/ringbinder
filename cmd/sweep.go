@@ -121,7 +121,7 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	}
 
 	// Soft-delete files no longer present
-	deletedCount, err := database.SoftDeleteMissing(seenPaths)
+	deletedCount, err := database.SoftDeleteMissing(seenPaths, paths)
 	if err != nil {
 		return fmt.Errorf("soft delete: %w", err)
 	}

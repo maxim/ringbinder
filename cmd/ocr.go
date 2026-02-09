@@ -67,19 +67,17 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider) err
 			continue
 		}
 
-		// Clear old pages before inserting new ones
-		if err := database.DeletePagesForDocument(doc.ID); err != nil {
-			return fmt.Errorf("delete old pages: %w", err)
-		}
-
-		for _, page := range pages {
-			if err := database.UpsertPage(doc.ID, page.PageIndex, page.Markdown, page.Annotations); err != nil {
-				return fmt.Errorf("upsert page: %w", err)
+		pageInputs := make([]db.PageInput, len(pages))
+		for j, page := range pages {
+			pageInputs[j] = db.PageInput{
+				PageIndex:   page.PageIndex,
+				Markdown:    page.Markdown,
+				Annotations: page.Annotations,
 			}
 		}
 
-		if err := database.MarkOCRDone(doc.ID); err != nil {
-			return fmt.Errorf("mark OCR done: %w", err)
+		if err := database.ReplaceDocumentPages(doc.ID, pageInputs); err != nil {
+			return fmt.Errorf("replace document pages: %w", err)
 		}
 
 		totalPages += len(pages)

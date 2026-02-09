@@ -129,6 +129,17 @@ func (db *DB) SoftDeleteMissing(seenPaths map[string]bool, roots []string) (int,
 	return len(toDelete), nil
 }
 
+func (db *DB) ResetAllDocuments() (int, error) {
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM documents").Scan(&count); err != nil {
+		return 0, err
+	}
+	if _, err := db.Exec("DELETE FROM documents"); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func pathWithinRoots(path string, roots []string) bool {
 	if len(roots) == 0 {
 		return true

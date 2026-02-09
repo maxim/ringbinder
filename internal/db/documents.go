@@ -19,34 +19,48 @@ type Document struct {
 	Deleted    bool
 }
 
+type documentScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanDocument(scanner documentScanner) (Document, error) {
+	var doc Document
+	var createdAt, modifiedAt string
+	var ocrPending, deleted int
+
+	if err := scanner.Scan(&doc.ID, &doc.Path, &doc.Checksum, &createdAt, &modifiedAt,
+		&doc.PageCount, &ocrPending, &deleted); err != nil {
+		return Document{}, err
+	}
+
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return Document{}, fmt.Errorf("parse created_at %q: %w", createdAt, err)
+	}
+	modified, err := time.Parse(time.RFC3339Nano, modifiedAt)
+	if err != nil {
+		return Document{}, fmt.Errorf("parse modified_at %q: %w", modifiedAt, err)
+	}
+
+	doc.CreatedAt = created
+	doc.ModifiedAt = modified
+	doc.OCRPending = ocrPending == 1
+	doc.Deleted = deleted == 1
+	return doc, nil
+}
+
 func (db *DB) GetDocumentByPath(path string) (*Document, error) {
 	row := db.QueryRow(
 		`SELECT id, path, checksum, created_at, modified_at, page_count, ocr_pending, deleted
 		 FROM documents WHERE path = ?`, path)
 
-	var doc Document
-	var createdAt, modifiedAt string
-	var ocrPending, deleted int
-
-	err := row.Scan(&doc.ID, &doc.Path, &doc.Checksum, &createdAt, &modifiedAt,
-		&doc.PageCount, &ocrPending, &deleted)
+	doc, err := scanDocument(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-
-	doc.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
-	if err != nil {
-		return nil, fmt.Errorf("parse created_at %q: %w", createdAt, err)
-	}
-	doc.ModifiedAt, err = time.Parse(time.RFC3339Nano, modifiedAt)
-	if err != nil {
-		return nil, fmt.Errorf("parse modified_at %q: %w", modifiedAt, err)
-	}
-	doc.OCRPending = ocrPending == 1
-	doc.Deleted = deleted == 1
 	return &doc, nil
 }
 
@@ -139,9 +153,19 @@ func pathWithinRoots(path string, roots []string) bool {
 }
 
 func (db *DB) PendingDocuments() ([]Document, error) {
-	rows, err := db.Query(
+	return db.queryDocuments(
 		`SELECT id, path, checksum, created_at, modified_at, page_count, ocr_pending, deleted
 		 FROM documents WHERE ocr_pending = 1 AND deleted = 0 ORDER BY id`)
+}
+
+func (db *DB) AllDocuments() ([]Document, error) {
+	return db.queryDocuments(
+		`SELECT id, path, checksum, created_at, modified_at, page_count, ocr_pending, deleted
+		 FROM documents WHERE deleted = 0 ORDER BY id`)
+}
+
+func (db *DB) queryDocuments(query string, args ...any) ([]Document, error) {
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -149,29 +173,23 @@ func (db *DB) PendingDocuments() ([]Document, error) {
 
 	var docs []Document
 	for rows.Next() {
-		var doc Document
-		var createdAt, modifiedAt string
-		var ocrPending, deleted int
-		if err := rows.Scan(&doc.ID, &doc.Path, &doc.Checksum, &createdAt, &modifiedAt,
-			&doc.PageCount, &ocrPending, &deleted); err != nil {
+		doc, err := scanDocument(rows)
+		if err != nil {
 			return nil, err
 		}
-		doc.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse created_at %q: %w", createdAt, err)
-		}
-		doc.ModifiedAt, err = time.Parse(time.RFC3339Nano, modifiedAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse modified_at %q: %w", modifiedAt, err)
-		}
-		doc.OCRPending = ocrPending == 1
-		doc.Deleted = deleted == 1
 		docs = append(docs, doc)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return docs, nil
+}
+
+func (db *DB) AllStats() (docCount int, totalPages int, err error) {
+	err = db.QueryRow(
+		`SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(page_count), 0)
+		 FROM documents WHERE deleted = 0`).Scan(&docCount, &totalPages)
+	return
 }
 
 func (db *DB) MarkOCRDone(id int64) error {

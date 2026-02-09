@@ -105,6 +105,68 @@ func TestSearch_ReturnsPageCount(t *testing.T) {
 	}
 }
 
+func TestSearch_MatchesFilename(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	path := "/Users/max/Documents/report.pdf"
+	docID, err := database.InsertDocument(path, "checksum", now, now, 1)
+	if err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+	if err := database.UpsertPage(docID, 0, BuildPageMarkdown(path, 0, "page body")); err != nil {
+		t.Fatalf("UpsertPage() error = %v", err)
+	}
+
+	results, err := database.Search("report.pdf")
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Search() returned %d rows, want 1", len(results))
+	}
+	if results[0].Path != path {
+		t.Fatalf("result path = %q, want %q", results[0].Path, path)
+	}
+}
+
+func TestSearch_MatchesPath(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	path := "/Users/max/Documents/invoices/report.pdf"
+	docID, err := database.InsertDocument(path, "checksum", now, now, 1)
+	if err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+	if err := database.UpsertPage(docID, 0, BuildPageMarkdown(path, 0, "page body")); err != nil {
+		t.Fatalf("UpsertPage() error = %v", err)
+	}
+
+	results, err := database.Search("invoices")
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Search() returned %d rows, want 1", len(results))
+	}
+	if results[0].Path != path {
+		t.Fatalf("result path = %q, want %q", results[0].Path, path)
+	}
+}
+
 func TestReplaceDocumentPages_Atomic(t *testing.T) {
 	t.Parallel()
 

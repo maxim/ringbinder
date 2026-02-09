@@ -1,6 +1,6 @@
 package db
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS documents (

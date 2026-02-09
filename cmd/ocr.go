@@ -88,7 +88,7 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		for j, page := range pages {
 			pageInputs[j] = db.PageInput{
 				PageIndex: page.PageIndex,
-				Markdown:  page.Markdown,
+				Markdown:  db.BuildPageMarkdown(doc.Path, page.PageIndex, page.Markdown),
 			}
 		}
 

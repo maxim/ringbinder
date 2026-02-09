@@ -50,20 +50,83 @@ func (db *DB) migrate() error {
 		return nil
 	}
 
-	if ver < schemaVersion {
+	for ver < schemaVersion {
 		switch ver {
 		case 1:
 			if _, err := db.Exec("ALTER TABLE pages DROP COLUMN annotations"); err != nil {
 				return fmt.Errorf("migrate 1->2: %w", err)
 			}
+			ver = 2
+		case 2:
+			if err := db.migrateV2ToV3(); err != nil {
+				return fmt.Errorf("migrate 2->3: %w", err)
+			}
+			ver = 3
 		default:
 			return fmt.Errorf("unsupported schema version: %d", ver)
 		}
 
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", ver)); err != nil {
+			return fmt.Errorf("set schema version %d: %w", ver, err)
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) migrateV2ToV3() (err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	type pageRow struct {
+		id        int64
+		path      string
+		pageIndex int
+		markdown  string
+	}
+
+	rows, err := tx.Query(
+		`SELECT p.id, d.path, p.page_index, p.markdown
+		 FROM pages p
+		 JOIN documents d ON d.id = p.document_id`,
+	)
+	if err != nil {
+		return err
+	}
+
+	var allPages []pageRow
+	for rows.Next() {
+		var page pageRow
+		if err := rows.Scan(&page.id, &page.path, &page.pageIndex, &page.markdown); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		allPages = append(allPages, page)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, page := range allPages {
+		markdown := BuildPageMarkdown(page.path, page.pageIndex, page.markdown)
+		if _, err := tx.Exec("UPDATE pages SET markdown = ? WHERE id = ?", markdown, page.id); err != nil {
 			return err
 		}
 	}
 
+	if err = tx.Commit(); err != nil {
+		return err
+	}
 	return nil
 }

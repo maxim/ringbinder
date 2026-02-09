@@ -28,6 +28,7 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 	}
 
 	cmd := &cobra.Command{}
+	cmd.Flags().Bool("redo", false, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
 	}
@@ -156,6 +157,7 @@ func TestSweep_DoesNotClearExistingPendingOnTouch(t *testing.T) {
 	}
 
 	cmd := &cobra.Command{}
+	cmd.Flags().Bool("redo", false, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
 	}

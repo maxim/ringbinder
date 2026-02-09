@@ -199,43 +199,6 @@ func TestOCRFile_ParsesImageAnnotations(t *testing.T) {
 	if got, want := result[0].Markdown, "Page text\n\n[Image: scatter plot — A scatter plot comparing model performance vs cost]"; got != want {
 		t.Fatalf("markdown = %q, want %q", got, want)
 	}
-
-	var annotations pageAnnotations
-	if err := json.Unmarshal(result[0].Annotations, &annotations); err != nil {
-		t.Fatalf("unmarshal annotations: %v", err)
-	}
-	if annotations.Dimensions == nil {
-		t.Fatalf("dimensions = nil, want non-nil")
-	}
-	if got, want := annotations.Dimensions.DPI, 200; got != want {
-		t.Fatalf("dimensions.dpi = %d, want %d", got, want)
-	}
-	if got, want := len(annotations.Images), 1; got != want {
-		t.Fatalf("len(images) = %d, want %d", got, want)
-	}
-
-	image := annotations.Images[0]
-	if got, want := image.ID, "img-0.jpeg"; got != want {
-		t.Fatalf("image id = %q, want %q", got, want)
-	}
-	if got, want := image.ImageType, "scatter plot"; got != want {
-		t.Fatalf("image_type = %q, want %q", got, want)
-	}
-	if got, want := image.Description, "A scatter plot comparing model performance vs cost"; got != want {
-		t.Fatalf("description = %q, want %q", got, want)
-	}
-	if got, want := image.BoundingBox.TopLeftX, 100; got != want {
-		t.Fatalf("top_left_x = %d, want %d", got, want)
-	}
-	if got, want := image.BoundingBox.TopLeftY, 50; got != want {
-		t.Fatalf("top_left_y = %d, want %d", got, want)
-	}
-	if got, want := image.BoundingBox.BottomRightX, 400; got != want {
-		t.Fatalf("bottom_right_x = %d, want %d", got, want)
-	}
-	if got, want := image.BoundingBox.BottomRightY, 300; got != want {
-		t.Fatalf("bottom_right_y = %d, want %d", got, want)
-	}
 }
 
 func TestOCRFile_ParsesStringImageAnnotation(t *testing.T) {
@@ -281,20 +244,6 @@ func TestOCRFile_ParsesStringImageAnnotation(t *testing.T) {
 	if got, want := result[0].Markdown, "Page text\n\n[Image: image — A scatter plot comparing model performance vs cost]"; got != want {
 		t.Fatalf("markdown = %q, want %q", got, want)
 	}
-
-	var annotations pageAnnotations
-	if err := json.Unmarshal(result[0].Annotations, &annotations); err != nil {
-		t.Fatalf("unmarshal annotations: %v", err)
-	}
-	if got, want := len(annotations.Images), 1; got != want {
-		t.Fatalf("len(images) = %d, want %d", got, want)
-	}
-	if got, want := annotations.Images[0].ImageType, ""; got != want {
-		t.Fatalf("image_type = %q, want %q", got, want)
-	}
-	if got, want := annotations.Images[0].Description, "A scatter plot comparing model performance vs cost"; got != want {
-		t.Fatalf("description = %q, want %q", got, want)
-	}
 }
 
 func TestOCRFile_NoImages(t *testing.T) {
@@ -328,20 +277,6 @@ func TestOCRFile_NoImages(t *testing.T) {
 	}
 	if got, want := result[0].Markdown, "Page text"; got != want {
 		t.Fatalf("markdown = %q, want %q", got, want)
-	}
-
-	var annotations pageAnnotations
-	if err := json.Unmarshal(result[0].Annotations, &annotations); err != nil {
-		t.Fatalf("unmarshal annotations: %v", err)
-	}
-	if annotations.Dimensions == nil {
-		t.Fatalf("dimensions = nil, want non-nil")
-	}
-	if got, want := annotations.Dimensions.Width, 1700; got != want {
-		t.Fatalf("width = %d, want %d", got, want)
-	}
-	if len(annotations.Images) != 0 {
-		t.Fatalf("len(images) = %d, want 0", len(annotations.Images))
 	}
 }
 

@@ -111,42 +111,19 @@ func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType s
 
 	results := make([]PageResult, len(resp.Pages))
 	for i, page := range resp.Pages {
-		var annotations json.RawMessage
-
-		pageAnnotation := pageAnnotations{
-			Dimensions: page.Dimensions,
-		}
-
 		for _, image := range page.Images {
-			metadata := imageMetadata{
-				ID: image.ID,
-				BoundingBox: bbox{
-					TopLeftX:     image.TopLeftX,
-					TopLeftY:     image.TopLeftY,
-					BottomRightX: image.BottomRightX,
-					BottomRightY: image.BottomRightY,
-				},
-				ImageType:   strings.TrimSpace(image.ImageAnnotation.ImageType),
-				Description: strings.TrimSpace(image.ImageAnnotation.Description),
-			}
-			pageAnnotation.Images = append(pageAnnotation.Images, metadata)
-
-			if metadata.Description != "" {
-				imageType := metadata.ImageType
+			imageType := strings.TrimSpace(image.ImageAnnotation.ImageType)
+			description := strings.TrimSpace(image.ImageAnnotation.Description)
+			if description != "" {
 				if imageType == "" {
 					imageType = "image"
 				}
-				page.Markdown += fmt.Sprintf("\n\n[Image: %s — %s]", imageType, metadata.Description)
+				page.Markdown += fmt.Sprintf("\n\n[Image: %s — %s]", imageType, description)
 			}
 		}
-
-		if pageAnnotation.Dimensions != nil || len(pageAnnotation.Images) > 0 {
-			annotations, _ = json.Marshal(pageAnnotation)
-		}
 		results[i] = PageResult{
-			PageIndex:   page.Index,
-			Markdown:    page.Markdown,
-			Annotations: annotations,
+			PageIndex: page.Index,
+			Markdown:  page.Markdown,
 		}
 	}
 

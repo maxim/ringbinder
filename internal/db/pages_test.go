@@ -1,7 +1,6 @@
 package db
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 )
@@ -57,7 +56,7 @@ func TestSearch_MultiWordMatchesNonContiguous(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertDocument() error = %v", err)
 	}
-	if err := database.UpsertPage(docID, 0, "the quick brown fox jumps over the lazy dog", nil); err != nil {
+	if err := database.UpsertPage(docID, 0, "the quick brown fox jumps over the lazy dog"); err != nil {
 		t.Fatalf("UpsertPage() error = %v", err)
 	}
 
@@ -90,7 +89,7 @@ func TestSearch_ReturnsPageCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertDocument() error = %v", err)
 	}
-	if err := database.UpsertPage(docID, 3, "searchable content", nil); err != nil {
+	if err := database.UpsertPage(docID, 3, "searchable content"); err != nil {
 		t.Fatalf("UpsertPage() error = %v", err)
 	}
 
@@ -122,15 +121,15 @@ func TestReplaceDocumentPages_Atomic(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		if err := database.UpsertPage(docID, i, "old-page", nil); err != nil {
+		if err := database.UpsertPage(docID, i, "old-page"); err != nil {
 			t.Fatalf("UpsertPage(old %d) error = %v", i, err)
 		}
 	}
 
 	newPages := []PageInput{
-		{PageIndex: 0, Markdown: "new-0", Annotations: json.RawMessage(`{"x":1}`)},
-		{PageIndex: 1, Markdown: "new-1", Annotations: json.RawMessage(`{"x":2}`)},
-		{PageIndex: 2, Markdown: "new-2", Annotations: json.RawMessage(`{"x":3}`)},
+		{PageIndex: 0, Markdown: "new-0"},
+		{PageIndex: 1, Markdown: "new-1"},
+		{PageIndex: 2, Markdown: "new-2"},
 	}
 
 	if err := database.ReplaceDocumentPages(docID, newPages); err != nil {

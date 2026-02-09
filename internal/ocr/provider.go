@@ -2,13 +2,11 @@ package ocr
 
 import (
 	"context"
-	"encoding/json"
 )
 
 type PageResult struct {
-	PageIndex   int
-	Markdown    string
-	Annotations json.RawMessage
+	PageIndex int
+	Markdown  string
 }
 
 type Provider interface {

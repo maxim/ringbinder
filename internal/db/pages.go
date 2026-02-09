@@ -1,22 +1,19 @@
 package db
 
 import (
-	"encoding/json"
 	"strings"
 )
 
 type PageRecord struct {
-	ID          int64
-	DocumentID  int64
-	PageIndex   int
-	Markdown    string
-	Annotations json.RawMessage
+	ID         int64
+	DocumentID int64
+	PageIndex  int
+	Markdown   string
 }
 
 type PageInput struct {
-	PageIndex   int
-	Markdown    string
-	Annotations json.RawMessage
+	PageIndex int
+	Markdown  string
 }
 
 type SearchResult struct {
@@ -26,14 +23,13 @@ type SearchResult struct {
 	Snippet   string
 }
 
-func (db *DB) UpsertPage(documentID int64, pageIndex int, markdown string, annotations json.RawMessage) error {
+func (db *DB) UpsertPage(documentID int64, pageIndex int, markdown string) error {
 	_, err := db.Exec(
-		`INSERT INTO pages (document_id, page_index, markdown, annotations)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO pages (document_id, page_index, markdown)
+		 VALUES (?, ?, ?)
 		 ON CONFLICT(document_id, page_index) DO UPDATE SET
-		   markdown = excluded.markdown,
-		   annotations = excluded.annotations`,
-		documentID, pageIndex, markdown, string(annotations))
+		   markdown = excluded.markdown`,
+		documentID, pageIndex, markdown)
 	return err
 }
 
@@ -55,12 +51,11 @@ func (db *DB) ReplaceDocumentPages(documentID int64, pages []PageInput) (err err
 
 	for _, page := range pages {
 		if _, err = tx.Exec(
-			`INSERT INTO pages (document_id, page_index, markdown, annotations)
-			 VALUES (?, ?, ?, ?)
+			`INSERT INTO pages (document_id, page_index, markdown)
+			 VALUES (?, ?, ?)
 			 ON CONFLICT(document_id, page_index) DO UPDATE SET
-			   markdown = excluded.markdown,
-			   annotations = excluded.annotations`,
-			documentID, page.PageIndex, page.Markdown, string(page.Annotations)); err != nil {
+			   markdown = excluded.markdown`,
+			documentID, page.PageIndex, page.Markdown); err != nil {
 			return err
 		}
 	}

@@ -113,22 +113,3 @@ func (a *imageAnnotation) UnmarshalJSON(data []byte) error {
 	*a = imageAnnotation(parsed)
 	return nil
 }
-
-type pageAnnotations struct {
-	Dimensions *mistralDimension `json:"dimensions,omitempty"`
-	Images     []imageMetadata   `json:"images,omitempty"`
-}
-
-type imageMetadata struct {
-	ID          string `json:"id"`
-	BoundingBox bbox   `json:"bounding_box"`
-	ImageType   string `json:"image_type"`
-	Description string `json:"description"`
-}
-
-type bbox struct {
-	TopLeftX     int `json:"top_left_x"`
-	TopLeftY     int `json:"top_left_y"`
-	BottomRightX int `json:"bottom_right_x"`
-	BottomRightY int `json:"bottom_right_y"`
-}

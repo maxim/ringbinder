@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
+	"strings"
 
 	"github.com/maxim/ringbinder/internal/checksum"
 	"github.com/maxim/ringbinder/internal/config"
@@ -15,6 +18,7 @@ import (
 
 func init() {
 	rootCmd.AddCommand(sweepCmd)
+	sweepCmd.Flags().Bool("redo", false, "Delete all data and re-sweep from scratch")
 }
 
 var sweepCmd = &cobra.Command{
@@ -52,6 +56,35 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer database.Close()
+
+	redo, err := cmd.Flags().GetBool("redo")
+	if err != nil {
+		return fmt.Errorf("read redo flag: %w", err)
+	}
+	if redo {
+		var documentCount int
+		if err := database.QueryRow("SELECT COUNT(*) FROM documents").Scan(&documentCount); err != nil {
+			return fmt.Errorf("count documents: %w", err)
+		}
+
+		fmt.Printf("This will delete all %d documents and their OCR data. Continue? [y/N] ", documentCount)
+		reader := bufio.NewReader(cmd.InOrStdin())
+		response, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("read confirmation: %w", err)
+		}
+		response = strings.TrimSpace(response)
+		if response != "y" && response != "Y" {
+			fmt.Println("Aborted.")
+			return nil
+		}
+
+		deletedCount, err := database.ResetAllDocuments()
+		if err != nil {
+			return fmt.Errorf("reset documents: %w", err)
+		}
+		fmt.Printf("Deleted %d documents.\n", deletedCount)
+	}
 
 	ctx := cmd.Context()
 	if ctx == nil {

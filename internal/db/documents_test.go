@@ -157,3 +157,65 @@ func TestSoftDeleteMissing_OnlyDeletesWithinRoots(t *testing.T) {
 		t.Fatalf("/root2/c.pdf deleted = true, want false")
 	}
 }
+
+func TestResetAllDocuments(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+
+	withPagesID, err := database.InsertDocument("/docs/with-pages.pdf", "aaa", now, now, 2)
+	if err != nil {
+		t.Fatalf("InsertDocument(with-pages) error = %v", err)
+	}
+	if err := database.ReplaceDocumentPages(withPagesID, []PageInput{
+		{PageIndex: 0, Markdown: "page 1"},
+		{PageIndex: 1, Markdown: "page 2"},
+	}); err != nil {
+		t.Fatalf("ReplaceDocumentPages() error = %v", err)
+	}
+
+	if _, err := database.InsertDocument("/docs/soft-deleted.pdf", "bbb", now, now, 1); err != nil {
+		t.Fatalf("InsertDocument(soft-deleted) error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/pending.pdf", "ccc", now, now, 3); err != nil {
+		t.Fatalf("InsertDocument(pending) error = %v", err)
+	}
+
+	seenPaths := map[string]bool{
+		"/docs/with-pages.pdf": true,
+		"/docs/pending.pdf":    true,
+	}
+	if _, err := database.SoftDeleteMissing(seenPaths, []string{"/docs"}); err != nil {
+		t.Fatalf("SoftDeleteMissing() error = %v", err)
+	}
+
+	resetCount, err := database.ResetAllDocuments()
+	if err != nil {
+		t.Fatalf("ResetAllDocuments() error = %v", err)
+	}
+	if resetCount != 3 {
+		t.Fatalf("ResetAllDocuments() count = %d, want 3", resetCount)
+	}
+
+	docs, err := database.AllDocuments()
+	if err != nil {
+		t.Fatalf("AllDocuments() error = %v", err)
+	}
+	if len(docs) != 0 {
+		t.Fatalf("AllDocuments() returned %d docs, want 0", len(docs))
+	}
+
+	var pageCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM pages").Scan(&pageCount); err != nil {
+		t.Fatalf("count pages error = %v", err)
+	}
+	if pageCount != 0 {
+		t.Fatalf("pages row count = %d, want 0", pageCount)
+	}
+}

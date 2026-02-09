@@ -77,6 +77,7 @@ func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType s
 
 	var req mistralRequest
 	req.Model = mistralModel
+	req.BBoxAnnotationFormat = buildBBoxAnnotationFormat()
 
 	switch fileType {
 	case "pdf":
@@ -111,8 +112,36 @@ func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType s
 	results := make([]PageResult, len(resp.Pages))
 	for i, page := range resp.Pages {
 		var annotations json.RawMessage
-		if page.Dimensions != nil {
-			annotations, _ = json.Marshal(page.Dimensions)
+
+		pageAnnotation := pageAnnotations{
+			Dimensions: page.Dimensions,
+		}
+
+		for _, image := range page.Images {
+			metadata := imageMetadata{
+				ID: image.ID,
+				BoundingBox: bbox{
+					TopLeftX:     image.TopLeftX,
+					TopLeftY:     image.TopLeftY,
+					BottomRightX: image.BottomRightX,
+					BottomRightY: image.BottomRightY,
+				},
+				ImageType:   strings.TrimSpace(image.ImageAnnotation.ImageType),
+				Description: strings.TrimSpace(image.ImageAnnotation.Description),
+			}
+			pageAnnotation.Images = append(pageAnnotation.Images, metadata)
+
+			if metadata.Description != "" {
+				imageType := metadata.ImageType
+				if imageType == "" {
+					imageType = "image"
+				}
+				page.Markdown += fmt.Sprintf("\n\n[Image: %s — %s]", imageType, metadata.Description)
+			}
+		}
+
+		if pageAnnotation.Dimensions != nil || len(pageAnnotation.Images) > 0 {
+			annotations, _ = json.Marshal(pageAnnotation)
 		}
 		results[i] = PageResult{
 			PageIndex:   page.Index,
@@ -122,6 +151,32 @@ func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType s
 	}
 
 	return results, nil
+}
+
+func buildBBoxAnnotationFormat() bboxAnnotationFormat {
+	return bboxAnnotationFormat{
+		Type: "json_schema",
+		JSONSchema: bboxJSONSchemaDef{
+			Name:        "image_annotation",
+			Description: "Describe each image on the page so it can be indexed in full text search.",
+			Strict:      true,
+			Schema: bboxSchemaDefinition{
+				Type: "object",
+				Properties: map[string]bboxPropertyDef{
+					"image_type": {
+						Type:        "string",
+						Description: "Short label for the visual, such as chart, table, diagram, or photo.",
+					},
+					"description": {
+						Type:        "string",
+						Description: "One to two sentence description of what the image contains.",
+					},
+				},
+				Required:             []string{"image_type", "description"},
+				AdditionalProperties: false,
+			},
+		},
+	}
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {

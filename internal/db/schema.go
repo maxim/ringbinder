@@ -1,6 +1,6 @@
 package db
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS documents (
@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS pages (
     document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     page_index  INTEGER NOT NULL,
     markdown    TEXT    NOT NULL DEFAULT '',
-    annotations TEXT,
     UNIQUE(document_id, page_index)
 );
 

@@ -51,7 +51,15 @@ func (db *DB) migrate() error {
 	}
 
 	if ver < schemaVersion {
-		// Future migrations would go here
+		switch ver {
+		case 1:
+			if _, err := db.Exec("ALTER TABLE pages DROP COLUMN annotations"); err != nil {
+				return fmt.Errorf("migrate 1->2: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported schema version: %d", ver)
+		}
+
 		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 			return err
 		}

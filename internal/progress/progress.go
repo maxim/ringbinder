@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-var spinnerChars = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+const trackerSpinnerInterval = 80 * time.Millisecond
 
 type workerState struct {
 	filename string
@@ -34,7 +34,7 @@ type Tracker struct {
 	skipped   int
 
 	renderedLines int
-	spinnerIndex  int
+	spinner       *Spinner
 	cursorHidden  bool
 	finished      bool
 }
@@ -59,6 +59,15 @@ func New(out io.Writer, isTTY bool, total, concurrency int) *Tracker {
 		now:     time.Now,
 	}
 	if isTTY {
+		t.spinner = NewSpinner(trackerSpinnerInterval, func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			if t.finished {
+				return
+			}
+			t.renderLocked()
+		})
+
 		t.mu.Lock()
 		t.renderLocked()
 		t.mu.Unlock()
@@ -80,9 +89,6 @@ func (t *Tracker) WorkerStart(slotID int, filename string) {
 		filename: truncate(filename, 50),
 		active:   true,
 	}
-	if t.isTTY {
-		t.renderLocked()
-	}
 }
 
 func (t *Tracker) WorkerDone(slotID int) {
@@ -96,11 +102,9 @@ func (t *Tracker) WorkerDone(slotID int) {
 	t.completed++
 	t.succeeded++
 
-	if t.isTTY {
-		t.renderLocked()
-		return
+	if !t.isTTY {
+		t.renderNonTTYLocked("OK", filename, "")
 	}
-	t.renderNonTTYLocked("OK", filename, "")
 }
 
 func (t *Tracker) WorkerError(slotID int, err error) {
@@ -114,15 +118,13 @@ func (t *Tracker) WorkerError(slotID int, err error) {
 	t.completed++
 	t.failed++
 
-	if t.isTTY {
-		t.renderLocked()
-		return
+	if !t.isTTY {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		t.renderNonTTYLocked("FAIL", filename, msg)
 	}
-	msg := ""
-	if err != nil {
-		msg = err.Error()
-	}
-	t.renderNonTTYLocked("FAIL", filename, msg)
 }
 
 func (t *Tracker) Skip(filename string) {
@@ -134,19 +136,30 @@ func (t *Tracker) Skip(filename string) {
 
 	t.completed++
 	t.skipped++
-	if t.isTTY {
-		t.renderLocked()
-		return
+	if !t.isTTY {
+		t.renderNonTTYLocked("SKIP", truncate(filename, 50), "")
 	}
-	t.renderNonTTYLocked("SKIP", truncate(filename, 50), "")
 }
 
 func (t *Tracker) Finish() {
+	var spinner *Spinner
+
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.finished {
+		t.mu.Unlock()
 		return
 	}
+	t.finished = true
+	spinner = t.spinner
+	t.spinner = nil
+	t.mu.Unlock()
+
+	if spinner != nil {
+		spinner.Stop()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	if t.isTTY {
 		t.clearRenderedLocked()
@@ -162,7 +175,6 @@ func (t *Tracker) Finish() {
 		t.skipped,
 		t.failed,
 	)
-	t.finished = true
 }
 
 func (t *Tracker) validSlot(slotID int) bool {
@@ -193,9 +205,6 @@ func (t *Tracker) renderLocked() {
 		fmt.Fprintln(t.out, line)
 	}
 	t.renderedLines = len(lines)
-	if len(spinnerChars) > 0 {
-		t.spinnerIndex = (t.spinnerIndex + 1) % len(spinnerChars)
-	}
 }
 
 func (t *Tracker) clearRenderedLocked() {
@@ -228,8 +237,8 @@ func (t *Tracker) renderLinesLocked() []string {
 	}
 
 	spinner := ' '
-	if len(spinnerChars) > 0 {
-		spinner = spinnerChars[t.spinnerIndex%len(spinnerChars)]
+	if t.spinner != nil {
+		spinner = t.spinner.Frame()
 	}
 	line1 := fmt.Sprintf(
 		"%c OCR %d/%d (%d%%) · ETA %s",

@@ -8,12 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/checksum"
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/pdf"
+	"github.com/maxim/ringbinder/internal/progress"
 	"github.com/maxim/ringbinder/internal/scanner"
 	"github.com/spf13/cobra"
 )
@@ -29,8 +32,6 @@ var sweepCmd = &cobra.Command{
 	Long:  "Scans the given paths (or paths from config) for PNG, JPEG, and PDF files and indexes them in the database.",
 	RunE:  runSweep,
 }
-
-var spinnerChars = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
 func runSweep(cmd *cobra.Command, args []string) error {
 	cfg, err := config.Load(cfgFile)
@@ -104,15 +105,29 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	}()
 
 	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
-	scanned := 0
+	var scanned atomic.Int64
+	if isTTY {
+		var spinnerPtr atomic.Pointer[progress.Spinner]
+		sweepSpinner := progress.NewSpinner(80*time.Millisecond, func() {
+			spinner := spinnerPtr.Load()
+			frame := ' '
+			if spinner != nil {
+				frame = spinner.Frame()
+			}
+			fmt.Fprintf(os.Stdout, "\r%c %d files scanned   ", frame, scanned.Load())
+		})
+		spinnerPtr.Store(sweepSpinner)
+		defer func() {
+			sweepSpinner.Stop()
+			fmt.Fprintf(os.Stdout, "\r                                                                                \r")
+		}()
+	}
+
 	var newCount, updatedCount, restoredCount, unchangedCount int
 	seenPaths := make(map[string]bool)
 
 	for fi := range results {
-		scanned++
-		if isTTY {
-			fmt.Fprintf(os.Stdout, "\r%c %d files scanned   ", spinnerChars[scanned%len(spinnerChars)], scanned)
-		}
+		scanned.Add(1)
 
 		seenPaths[fi.Path] = true
 
@@ -205,9 +220,6 @@ func runSweep(cmd *cobra.Command, args []string) error {
 
 	if err := <-scanErr; err != nil {
 		return fmt.Errorf("scan: %w", err)
-	}
-	if isTTY {
-		fmt.Fprintf(os.Stdout, "\r                                                                                \r")
 	}
 
 	// Soft-delete files no longer present

@@ -33,17 +33,17 @@ func runCost(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("read --redo flag: %w", err)
 	}
 
-	var docCount, totalPages int
+	var itemCount, totalPages int
 	if redo {
-		docCount, totalPages, err = database.AllStats()
+		itemCount, totalPages, err = database.AllStats()
 	} else {
-		docCount, totalPages, err = database.PendingStats()
+		itemCount, totalPages, err = database.PendingStats()
 	}
 	if err != nil {
 		return fmt.Errorf("query stats: %w", err)
 	}
 
-	if docCount == 0 {
+	if itemCount == 0 {
 		if redo {
 			fmt.Println("No documents found.")
 		} else {
@@ -56,10 +56,12 @@ func runCost(cmd *cobra.Command, args []string) error {
 	cost := float64(totalPages) * price
 
 	label := "Pending OCR"
+	unit := "content item(s)"
 	if redo {
 		label = "All documents"
+		unit = "documents"
 	}
-	fmt.Printf("%s: %d documents, %d pages\n", label, docCount, totalPages)
+	fmt.Printf("%s: %d %s, %d pages\n", label, itemCount, unit, totalPages)
 	fmt.Printf("Estimated cost: $%.2f (at $%.4f/page)\n", cost, price)
 
 	return nil

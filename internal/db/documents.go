@@ -11,6 +11,7 @@ import (
 type Document struct {
 	ID         int64
 	Path       string
+	ContentID  int64
 	Checksum   string
 	CreatedAt  time.Time
 	ModifiedAt time.Time
@@ -28,8 +29,17 @@ func scanDocument(scanner documentScanner) (Document, error) {
 	var createdAt, modifiedAt string
 	var ocrPending, deleted int
 
-	if err := scanner.Scan(&doc.ID, &doc.Path, &doc.Checksum, &createdAt, &modifiedAt,
-		&doc.PageCount, &ocrPending, &deleted); err != nil {
+	if err := scanner.Scan(
+		&doc.ID,
+		&doc.Path,
+		&doc.ContentID,
+		&createdAt,
+		&modifiedAt,
+		&deleted,
+		&doc.Checksum,
+		&doc.PageCount,
+		&ocrPending,
+	); err != nil {
 		return Document{}, err
 	}
 
@@ -51,8 +61,13 @@ func scanDocument(scanner documentScanner) (Document, error) {
 
 func (db *DB) GetDocumentByPath(path string) (*Document, error) {
 	row := db.QueryRow(
-		`SELECT id, path, checksum, created_at, modified_at, page_count, ocr_pending, deleted
-		 FROM documents WHERE path = ?`, path)
+		`SELECT d.id, d.path, d.content_id, d.created_at, d.modified_at, d.deleted,
+		        c.checksum, c.page_count, c.ocr_pending
+		 FROM documents d
+		 JOIN contents c ON c.id = d.content_id
+		 WHERE d.path = ?`,
+		path,
+	)
 
 	doc, err := scanDocument(row)
 	if err == sql.ErrNoRows {
@@ -64,38 +79,34 @@ func (db *DB) GetDocumentByPath(path string) (*Document, error) {
 	return &doc, nil
 }
 
-func (db *DB) InsertDocument(path, checksum string, createdAt, modifiedAt time.Time, pageCount int) (int64, error) {
+func (db *DB) InsertDocument(path string, contentID int64, createdAt, modifiedAt time.Time) (int64, error) {
 	res, err := db.Exec(
-		`INSERT INTO documents (path, checksum, created_at, modified_at, page_count, ocr_pending, deleted)
-		 VALUES (?, ?, ?, ?, ?, 1, 0)`,
-		path, checksum, createdAt.Format(time.RFC3339Nano), modifiedAt.Format(time.RFC3339Nano), pageCount)
+		`INSERT INTO documents (path, content_id, created_at, modified_at, deleted)
+		 VALUES (?, ?, ?, ?, 0)`,
+		path, contentID, createdAt.Format(time.RFC3339Nano), modifiedAt.Format(time.RFC3339Nano),
+	)
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
 }
 
-func (db *DB) UpdateDocument(id int64, checksum string, modifiedAt time.Time, pageCount int, ocrPending bool) error {
-	ocrPendingInt := 0
-	if ocrPending {
-		ocrPendingInt = 1
-	}
+func (db *DB) UpdateDocument(id int64, contentID int64, modifiedAt time.Time) error {
 	_, err := db.Exec(
-		`UPDATE documents SET checksum = ?, modified_at = ?, page_count = ?, ocr_pending = ?
+		`UPDATE documents SET content_id = ?, modified_at = ?
 		 WHERE id = ?`,
-		checksum, modifiedAt.Format(time.RFC3339Nano), pageCount, ocrPendingInt, id)
+		contentID, modifiedAt.Format(time.RFC3339Nano), id,
+	)
 	return err
 }
 
-func (db *DB) RestoreDocument(id int64, checksum string, modifiedAt time.Time, pageCount int, ocrPending bool) error {
-	ocrPendingInt := 0
-	if ocrPending {
-		ocrPendingInt = 1
-	}
+func (db *DB) RestoreDocument(id int64, contentID int64, modifiedAt time.Time) error {
 	_, err := db.Exec(
-		`UPDATE documents SET checksum = ?, modified_at = ?, page_count = ?, ocr_pending = ?, deleted = 0
+		`UPDATE documents
+		 SET content_id = ?, modified_at = ?, deleted = 0
 		 WHERE id = ?`,
-		checksum, modifiedAt.Format(time.RFC3339Nano), pageCount, ocrPendingInt, id)
+		contentID, modifiedAt.Format(time.RFC3339Nano), id,
+	)
 	return err
 }
 
@@ -134,13 +145,30 @@ func (db *DB) SoftDeleteMissing(seenPaths map[string]bool, roots []string) (int,
 }
 
 func (db *DB) ResetAllDocuments() (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
 	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM documents").Scan(&count); err != nil {
+	if err = tx.QueryRow("SELECT COUNT(*) FROM documents").Scan(&count); err != nil {
 		return 0, err
 	}
-	if _, err := db.Exec("DELETE FROM documents"); err != nil {
+	if _, err = tx.Exec("DELETE FROM documents"); err != nil {
 		return 0, err
 	}
+	if _, err = tx.Exec("DELETE FROM contents"); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+
 	return count, nil
 }
 
@@ -169,14 +197,25 @@ func pathWithinRoots(path string, roots []string) bool {
 
 func (db *DB) PendingDocuments() ([]Document, error) {
 	return db.queryDocuments(
-		`SELECT id, path, checksum, created_at, modified_at, page_count, ocr_pending, deleted
-		 FROM documents WHERE ocr_pending = 1 AND deleted = 0 ORDER BY id`)
+		`SELECT d.id, d.path, d.content_id, d.created_at, d.modified_at, d.deleted,
+		        c.checksum, c.page_count, c.ocr_pending
+		 FROM documents d
+		 JOIN contents c ON c.id = d.content_id
+		 WHERE c.ocr_pending = 1
+		   AND d.deleted = 0
+		 ORDER BY d.id`,
+	)
 }
 
 func (db *DB) AllDocuments() ([]Document, error) {
 	return db.queryDocuments(
-		`SELECT id, path, checksum, created_at, modified_at, page_count, ocr_pending, deleted
-		 FROM documents WHERE deleted = 0 ORDER BY id`)
+		`SELECT d.id, d.path, d.content_id, d.created_at, d.modified_at, d.deleted,
+		        c.checksum, c.page_count, c.ocr_pending
+		 FROM documents d
+		 JOIN contents c ON c.id = d.content_id
+		 WHERE d.deleted = 0
+		 ORDER BY d.id`,
+	)
 }
 
 func (db *DB) queryDocuments(query string, args ...any) ([]Document, error) {
@@ -202,19 +241,24 @@ func (db *DB) queryDocuments(query string, args ...any) ([]Document, error) {
 
 func (db *DB) AllStats() (docCount int, totalPages int, err error) {
 	err = db.QueryRow(
-		`SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(page_count), 0)
-		 FROM documents WHERE deleted = 0`).Scan(&docCount, &totalPages)
+		`SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(c.page_count), 0)
+		 FROM documents d
+		 JOIN contents c ON c.id = d.content_id
+		 WHERE d.deleted = 0`,
+	).Scan(&docCount, &totalPages)
 	return
-}
-
-func (db *DB) MarkOCRDone(id int64) error {
-	_, err := db.Exec("UPDATE documents SET ocr_pending = 0 WHERE id = ?", id)
-	return err
 }
 
 func (db *DB) PendingStats() (docCount int, totalPages int, err error) {
 	err = db.QueryRow(
-		`SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(page_count), 0)
-		 FROM documents WHERE ocr_pending = 1 AND deleted = 0`).Scan(&docCount, &totalPages)
+		`SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(c.page_count), 0)
+		 FROM contents c
+		 WHERE c.ocr_pending = 1
+		   AND EXISTS (
+		     SELECT 1
+		     FROM documents d
+		     WHERE d.content_id = c.id AND d.deleted = 0
+		   )`,
+	).Scan(&docCount, &totalPages)
 	return
 }

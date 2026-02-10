@@ -44,18 +44,18 @@ func runOCR(cmd *cobra.Command, args []string) error {
 }
 
 func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, redo bool) error {
-	var docs []db.Document
+	var contents []db.Content
 	var err error
 	if redo {
-		docs, err = database.AllDocuments()
+		contents, err = allLiveContents(database)
 	} else {
-		docs, err = database.PendingDocuments()
+		contents, err = database.PendingContents()
 	}
 	if err != nil {
-		return fmt.Errorf("query documents: %w", err)
+		return fmt.Errorf("query contents: %w", err)
 	}
 
-	if len(docs) == 0 {
+	if len(contents) == 0 {
 		if redo {
 			fmt.Println("No documents found.")
 		} else {
@@ -64,20 +64,29 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		return nil
 	}
 
-	fmt.Printf("Processing %d documents...\n", len(docs))
+	fmt.Printf("Processing %d content item(s)...\n", len(contents))
 	var totalPages, processedOK, skipped, failed int
 
-	for i, doc := range docs {
-		fmt.Printf("Processing %d/%d: %s...\n", i+1, len(docs), filepath.Base(doc.Path))
+	for i, content := range contents {
+		path, err := database.GetDocumentPathForContent(content.ID)
+		if err != nil {
+			return fmt.Errorf("query document path for content %d: %w", content.ID, err)
+		}
+		if path == "" {
+			skipped++
+			continue
+		}
 
-		fileType := classifyPath(doc.Path)
+		fmt.Printf("Processing %d/%d: %s...\n", i+1, len(contents), filepath.Base(path))
+
+		fileType := classifyPath(path)
 		if fileType == "" {
 			fmt.Printf("  skipping: unknown file type\n")
 			skipped++
 			continue
 		}
 
-		pages, err := provider.OCRFile(ctx, doc.Path, fileType)
+		pages, err := provider.OCRFile(ctx, path, fileType)
 		if err != nil {
 			fmt.Printf("  error: %v\n", err)
 			failed++
@@ -88,12 +97,12 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		for j, page := range pages {
 			pageInputs[j] = db.PageInput{
 				PageIndex: page.PageIndex,
-				Markdown:  db.BuildPageMarkdown(doc.Path, page.PageIndex, page.Markdown),
+				Markdown:  page.Markdown,
 			}
 		}
 
-		if err := database.ReplaceDocumentPages(doc.ID, pageInputs); err != nil {
-			return fmt.Errorf("replace document pages for %s: %w", doc.Path, err)
+		if err := database.ReplaceContentPages(content.ID, pageInputs); err != nil {
+			return fmt.Errorf("replace content pages for %s: %w", path, err)
 		}
 
 		totalPages += len(pages)
@@ -105,6 +114,29 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		processedOK, skipped, failed, totalPages,
 	)
 	return nil
+}
+
+func allLiveContents(database *db.DB) ([]db.Content, error) {
+	docs, err := database.AllDocuments()
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[int64]bool)
+	contents := make([]db.Content, 0, len(docs))
+	for _, doc := range docs {
+		if seen[doc.ContentID] {
+			continue
+		}
+		seen[doc.ContentID] = true
+		contents = append(contents, db.Content{
+			ID:         doc.ContentID,
+			Checksum:   doc.Checksum,
+			PageCount:  doc.PageCount,
+			OCRPending: doc.OCRPending,
+		})
+	}
+	return contents, nil
 }
 
 func classifyPath(path string) string {

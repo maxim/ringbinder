@@ -4,14 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 
+	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
+	"github.com/maxim/ringbinder/internal/progress"
 	"github.com/spf13/cobra"
 )
 
@@ -80,23 +82,22 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		return nil
 	}
 
-	fmt.Printf("Processing %d content item(s)...\n", len(contents))
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
 	type ocrJob struct {
-		index   int
 		content db.Content
 		path    string
+		name    string
 		fileTyp string
 	}
 
-	var outMu sync.Mutex
 	var writeMu sync.Mutex
-	var totalPages, processedOK, skipped, failed atomic.Int64
 	jobs := make([]ocrJob, 0, len(contents))
+	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+	tracker := progress.New(os.Stdout, isTTY, len(contents), concurrency)
 
-	for i, content := range contents {
+	for _, content := range contents {
 		if err := ctx.Err(); err != nil {
 			break
 		}
@@ -106,29 +107,29 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 			return fmt.Errorf("query document path for content %d: %w", content.ID, err)
 		}
 		if path == "" {
-			skipped.Add(1)
+			tracker.Skip(fmt.Sprintf("content-%d", content.ID))
 			continue
 		}
 
 		fileType := classifyPath(path)
 		if fileType == "" {
-			outMu.Lock()
-			fmt.Printf("Processing %d/%d: %s...\n", i+1, len(contents), filepath.Base(path))
-			fmt.Printf("  skipping: unknown file type\n")
-			outMu.Unlock()
-			skipped.Add(1)
+			tracker.Skip(filepath.Base(path))
 			continue
 		}
 
 		jobs = append(jobs, ocrJob{
-			index:   i,
 			content: content,
 			path:    path,
+			name:    filepath.Base(path),
 			fileTyp: fileType,
 		})
 	}
 
-	sem := make(chan struct{}, concurrency)
+	slots := make(chan int, concurrency)
+	for i := 0; i < concurrency; i++ {
+		slots <- i
+	}
+
 	var wg sync.WaitGroup
 	for _, job := range jobs {
 		if ctx.Err() != nil {
@@ -138,26 +139,21 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		go func(job ocrJob) {
 			defer wg.Done()
 
+			var slotID int
 			select {
-			case sem <- struct{}{}:
+			case slotID = <-slots:
 			case <-ctx.Done():
 				return
 			}
-			defer func() { <-sem }()
-
-			outMu.Lock()
-			fmt.Printf("Processing %d/%d: %s...\n", job.index+1, len(contents), filepath.Base(job.path))
-			outMu.Unlock()
+			defer func() { slots <- slotID }()
+			tracker.WorkerStart(slotID, job.name)
 
 			pages, err := provider.OCRFile(ctx, job.path, job.fileTyp)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					cancel(err)
 				}
-				outMu.Lock()
-				fmt.Printf("  error: %v\n", err)
-				outMu.Unlock()
-				failed.Add(1)
+				tracker.WorkerError(slotID, err)
 				return
 			}
 
@@ -173,26 +169,15 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 			err = database.ReplaceContentPages(job.content.ID, pageInputs)
 			writeMu.Unlock()
 			if err != nil {
-				outMu.Lock()
-				fmt.Printf("  error: %v\n", err)
-				outMu.Unlock()
-				failed.Add(1)
+				tracker.WorkerError(slotID, err)
 				return
 			}
 
-			totalPages.Add(int64(len(pages)))
-			processedOK.Add(1)
+			tracker.WorkerDone(slotID)
 		}(job)
 	}
 	wg.Wait()
-
-	fmt.Printf(
-		"OCR complete: %d succeeded, %d skipped, %d failed, %d pages processed.\n",
-		processedOK.Load(),
-		skipped.Load(),
-		failed.Load(),
-		totalPages.Load(),
-	)
+	tracker.Finish()
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}

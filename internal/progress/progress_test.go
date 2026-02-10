@@ -51,13 +51,36 @@ func TestTrackerETACalculation(t *testing.T) {
 
 	var out bytes.Buffer
 	tracker := New(&out, true, 4, 1)
+	tracker.mu.Lock()
 	tracker.start = time.Unix(0, 0)
 	tracker.now = func() time.Time { return time.Unix(10, 0) }
+	tracker.mu.Unlock()
 
 	tracker.WorkerStart(0, "doc.pdf")
 	tracker.WorkerDone(0)
+	time.Sleep(120 * time.Millisecond)
+	tracker.Finish()
 
 	mustContain(t, out.String(), "ETA 30s")
+}
+
+func TestTrackerSpinsOnTimer(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	tracker := New(&out, true, 2, 1)
+	time.Sleep(260 * time.Millisecond)
+	tracker.Finish()
+
+	seen := make(map[rune]bool)
+	for _, r := range out.String() {
+		if indexOfFrame(r) >= 0 {
+			seen[r] = true
+		}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("spinner frames seen = %d, want at least 2", len(seen))
+	}
 }
 
 func TestTrackerConcurrentAccess(t *testing.T) {

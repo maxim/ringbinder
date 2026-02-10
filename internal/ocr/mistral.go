@@ -208,7 +208,15 @@ func (c *MistralClient) doWithRetry(ctx context.Context, req mistralRequest) ([]
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("http request: %w", err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if attempt == maxAttempts {
+				return nil, fmt.Errorf("http request failed after %d attempts: %w", maxAttempts, err)
+			}
+			backoff = math.Min(backoff*2, 60)
+			backoff = math.Min(backoff*(0.5+randFloat64()), 60)
+			continue
 		}
 
 		respBody, err := io.ReadAll(resp.Body)

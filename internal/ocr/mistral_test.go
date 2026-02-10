@@ -3,6 +3,7 @@ package ocr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -112,6 +113,114 @@ func TestRetry_4xxNotRetried(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&requests); got != 1 {
 		t.Fatalf("request attempts = %d, want 1", got)
+	}
+}
+
+func TestRetry_TransportErrorRetried(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatalf("response writer does not support hijacking")
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatalf("hijack connection: %v", err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	client := NewMistralClient("test-key")
+	client.endpoint = server.URL
+	client.sleep = func(ctx context.Context, d time.Duration) error { return nil }
+	client.randFloat64 = func() float64 { return 0 }
+
+	_, err := client.doWithRetry(context.Background(), mistralRequest{
+		Model: mistralModel,
+		Document: mistralDocument{
+			Type:        "document_url",
+			DocumentURL: "data:application/pdf;base64,AA==",
+		},
+	})
+	if err == nil {
+		t.Fatalf("doWithRetry() error = nil, want non-nil")
+	}
+	if got := atomic.LoadInt32(&requests); got != 5 {
+		t.Fatalf("request attempts = %d, want 5", got)
+	}
+}
+
+func TestRetry_TransportErrorRecovery(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&requests, 1)
+		if count <= 2 {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatalf("response writer does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("hijack connection: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"pages":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewMistralClient("test-key")
+	client.endpoint = server.URL
+	client.sleep = func(ctx context.Context, d time.Duration) error { return nil }
+	client.randFloat64 = func() float64 { return 0 }
+
+	if _, err := client.doWithRetry(context.Background(), mistralRequest{
+		Model: mistralModel,
+		Document: mistralDocument{
+			Type:        "document_url",
+			DocumentURL: "data:application/pdf;base64,AA==",
+		},
+	}); err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 3 {
+		t.Fatalf("request attempts = %d, want 3", got)
+	}
+}
+
+func TestRetry_TransportErrorContextCancelled(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"pages":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewMistralClient("test-key")
+	client.endpoint = server.URL
+	client.sleep = func(ctx context.Context, d time.Duration) error { return nil }
+	client.randFloat64 = func() float64 { return 0 }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.doWithRetry(ctx, mistralRequest{
+		Model: mistralModel,
+		Document: mistralDocument{
+			Type:        "document_url",
+			DocumentURL: "data:application/pdf;base64,AA==",
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("doWithRetry() error = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("request attempts = %d, want 0", got)
 	}
 }
 

@@ -178,6 +178,60 @@ func TestProcessOCR_ErrorDoesNotBlockOthers(t *testing.T) {
 	}
 }
 
+func TestProcessOCR_TimeoutDoesNotCancelOthers(t *testing.T) {
+	t.Parallel()
+
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	for i := 0; i < 6; i++ {
+		contentID, err := database.InsertContent(fmt.Sprintf("checksum-%d", i), 1)
+		if err != nil {
+			t.Fatalf("InsertContent(%d) error = %v", i, err)
+		}
+		if _, err := database.InsertDocument(fmt.Sprintf("/docs/%d.pdf", i), contentID, now, now); err != nil {
+			t.Fatalf("InsertDocument(%d) error = %v", i, err)
+		}
+	}
+
+	provider := &fakeOCRProvider{
+		pages: []ocr.PageResult{
+			{PageIndex: 0, Markdown: "raw markdown"},
+		},
+		errByPath: map[string]error{
+			"/docs/1.pdf": context.DeadlineExceeded,
+		},
+	}
+
+	if err := processOCR(context.Background(), database, provider, false, 4); err != nil {
+		t.Fatalf("processOCR() error = %v, want nil", err)
+	}
+
+	if provider.calls.Load() != 6 {
+		t.Fatalf("provider OCR calls = %d, want 6", provider.calls.Load())
+	}
+
+	pending, err := database.PendingContents()
+	if err != nil {
+		t.Fatalf("PendingContents() error = %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending contents = %d, want 1", len(pending))
+	}
+
+	var pageCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM pages").Scan(&pageCount); err != nil {
+		t.Fatalf("count pages error = %v", err)
+	}
+	if pageCount != 5 {
+		t.Fatalf("stored page count = %d, want 5", pageCount)
+	}
+}
+
 func TestProcessOCR_ContextCancellation(t *testing.T) {
 	t.Parallel()
 

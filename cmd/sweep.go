@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/checksum"
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
@@ -27,6 +29,8 @@ var sweepCmd = &cobra.Command{
 	Long:  "Scans the given paths (or paths from config) for PNG, JPEG, and PDF files and indexes them in the database.",
 	RunE:  runSweep,
 }
+
+var spinnerChars = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
 func runSweep(cmd *cobra.Command, args []string) error {
 	cfg, err := config.Load(cfgFile)
@@ -99,10 +103,17 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		scanErr <- s.Scan(ctx, paths, results)
 	}()
 
+	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+	scanned := 0
 	var newCount, updatedCount, restoredCount, unchangedCount int
 	seenPaths := make(map[string]bool)
 
 	for fi := range results {
+		scanned++
+		if isTTY {
+			fmt.Fprintf(os.Stdout, "\r%c %d files scanned   ", spinnerChars[scanned%len(spinnerChars)], scanned)
+		}
+
 		seenPaths[fi.Path] = true
 
 		// Compute checksum
@@ -194,6 +205,9 @@ func runSweep(cmd *cobra.Command, args []string) error {
 
 	if err := <-scanErr; err != nil {
 		return fmt.Errorf("scan: %w", err)
+	}
+	if isTTY {
+		fmt.Fprintf(os.Stdout, "\r                                                                                \r")
 	}
 
 	// Soft-delete files no longer present

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -150,7 +149,7 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 
 			pages, err := provider.OCRFile(ctx, job.path, job.fileTyp)
 			if err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
 					cancel(err)
 				}
 				tracker.WorkerError(slotID, err)

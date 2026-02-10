@@ -82,3 +82,25 @@ Body`,
 		})
 	}
 }
+
+func TestStripPageFrontmatter(t *testing.T) {
+	t.Parallel()
+
+	markdown := `---
+file: report.pdf
+type: pdf
+path: /docs/report.pdf
+page: 2
+---
+
+Body text`
+
+	if got := StripPageFrontmatter(markdown); got != "Body text" {
+		t.Fatalf("StripPageFrontmatter() = %q, want %q", got, "Body text")
+	}
+
+	raw := "already raw markdown"
+	if got := StripPageFrontmatter(raw); got != raw {
+		t.Fatalf("StripPageFrontmatter(raw) = %q, want %q", got, raw)
+	}
+}

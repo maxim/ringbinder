@@ -44,8 +44,8 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 		if !doc.OCRPending {
 			t.Fatalf("initial OCRPending = false, want true")
 		}
-		if err := database.MarkOCRDone(doc.ID); err != nil {
-			t.Fatalf("MarkOCRDone() error = %v", err)
+		if err := database.MarkContentOCRDone(doc.ContentID); err != nil {
+			t.Fatalf("MarkContentOCRDone() error = %v", err)
 		}
 	})
 
@@ -107,8 +107,8 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 			t.Fatalf("content+mtime ModifiedAt = %s, want %s", doc.ModifiedAt.Format(time.RFC3339Nano), t3.Format(time.RFC3339Nano))
 		}
 		checksumV2 = doc.Checksum
-		if err := database.MarkOCRDone(doc.ID); err != nil {
-			t.Fatalf("MarkOCRDone() error = %v", err)
+		if err := database.MarkContentOCRDone(doc.ContentID); err != nil {
+			t.Fatalf("MarkContentOCRDone() error = %v", err)
 		}
 	})
 
@@ -181,6 +181,55 @@ func TestSweep_DoesNotClearExistingPendingOnTouch(t *testing.T) {
 		}
 		if !doc.OCRPending {
 			t.Fatalf("touch-only OCRPending = false, want true")
+		}
+	})
+}
+
+func TestSweep_DuplicateFileSharesContent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgFile = ""
+
+	scanDir := t.TempDir()
+	pathA := filepath.Join(scanDir, "a.png")
+	pathB := filepath.Join(scanDir, "b.png")
+
+	content := []byte("same-bytes")
+	if err := os.WriteFile(pathA, content, 0644); err != nil {
+		t.Fatalf("WriteFile(a) error = %v", err)
+	}
+	if err := os.WriteFile(pathB, content, 0644); err != nil {
+		t.Fatalf("WriteFile(b) error = %v", err)
+	}
+
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("redo", false, "")
+	if err := runSweep(cmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep() error = %v", err)
+	}
+
+	withDB(t, func(database *db.DB) {
+		docA, err := database.GetDocumentByPath(pathA)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(a) error = %v", err)
+		}
+		docB, err := database.GetDocumentByPath(pathB)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(b) error = %v", err)
+		}
+		if docA == nil || docB == nil {
+			t.Fatalf("expected both documents to exist")
+		}
+		if docA.ContentID != docB.ContentID {
+			t.Fatalf("content_id mismatch: %d vs %d", docA.ContentID, docB.ContentID)
+		}
+
+		var contentRows int
+		if err := database.QueryRow("SELECT COUNT(*) FROM contents").Scan(&contentRows); err != nil {
+			t.Fatalf("count contents error = %v", err)
+		}
+		if contentRows != 1 {
+			t.Fatalf("content rows = %d, want 1", contentRows)
 		}
 	})
 }

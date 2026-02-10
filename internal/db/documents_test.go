@@ -5,6 +5,97 @@ import (
 	"time"
 )
 
+func TestInsertDocument_WithContentID(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	contentID, err := database.InsertContent("content-a", 3)
+	if err != nil {
+		t.Fatalf("InsertContent() error = %v", err)
+	}
+
+	docID, err := database.InsertDocument("/docs/a.pdf", contentID, now, now)
+	if err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+	if docID <= 0 {
+		t.Fatalf("InsertDocument() id = %d, want > 0", docID)
+	}
+
+	doc, err := database.GetDocumentByPath("/docs/a.pdf")
+	if err != nil {
+		t.Fatalf("GetDocumentByPath() error = %v", err)
+	}
+	if doc == nil {
+		t.Fatalf("GetDocumentByPath() = nil, want document")
+	}
+	if doc.ContentID != contentID {
+		t.Fatalf("document content_id = %d, want %d", doc.ContentID, contentID)
+	}
+	if doc.Checksum != "content-a" {
+		t.Fatalf("document checksum = %q, want %q", doc.Checksum, "content-a")
+	}
+	if doc.PageCount != 3 {
+		t.Fatalf("document page_count = %d, want 3", doc.PageCount)
+	}
+}
+
+func TestUpdateDocument_ChangesContentID(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	contentA, err := database.InsertContent("content-a", 1)
+	if err != nil {
+		t.Fatalf("InsertContent(content-a) error = %v", err)
+	}
+	contentB, err := database.InsertContent("content-b", 2)
+	if err != nil {
+		t.Fatalf("InsertContent(content-b) error = %v", err)
+	}
+
+	docID, err := database.InsertDocument("/docs/a.pdf", contentA, now, now)
+	if err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+
+	updatedTime := now.Add(5 * time.Minute)
+	if err := database.UpdateDocument(docID, contentB, updatedTime); err != nil {
+		t.Fatalf("UpdateDocument() error = %v", err)
+	}
+
+	doc, err := database.GetDocumentByPath("/docs/a.pdf")
+	if err != nil {
+		t.Fatalf("GetDocumentByPath() error = %v", err)
+	}
+	if doc == nil {
+		t.Fatalf("GetDocumentByPath() = nil, want document")
+	}
+	if doc.ContentID != contentB {
+		t.Fatalf("document content_id = %d, want %d", doc.ContentID, contentB)
+	}
+	if doc.Checksum != "content-b" {
+		t.Fatalf("document checksum = %q, want %q", doc.Checksum, "content-b")
+	}
+	if doc.PageCount != 2 {
+		t.Fatalf("document page_count = %d, want 2", doc.PageCount)
+	}
+	if !doc.ModifiedAt.Equal(updatedTime) {
+		t.Fatalf("document modified_at = %s, want %s", doc.ModifiedAt.Format(time.RFC3339Nano), updatedTime.Format(time.RFC3339Nano))
+	}
+}
+
 func TestAllDocuments_IncludesNonPending(t *testing.T) {
 	t.Parallel()
 
@@ -15,31 +106,40 @@ func TestAllDocuments_IncludesNonPending(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 
 	now := time.Now().UTC()
+	contentA, err := database.InsertContent("aaa", 3)
+	if err != nil {
+		t.Fatalf("InsertContent(aaa) error = %v", err)
+	}
+	contentB, err := database.InsertContent("bbb", 2)
+	if err != nil {
+		t.Fatalf("InsertContent(bbb) error = %v", err)
+	}
+	if err := database.MarkContentOCRDone(contentB); err != nil {
+		t.Fatalf("MarkContentOCRDone() error = %v", err)
+	}
 
-	// Insert two documents: one pending, one already OCR'd.
-	id1, err := database.InsertDocument("/docs/a.pdf", "aaa", now, now, 3)
+	id1, err := database.InsertDocument("/docs/a.pdf", contentA, now, now)
 	if err != nil {
 		t.Fatalf("InsertDocument(a) error = %v", err)
 	}
-	id2, err := database.InsertDocument("/docs/b.pdf", "bbb", now, now, 2)
+	id2, err := database.InsertDocument("/docs/b.pdf", contentB, now, now)
 	if err != nil {
 		t.Fatalf("InsertDocument(b) error = %v", err)
 	}
-	// Mark b as OCR-done.
-	if err := database.MarkOCRDone(id2); err != nil {
-		t.Fatalf("MarkOCRDone() error = %v", err)
-	}
 
-	// Insert a deleted document that should be excluded.
-	if _, err := database.InsertDocument("/docs/deleted.pdf", "ddd", now, now, 1); err != nil {
+	contentDeleted, err := database.InsertContent("ddd", 1)
+	if err != nil {
+		t.Fatalf("InsertContent(ddd) error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/deleted.pdf", contentDeleted, now, now); err != nil {
 		t.Fatalf("InsertDocument(deleted) error = %v", err)
 	}
+
 	seenPaths := map[string]bool{"/docs/a.pdf": true, "/docs/b.pdf": true}
 	if _, err := database.SoftDeleteMissing(seenPaths, []string{"/docs"}); err != nil {
 		t.Fatalf("SoftDeleteMissing() error = %v", err)
 	}
 
-	// PendingDocuments should return only a.
 	pending, err := database.PendingDocuments()
 	if err != nil {
 		t.Fatalf("PendingDocuments() error = %v", err)
@@ -48,7 +148,6 @@ func TestAllDocuments_IncludesNonPending(t *testing.T) {
 		t.Fatalf("PendingDocuments() returned %d docs, want 1 (id=%d)", len(pending), id1)
 	}
 
-	// AllDocuments should return both a and b (but not deleted).
 	all, err := database.AllDocuments()
 	if err != nil {
 		t.Fatalf("AllDocuments() error = %v", err)
@@ -72,42 +171,58 @@ func TestAllStats_IncludesNonPending(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 
 	now := time.Now().UTC()
+	contentPending, err := database.InsertContent("pending", 3)
+	if err != nil {
+		t.Fatalf("InsertContent(pending) error = %v", err)
+	}
+	contentDone, err := database.InsertContent("done", 2)
+	if err != nil {
+		t.Fatalf("InsertContent(done) error = %v", err)
+	}
+	if err := database.MarkContentOCRDone(contentDone); err != nil {
+		t.Fatalf("MarkContentOCRDone() error = %v", err)
+	}
 
-	// Insert: pending (3 pages), done (2 pages), deleted (10 pages).
-	if _, err := database.InsertDocument("/docs/a.pdf", "aaa", now, now, 3); err != nil {
+	if _, err := database.InsertDocument("/docs/a.pdf", contentPending, now, now); err != nil {
 		t.Fatalf("InsertDocument(a) error = %v", err)
 	}
-	id2, err := database.InsertDocument("/docs/b.pdf", "bbb", now, now, 2)
-	if err != nil {
+	if _, err := database.InsertDocument("/docs/a-copy.pdf", contentPending, now, now); err != nil {
+		t.Fatalf("InsertDocument(a-copy) error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/b.pdf", contentDone, now, now); err != nil {
 		t.Fatalf("InsertDocument(b) error = %v", err)
 	}
-	if err := database.MarkOCRDone(id2); err != nil {
-		t.Fatalf("MarkOCRDone() error = %v", err)
+
+	contentDeleted, err := database.InsertContent("deleted", 10)
+	if err != nil {
+		t.Fatalf("InsertContent(deleted) error = %v", err)
 	}
-	if _, err := database.InsertDocument("/docs/deleted.pdf", "ddd", now, now, 10); err != nil {
+	if _, err := database.InsertDocument("/docs/deleted.pdf", contentDeleted, now, now); err != nil {
 		t.Fatalf("InsertDocument(deleted) error = %v", err)
 	}
-	seenPaths := map[string]bool{"/docs/a.pdf": true, "/docs/b.pdf": true}
+	seenPaths := map[string]bool{
+		"/docs/a.pdf":      true,
+		"/docs/a-copy.pdf": true,
+		"/docs/b.pdf":      true,
+	}
 	if _, err := database.SoftDeleteMissing(seenPaths, []string{"/docs"}); err != nil {
 		t.Fatalf("SoftDeleteMissing() error = %v", err)
 	}
 
-	// PendingStats: 1 doc, 3 pages.
-	pendingDocs, pendingPages, err := database.PendingStats()
+	pendingContents, pendingPages, err := database.PendingStats()
 	if err != nil {
 		t.Fatalf("PendingStats() error = %v", err)
 	}
-	if pendingDocs != 1 || pendingPages != 3 {
-		t.Fatalf("PendingStats() = (%d, %d), want (1, 3)", pendingDocs, pendingPages)
+	if pendingContents != 1 || pendingPages != 3 {
+		t.Fatalf("PendingStats() = (%d, %d), want (1, 3)", pendingContents, pendingPages)
 	}
 
-	// AllStats: 2 docs, 5 pages (excludes deleted).
 	allDocs, allPages, err := database.AllStats()
 	if err != nil {
 		t.Fatalf("AllStats() error = %v", err)
 	}
-	if allDocs != 2 || allPages != 5 {
-		t.Fatalf("AllStats() = (%d, %d), want (2, 5)", allDocs, allPages)
+	if allDocs != 3 || allPages != 8 {
+		t.Fatalf("AllStats() = (%d, %d), want (3, 8)", allDocs, allPages)
 	}
 }
 
@@ -123,7 +238,11 @@ func TestSoftDeleteMissing_OnlyDeletesWithinRoots(t *testing.T) {
 	now := time.Now().UTC()
 	mustInsertDocument := func(path string) {
 		t.Helper()
-		if _, err := database.InsertDocument(path, "checksum-"+path, now, now, 1); err != nil {
+		contentID, err := database.InsertContent("checksum-"+path, 1)
+		if err != nil {
+			t.Fatalf("InsertContent(%q) error = %v", path, err)
+		}
+		if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
 			t.Fatalf("InsertDocument(%q) error = %v", path, err)
 		}
 	}
@@ -169,21 +288,33 @@ func TestResetAllDocuments(t *testing.T) {
 
 	now := time.Now().UTC()
 
-	withPagesID, err := database.InsertDocument("/docs/with-pages.pdf", "aaa", now, now, 2)
+	contentWithPages, err := database.InsertContent("aaa", 2)
 	if err != nil {
+		t.Fatalf("InsertContent(with-pages) error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/with-pages.pdf", contentWithPages, now, now); err != nil {
 		t.Fatalf("InsertDocument(with-pages) error = %v", err)
 	}
-	if err := database.ReplaceDocumentPages(withPagesID, []PageInput{
+	if err := database.ReplaceContentPages(contentWithPages, []PageInput{
 		{PageIndex: 0, Markdown: "page 1"},
 		{PageIndex: 1, Markdown: "page 2"},
 	}); err != nil {
-		t.Fatalf("ReplaceDocumentPages() error = %v", err)
+		t.Fatalf("ReplaceContentPages() error = %v", err)
 	}
 
-	if _, err := database.InsertDocument("/docs/soft-deleted.pdf", "bbb", now, now, 1); err != nil {
+	contentDeleted, err := database.InsertContent("bbb", 1)
+	if err != nil {
+		t.Fatalf("InsertContent(soft-deleted) error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/soft-deleted.pdf", contentDeleted, now, now); err != nil {
 		t.Fatalf("InsertDocument(soft-deleted) error = %v", err)
 	}
-	if _, err := database.InsertDocument("/docs/pending.pdf", "ccc", now, now, 3); err != nil {
+
+	contentPending, err := database.InsertContent("ccc", 3)
+	if err != nil {
+		t.Fatalf("InsertContent(pending) error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/pending.pdf", contentPending, now, now); err != nil {
 		t.Fatalf("InsertDocument(pending) error = %v", err)
 	}
 
@@ -217,5 +348,13 @@ func TestResetAllDocuments(t *testing.T) {
 	}
 	if pageCount != 0 {
 		t.Fatalf("pages row count = %d, want 0", pageCount)
+	}
+
+	var contentCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM contents").Scan(&contentCount); err != nil {
+		t.Fatalf("count contents error = %v", err)
+	}
+	if contentCount != 0 {
+		t.Fatalf("contents row count = %d, want 0", contentCount)
 	}
 }

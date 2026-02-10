@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -51,12 +52,11 @@ func TestSearch_MultiWordMatchesNonContiguous(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	now := time.Now().UTC()
-	docID, err := database.InsertDocument("/docs/fox.pdf", "checksum", now, now, 1)
+	contentID, err := insertTestDocumentWithContent(database, "/docs/fox.pdf", "checksum", 1)
 	if err != nil {
-		t.Fatalf("InsertDocument() error = %v", err)
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
 	}
-	if err := database.UpsertPage(docID, 0, "the quick brown fox jumps over the lazy dog"); err != nil {
+	if err := database.UpsertPage(contentID, 0, "the quick brown fox jumps over the lazy dog"); err != nil {
 		t.Fatalf("UpsertPage() error = %v", err)
 	}
 
@@ -84,12 +84,11 @@ func TestSearch_ReturnsPageCount(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	now := time.Now().UTC()
-	docID, err := database.InsertDocument("/docs/multi.pdf", "checksum", now, now, 7)
+	contentID, err := insertTestDocumentWithContent(database, "/docs/multi.pdf", "checksum", 7)
 	if err != nil {
-		t.Fatalf("InsertDocument() error = %v", err)
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
 	}
-	if err := database.UpsertPage(docID, 3, "searchable content"); err != nil {
+	if err := database.UpsertPage(contentID, 3, "searchable content"); err != nil {
 		t.Fatalf("UpsertPage() error = %v", err)
 	}
 
@@ -114,13 +113,12 @@ func TestSearch_MatchesFilename(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	now := time.Now().UTC()
 	path := "/Users/max/Documents/report.pdf"
-	docID, err := database.InsertDocument(path, "checksum", now, now, 1)
+	contentID, err := insertTestDocumentWithContent(database, path, "checksum", 1)
 	if err != nil {
-		t.Fatalf("InsertDocument() error = %v", err)
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
 	}
-	if err := database.UpsertPage(docID, 0, BuildPageMarkdown(path, 0, "page body")); err != nil {
+	if err := database.UpsertPage(contentID, 0, "page body"); err != nil {
 		t.Fatalf("UpsertPage() error = %v", err)
 	}
 
@@ -145,13 +143,12 @@ func TestSearch_MatchesPath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	now := time.Now().UTC()
 	path := "/Users/max/Documents/invoices/report.pdf"
-	docID, err := database.InsertDocument(path, "checksum", now, now, 1)
+	contentID, err := insertTestDocumentWithContent(database, path, "checksum", 1)
 	if err != nil {
-		t.Fatalf("InsertDocument() error = %v", err)
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
 	}
-	if err := database.UpsertPage(docID, 0, BuildPageMarkdown(path, 0, "page body")); err != nil {
+	if err := database.UpsertPage(contentID, 0, "page body"); err != nil {
 		t.Fatalf("UpsertPage() error = %v", err)
 	}
 
@@ -167,7 +164,7 @@ func TestSearch_MatchesPath(t *testing.T) {
 	}
 }
 
-func TestReplaceDocumentPages_Atomic(t *testing.T) {
+func TestReplaceContentPages_Atomic(t *testing.T) {
 	t.Parallel()
 
 	database, err := Open(t.TempDir())
@@ -176,14 +173,13 @@ func TestReplaceDocumentPages_Atomic(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	now := time.Now().UTC()
-	docID, err := database.InsertDocument("/docs/atomic.pdf", "checksum", now, now, 5)
+	contentID, err := insertTestDocumentWithContent(database, "/docs/atomic.pdf", "checksum", 5)
 	if err != nil {
-		t.Fatalf("InsertDocument() error = %v", err)
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
 	}
 
 	for i := 0; i < 5; i++ {
-		if err := database.UpsertPage(docID, i, "old-page"); err != nil {
+		if err := database.UpsertPage(contentID, i, "old-page"); err != nil {
 			t.Fatalf("UpsertPage(old %d) error = %v", i, err)
 		}
 	}
@@ -194,11 +190,11 @@ func TestReplaceDocumentPages_Atomic(t *testing.T) {
 		{PageIndex: 2, Markdown: "new-2"},
 	}
 
-	if err := database.ReplaceDocumentPages(docID, newPages); err != nil {
-		t.Fatalf("ReplaceDocumentPages() error = %v", err)
+	if err := database.ReplaceContentPages(contentID, newPages); err != nil {
+		t.Fatalf("ReplaceContentPages() error = %v", err)
 	}
 
-	rows, err := database.Query("SELECT page_index, markdown FROM pages WHERE document_id = ? ORDER BY page_index", docID)
+	rows, err := database.Query("SELECT page_index, markdown FROM pages WHERE content_id = ? ORDER BY page_index", contentID)
 	if err != nil {
 		t.Fatalf("query pages error = %v", err)
 	}
@@ -226,19 +222,32 @@ func TestReplaceDocumentPages_Atomic(t *testing.T) {
 		if indices[i] != i {
 			t.Fatalf("page index[%d] = %d, want %d", i, indices[i], i)
 		}
-		if markdowns[i] != "new-"+string(rune('0'+i)) {
-			t.Fatalf("markdown[%d] = %q, want %q", i, markdowns[i], "new-"+string(rune('0'+i)))
+		wantMarkdown := fmt.Sprintf("new-%d", i)
+		if markdowns[i] != wantMarkdown {
+			t.Fatalf("markdown[%d] = %q, want %q", i, markdowns[i], wantMarkdown)
 		}
 	}
 
-	doc, err := database.GetDocumentByPath("/docs/atomic.pdf")
+	content, err := database.GetContentByChecksum("checksum")
 	if err != nil {
-		t.Fatalf("GetDocumentByPath() error = %v", err)
+		t.Fatalf("GetContentByChecksum() error = %v", err)
 	}
-	if doc == nil {
-		t.Fatalf("document not found")
+	if content == nil {
+		t.Fatalf("content not found")
 	}
-	if doc.OCRPending {
+	if content.OCRPending {
 		t.Fatalf("ocr_pending = true, want false")
 	}
+}
+
+func insertTestDocumentWithContent(database *DB, path, checksum string, pageCount int) (int64, error) {
+	now := time.Now().UTC()
+	contentID, err := database.InsertContent(checksum, pageCount)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
+		return 0, err
+	}
+	return contentID, nil
 }

@@ -129,28 +129,56 @@ func runSweep(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("query document: %w", err)
 		}
 
+		desiredPending := true
+		checksumChanged := false
+		mtimeChanged := false
+		if existing != nil {
+			checksumChanged = existing.Checksum != cs
+			mtimeChanged = !existing.ModifiedAt.Equal(fi.ModTime)
+			desiredPending = existing.OCRPending || (checksumChanged && mtimeChanged)
+		}
+
+		content, err := database.GetContentByChecksum(cs)
+		if err != nil {
+			return fmt.Errorf("query content: %w", err)
+		}
+
+		if content == nil {
+			contentID, err := database.InsertContent(cs, pageCount)
+			if err != nil {
+				return fmt.Errorf("insert content: %w", err)
+			}
+			content = &db.Content{
+				ID:         contentID,
+				Checksum:   cs,
+				PageCount:  pageCount,
+				OCRPending: true,
+			}
+
+			if !desiredPending {
+				if err := database.MarkContentOCRDone(contentID); err != nil {
+					return fmt.Errorf("mark content OCR done: %w", err)
+				}
+				content.OCRPending = false
+			}
+		}
+
 		if existing == nil {
 			// New file
-			if _, err := database.InsertDocument(fi.Path, cs, fi.ModTime, fi.ModTime, pageCount); err != nil {
+			if _, err := database.InsertDocument(fi.Path, content.ID, fi.ModTime, fi.ModTime); err != nil {
 				return fmt.Errorf("insert document: %w", err)
 			}
 			newCount++
 		} else if existing.Deleted {
 			// Was soft-deleted, now reappeared
-			checksumChanged := existing.Checksum != cs
-			mtimeChanged := !existing.ModifiedAt.Equal(fi.ModTime)
-			ocrPending := existing.OCRPending || (checksumChanged && mtimeChanged)
-			if err := database.RestoreDocument(existing.ID, cs, fi.ModTime, pageCount, ocrPending); err != nil {
+			if err := database.RestoreDocument(existing.ID, content.ID, fi.ModTime); err != nil {
 				return fmt.Errorf("restore document: %w", err)
 			}
 			restoredCount++
 		} else {
-			checksumChanged := existing.Checksum != cs
-			mtimeChanged := !existing.ModifiedAt.Equal(fi.ModTime)
-			ocrPending := existing.OCRPending || (checksumChanged && mtimeChanged)
-
-			if checksumChanged || mtimeChanged {
-				if err := database.UpdateDocument(existing.ID, cs, fi.ModTime, pageCount, ocrPending); err != nil {
+			contentChanged := existing.ContentID != content.ID
+			if checksumChanged || mtimeChanged || contentChanged {
+				if err := database.UpdateDocument(existing.ID, content.ID, fi.ModTime); err != nil {
 					return fmt.Errorf("update document: %w", err)
 				}
 				if checksumChanged {
@@ -172,6 +200,9 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	deletedCount, err := database.SoftDeleteMissing(seenPaths, paths)
 	if err != nil {
 		return fmt.Errorf("soft delete: %w", err)
+	}
+	if _, err := database.CleanupOrphanContents(); err != nil {
+		return fmt.Errorf("cleanup orphan contents: %w", err)
 	}
 
 	fmt.Printf("Sweep complete: %d new, %d updated, %d restored, %d deleted, %d unchanged\n",

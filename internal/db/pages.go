@@ -7,7 +7,13 @@ import (
 	"unicode"
 )
 
-const defaultSearchLimit = 50
+const (
+	defaultSearchLimit = 50
+
+	searchSourceFTS     = "fts"
+	searchSourceTrigram = "trigram"
+	searchSourcePath    = "path"
+)
 
 type PageRecord struct {
 	ID        int64
@@ -22,11 +28,12 @@ type PageInput struct {
 }
 
 type SearchResult struct {
-	Path      string
-	PageIndex int
-	PageCount int
-	Snippet   string
-	Rank      float64
+	Path         string
+	PageIndex    int
+	PageCount    int
+	Snippet      string
+	Rank         float64
+	SearchSource string
 }
 
 type SearchOptions struct {
@@ -141,14 +148,14 @@ func (db *DB) SearchWithOptions(opts SearchOptions) ([]SearchResult, error) {
 		ftsQuery = buildFTSQueryTokens(queryTokens, searchMode)
 	}
 
-	primaryResults, err := db.queryFTSResults("pages_fts", ftsQuery, fetchLimit, 0)
+	primaryResults, err := db.queryFTSResults("pages_fts", ftsQuery, fetchLimit, 0, searchSourceFTS)
 	if err != nil {
 		return nil, err
 	}
 
 	combinedResults := primaryResults
 	if opts.UseTrigram {
-		trigramResults, err := db.queryFTSResults("pages_fts_trigram", ftsQuery, fetchLimit, 0)
+		trigramResults, err := db.queryFTSResults("pages_fts_trigram", ftsQuery, fetchLimit, 0, searchSourceTrigram)
 		if err != nil {
 			return nil, err
 		}
@@ -166,7 +173,7 @@ func (db *DB) SearchWithOptions(opts SearchOptions) ([]SearchResult, error) {
 	return paginateSearchResults(combinedResults, searchLimit, searchOffset), nil
 }
 
-func (db *DB) queryFTSResults(indexName string, ftsQuery string, limit int, offset int) ([]SearchResult, error) {
+func (db *DB) queryFTSResults(indexName string, ftsQuery string, limit int, offset int, searchSource string) ([]SearchResult, error) {
 	query := fmt.Sprintf(
 		`SELECT d.path, p.page_index, c.page_count,
 		        snippet(%[1]s, 0, '>>>', '<<<', '...', 48) as snippet,
@@ -194,6 +201,7 @@ func (db *DB) queryFTSResults(indexName string, ftsQuery string, limit int, offs
 		if err := rows.Scan(&result.Path, &result.PageIndex, &result.PageCount, &result.Snippet, &result.Rank); err != nil {
 			return nil, err
 		}
+		result.SearchSource = searchSource
 		results = append(results, result)
 	}
 	if err := rows.Err(); err != nil {
@@ -245,6 +253,7 @@ func (db *DB) queryPathMatches(tokens []string, mode string, limit int, offset i
 		if err := rows.Scan(&result.Path, &result.PageIndex, &result.PageCount, &result.Snippet, &result.Rank); err != nil {
 			return nil, err
 		}
+		result.SearchSource = searchSourcePath
 		results = append(results, result)
 	}
 	if err := rows.Err(); err != nil {

@@ -12,18 +12,20 @@ func TestWriteFindResultsNDJSON_GoldenShape(t *testing.T) {
 
 	results := []db.SearchResult{
 		{
-			Path:      "/docs/a.pdf",
-			PageIndex: 0,
-			PageCount: 4,
-			Snippet:   "alpha >>>beta<<<",
-			Rank:      0.1234,
+			Path:         "/docs/a.pdf",
+			PageIndex:    0,
+			PageCount:    4,
+			Snippet:      "alpha >>>beta<<<",
+			Rank:         0.1234,
+			SearchSource: "fts",
 		},
 		{
-			Path:      "/docs/b.pdf",
-			PageIndex: 3,
-			PageCount: 7,
-			Snippet:   "",
-			Rank:      1.5,
+			Path:         "/docs/b.pdf",
+			PageIndex:    3,
+			PageCount:    7,
+			Snippet:      "",
+			Rank:         1.5,
+			SearchSource: "trigram",
 		},
 	}
 
@@ -32,8 +34,8 @@ func TestWriteFindResultsNDJSON_GoldenShape(t *testing.T) {
 		t.Fatalf("WriteFindResultsNDJSON() error = %v", err)
 	}
 
-	const want = "{\"path\":\"/docs/a.pdf\",\"page_index\":0,\"page_count\":4,\"snippet\":\"alpha >>>beta<<<\",\"rank\":0.1234}\n" +
-		"{\"path\":\"/docs/b.pdf\",\"page_index\":3,\"page_count\":7,\"snippet\":\"\",\"rank\":1.5}\n"
+	const want = "{\"path\":\"/docs/a.pdf\",\"page_index\":0,\"page_count\":4,\"snippet\":\"alpha >>>beta<<<\",\"rank\":0.1234,\"search_source\":\"fts\"}\n" +
+		"{\"path\":\"/docs/b.pdf\",\"page_index\":3,\"page_count\":7,\"snippet\":\"\",\"rank\":1.5,\"search_source\":\"trigram\"}\n"
 
 	if got.String() != want {
 		t.Fatalf("WriteFindResultsNDJSON() output mismatch\n got: %q\nwant: %q", got.String(), want)

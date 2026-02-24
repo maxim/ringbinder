@@ -227,6 +227,68 @@ func TestSearchWithOptions_UseTrigram(t *testing.T) {
 	}
 }
 
+func TestSearchWithOptions_SearchSourceFields(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	textContentID, err := insertTestDocumentWithContent(database, "/docs/source-fts.pdf", "checksum-source-fts", 1)
+	if err != nil {
+		t.Fatalf("insertTestDocumentWithContent(fts) error = %v", err)
+	}
+	if err := database.UpsertPage(textContentID, 0, "alpha beta"); err != nil {
+		t.Fatalf("UpsertPage(fts) error = %v", err)
+	}
+
+	pathContentID, err := insertTestDocumentWithContent(database, "/docs/source-path-invoice.pdf", "checksum-source-path", 1)
+	if err != nil {
+		t.Fatalf("insertTestDocumentWithContent(path) error = %v", err)
+	}
+	if err := database.UpsertPage(pathContentID, 0, "unrelated body"); err != nil {
+		t.Fatalf("UpsertPage(path) error = %v", err)
+	}
+
+	ftsResults, err := database.SearchWithOptions(SearchOptions{
+		Query:           "alpha",
+		Mode:            "and",
+		Limit:           10,
+		Offset:          0,
+		IncludePathLike: false,
+		UseTrigram:      false,
+	})
+	if err != nil {
+		t.Fatalf("SearchWithOptions(fts) error = %v", err)
+	}
+	if len(ftsResults) != 1 {
+		t.Fatalf("SearchWithOptions(fts) returned %d rows, want 1", len(ftsResults))
+	}
+	if ftsResults[0].SearchSource != "fts" {
+		t.Fatalf("fts result search_source = %q, want %q", ftsResults[0].SearchSource, "fts")
+	}
+
+	pathResults, err := database.SearchWithOptions(SearchOptions{
+		Query:           "invoice",
+		Mode:            "and",
+		Limit:           10,
+		Offset:          0,
+		IncludePathLike: true,
+		UseTrigram:      false,
+	})
+	if err != nil {
+		t.Fatalf("SearchWithOptions(path) error = %v", err)
+	}
+	if len(pathResults) == 0 {
+		t.Fatalf("SearchWithOptions(path) returned 0 rows, want >= 1")
+	}
+	if pathResults[0].SearchSource != "path" {
+		t.Fatalf("path result search_source = %q, want %q", pathResults[0].SearchSource, "path")
+	}
+}
+
 func TestSearchWithOptions_LimitOffset(t *testing.T) {
 	t.Parallel()
 

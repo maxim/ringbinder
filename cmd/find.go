@@ -19,6 +19,7 @@ var (
 	findOffset  int
 	findMode    string
 	findRawFTS  string
+	findTrigram bool
 )
 
 func init() {
@@ -28,6 +29,7 @@ func init() {
 	findCmd.Flags().IntVar(&findOffset, "offset", 0, "Result offset for pagination")
 	findCmd.Flags().StringVar(&findMode, "mode", "and", "Token combine mode: and|or")
 	findCmd.Flags().StringVar(&findRawFTS, "fts", "", "Raw FTS5 query; skips tokenization")
+	findCmd.Flags().BoolVar(&findTrigram, "trigram", false, "Also query trigram FTS index for OCR-noisy/partial matches")
 	rootCmd.AddCommand(findCmd)
 }
 
@@ -64,6 +66,7 @@ func runFind(cmd *cobra.Command, args []string) error {
 		Limit:           findLimit,
 		Offset:          findOffset,
 		IncludePathLike: true,
+		UseTrigram:      findTrigram,
 	})
 	if err != nil {
 		return fmt.Errorf("search: %w", err)

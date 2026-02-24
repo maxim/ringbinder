@@ -41,9 +41,22 @@ func (db *DB) migrate() error {
 
 	switch ver {
 	case 0:
-		// Fresh database — apply full schema
+		// Fresh database — apply full schema.
 		if _, err := db.Exec(schemaSQL); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
+		}
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		return nil
+	case 1:
+		if _, err := db.Exec(schemaV1ToV2SQL); err != nil {
+			return fmt.Errorf("migrate schema v1->v2: %w", err)
+		}
+		// Recompute normalized search text using the same path as write-time updates,
+		// so historical pages benefit from the new retrieval behavior immediately.
+		if err := db.backfillPageSearchText(); err != nil {
+			return fmt.Errorf("backfill search text: %w", err)
 		}
 		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 			return fmt.Errorf("set schema version: %w", err)

@@ -63,6 +63,38 @@ func TestBuildFTSQueryTokens(t *testing.T) {
 	}
 }
 
+func TestNormalizeSearchText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "markdown punctuation",
+			input:    "# Heading\n- **Bold** [Link](https://example.com)",
+			expected: "heading bold link https example com",
+		},
+		{
+			name:     "collapses whitespace",
+			input:    "alpha\n\n\tbeta   gamma",
+			expected: "alpha beta gamma",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := normalizeSearchText(tt.input); got != tt.expected {
+				t.Fatalf("normalizeSearchText(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestSearch_MultiWordMatchesNonContiguous(t *testing.T) {
 	t.Parallel()
 
@@ -141,6 +173,57 @@ func TestSearchWithOptions_ModeOR(t *testing.T) {
 	}
 	if orResults[0].Path != "/docs/mode.pdf" {
 		t.Fatalf("result path = %q, want %q", orResults[0].Path, "/docs/mode.pdf")
+	}
+}
+
+func TestSearchWithOptions_UseTrigram(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	contentID, err := insertTestDocumentWithContent(database, "/docs/trigram.pdf", "checksum", 1)
+	if err != nil {
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
+	}
+	if err := database.UpsertPage(contentID, 0, "reimbursement summary"); err != nil {
+		t.Fatalf("UpsertPage() error = %v", err)
+	}
+
+	plainResults, err := database.SearchWithOptions(SearchOptions{
+		Query:           "imburse",
+		Mode:            "and",
+		Limit:           50,
+		Offset:          0,
+		IncludePathLike: false,
+		UseTrigram:      false,
+	})
+	if err != nil {
+		t.Fatalf("SearchWithOptions(plain) error = %v", err)
+	}
+	if len(plainResults) != 0 {
+		t.Fatalf("SearchWithOptions(plain) returned %d rows, want 0", len(plainResults))
+	}
+
+	trigramResults, err := database.SearchWithOptions(SearchOptions{
+		Query:           "imburse",
+		Mode:            "and",
+		Limit:           50,
+		Offset:          0,
+		IncludePathLike: false,
+		UseTrigram:      true,
+	})
+	if err != nil {
+		t.Fatalf("SearchWithOptions(trigram) error = %v", err)
+	}
+	if len(trigramResults) != 1 {
+		t.Fatalf("SearchWithOptions(trigram) returned %d rows, want 1", len(trigramResults))
+	}
+	if trigramResults[0].Path != "/docs/trigram.pdf" {
+		t.Fatalf("result path = %q, want %q", trigramResults[0].Path, "/docs/trigram.pdf")
 	}
 }
 
@@ -337,6 +420,32 @@ func TestGetPagesMarkdownByPathAndRange(t *testing.T) {
 	}
 	if pages[0].Markdown != "page-1" || pages[1].Markdown != "page-2" || pages[2].Markdown != "page-3" {
 		t.Fatalf("markdown values = [%q, %q, %q], want [page-1 page-2 page-3]", pages[0].Markdown, pages[1].Markdown, pages[2].Markdown)
+	}
+}
+
+func TestUpsertPage_StoresNormalizedSearchText(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	contentID, err := insertTestDocumentWithContent(database, "/docs/normalize.pdf", "checksum-normalize", 1)
+	if err != nil {
+		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
+	}
+	if err := database.UpsertPage(contentID, 0, "# Alpha **Beta**"); err != nil {
+		t.Fatalf("UpsertPage() error = %v", err)
+	}
+
+	var searchText string
+	if err := database.QueryRow("SELECT search_text FROM pages WHERE content_id = ? AND page_index = 0", contentID).Scan(&searchText); err != nil {
+		t.Fatalf("query search_text error = %v", err)
+	}
+	if searchText != "alpha beta" {
+		t.Fatalf("search_text = %q, want %q", searchText, "alpha beta")
 	}
 }
 

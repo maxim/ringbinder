@@ -5,26 +5,47 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/format"
-	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
-var findVerbose bool
+var (
+	findVerbose bool
+	findJSON    bool
+	findLimit   int
+	findOffset  int
+	findMode    string
+	findRawFTS  string
+)
 
 func init() {
 	findCmd.Flags().BoolVarP(&findVerbose, "verbose", "v", false, "Show text snippets")
+	findCmd.Flags().BoolVar(&findJSON, "json", false, "Emit NDJSON records for machine consumption")
+	findCmd.Flags().IntVar(&findLimit, "limit", 50, "Maximum number of results to return")
+	findCmd.Flags().IntVar(&findOffset, "offset", 0, "Result offset for pagination")
+	findCmd.Flags().StringVar(&findMode, "mode", "and", "Token combine mode: and|or")
+	findCmd.Flags().StringVar(&findRawFTS, "fts", "", "Raw FTS5 query; skips tokenization")
 	rootCmd.AddCommand(findCmd)
 }
 
 var findCmd = &cobra.Command{
-	Use:   "find <query>",
+	Use:   "find [query]",
 	Short: "Full-text search across OCR'd documents",
-	Long:  "Searches the OCR'd text content of all indexed documents and shows matching file paths, pages, and text snippets.",
-	Args:  cobra.MinimumNArgs(1),
-	RunE:  runFind,
+	Long:  "Searches OCR text across indexed documents. Use --json for machine-readable NDJSON output.",
+	Args: func(cmd *cobra.Command, args []string) error {
+		rawFTS, err := cmd.Flags().GetString("fts")
+		if err != nil {
+			return fmt.Errorf("read --fts flag: %w", err)
+		}
+		if len(args) == 0 && strings.TrimSpace(rawFTS) == "" {
+			return fmt.Errorf("requires a query argument or --fts")
+		}
+		return nil
+	},
+	RunE: runFind,
 }
 
 func runFind(cmd *cobra.Command, args []string) error {
@@ -36,9 +57,20 @@ func runFind(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	results, err := database.Search(query)
+	results, err := database.SearchWithOptions(db.SearchOptions{
+		Query:           query,
+		RawFTS:          findRawFTS,
+		Mode:            findMode,
+		Limit:           findLimit,
+		Offset:          findOffset,
+		IncludePathLike: true,
+	})
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
+	}
+
+	if findJSON {
+		return format.WriteFindResultsNDJSON(os.Stdout, results)
 	}
 
 	if len(results) == 0 {

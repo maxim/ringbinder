@@ -12,7 +12,7 @@ var cfgFile string
 var rootCmd = &cobra.Command{
 	Use:   "ringbinder",
 	Short: "Scan, OCR, and search your documents",
-	Long:  "Ringbinder scans your filesystem for PDFs and images, runs them through OCR, and lets you full-text search the results.",
+	Long:  "Ringbinder scans your filesystem for PDFs and images, runs them through OCR, and lets you full-text search the results. Use --json on supported commands for automation/tooling.",
 }
 
 func Execute() error {

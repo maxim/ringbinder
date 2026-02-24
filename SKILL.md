@@ -1,91 +1,72 @@
 ---
 name: ringbinder
-description: Use the ringbinder CLI to search OCR’d PDFs/images via SQLite FTS, read full OCR pages to answer questions with quoted citations, and propose safe renames for timestamp-named files based on OCR content (ask for confirmation before applying).
-compatibility: Requires the ringbinder CLI in PATH and a populated ringbinder SQLite database (run ringbinder sweep + ringbinder ocr first).
+description: Use ringbinder CLI to retrieve OCR evidence from SQLite FTS, answer with citations, and propose safe file renames (confirm before applying).
+compatibility: Requires ringbinder in PATH and a populated DB (run ringbinder sweep + ringbinder ocr first).
 ---
 
 # Ringbinder
 
 ## Setup
-- Ensure the database is populated:
+- Populate/update index:
   - `ringbinder sweep <paths...>`
   - `ringbinder ocr`
-- Use JSON output for automation when available.
+- Prefer machine output: `--json` (find uses NDJSON).
 
 ## Capability A: Evidence-based Q&A (no embeddings)
 
-### Procedure
-1. Create **multiple search probes** (5–20):
-   - one precise probe (must-have terms)
-   - several broader probes (synonyms, alternate phrasing)
-   - include doc-type terms when helpful (invoice/receipt/statement/denial/etc.)
-   - if needed, a fallback probe using OR semantics or raw FTS syntax
+### Retrieval loop
+1. Build probe set (5–20 probes):
+   - precision probes: `--mode and`
+   - recall probes: `--mode or`
+   - expert probes: `--fts '<raw fts5 query>'`
+   - OCR-noise fallback: repeat key probes with `--trigram`
 
-2. For each probe:
-   - run `ringbinder find --json --limit 50 <probe>`
-   - union results and dedupe by `(path, page_index)`
+2. Run each probe:
+   - `ringbinder find --json --limit 50 --offset 0 <query>`
+   - or `ringbinder find --json --fts '<raw>'`
 
-3. Select candidates:
-   - prefer lower `rank` (bm25) and higher snippet relevance
-   - keep ~10–30 candidate pages total
+3. Parse result fields:
+   - `path`, `page_index`, `page_count`, `snippet`, `rank`, `search_source`
+   - `search_source` is one of: `fts`, `trigram`, `path`
 
-4. Read source pages (verify before answering):
-   - `ringbinder read --json --path <path> --page <page_index> --context 1`
-   - treat the returned markdown as ground truth
+4. Merge candidates:
+   - dedupe by `(path, page_index)`
+   - prefer `fts` over `trigram` over `path` when evidence quality conflicts
+   - keep ~10–30 pages for reading
 
-5. Answer with citations:
-   - quote the exact lines supporting each factual claim
-   - cite as `path (page X)` where X is 1-based for humans
+5. Read full text before answering:
+   - `ringbinder read --json --path <path> --page <i> --context 1`
+   - use `--start/--end` for wider ranges when needed
 
-6. If evidence is weak:
-   - run another probe round (different synonyms / fewer constraints / OR-mode/raw FTS)
-   - if still unclear, ask one targeted clarifying question (name, approximate date, doc type, folder, etc.)
+6. Optional metadata for ranking/citations:
+   - `ringbinder doc get --json --path <path>`
+
+7. Answer with quotes and citations:
+   - quote exact supporting lines
+   - cite as `path (page X)` with human 1-based page numbers
 
 ### Rules
-- Do not guess. If you can’t quote supporting text from retrieved pages, say so and continue searching or ask for clarification.
-- Prefer reading a few pages thoroughly over skimming many snippets.
+- Never guess; only claim what you can quote from `read` output.
+- If evidence is weak, run more probes (OR/raw/trigram) or ask one targeted clarifying question.
+- Prefer reading fewer pages deeply over many snippets shallowly.
 
 ## Capability B: Propose and apply renames for timestamp-like filenames
 
-### Intent
-Some files have non-descriptive names (often just a date/time). Use Ringbinder’s OCR text to propose better filenames, then (only after confirmation) rename files and update Ringbinder’s paths.
-
 ### Procedure
-1. Identify rename candidates:
-   - basename looks like a timestamp (e.g. `20240224_123735.pdf`, `2024-02-24 12.37.35.jpg`, etc.).
-
-2. For each candidate, read enough OCR to name it:
-   - start with `ringbinder read --json --path <path> --page 0 --context 1`
-   - if page 0 is uninformative, read more pages until naming is justified
-
-3. Extract a relevant date and normalize it:
-   - prefer a date that is *semantically primary* for the document (invoice date, statement period end, appointment date, letter date, etc.)
-   - if no reliable OCR date exists, fallback to a date derived from the original filename
-   - date formats must be one of:
-     - `YYYY-MM-DD` (preferred when day is known)
-     - `YYYY-MM` (when only month is known)
-     - `YYYY` (when only year is known)
-
-4. Propose a descriptive title from OCR:
-   - short, specific summary: issuer/vendor/person + doc type + key subject
-   - filesystem-safe (avoid `/`, `:`, control chars); keep it reasonably short
-
-5. Build the proposed filename:
-   - `<date> - <title>.<ext>`
-   - example: `2024-01-17 - Aetna - Claim Denial Letter.pdf`
-   - ensure uniqueness in the directory (add a disambiguator like ` (2)` only if needed)
-
-6. Present one full rename plan and ask for confirmation:
-   - show a single list of `OLD_PATH  ->  NEW_PATH`
-   - ask the user to confirm before making any changes
-
-7. After confirmation: perform renames and update Ringbinder:
-   - rename files on disk
-   - update Ringbinder’s stored paths afterwards so search results reflect new names
-     - if Ringbinder has a dedicated rename command, use it
-     - otherwise run `ringbinder sweep` on the affected roots; it should re-link by checksum without re-OCR
+1. Identify candidates with timestamp-like basenames.
+2. Read OCR for each candidate:
+   - start: `ringbinder read --json --path <path> --page 0 --context 1`
+   - expand pages only if needed.
+3. Extract date:
+   - prefer semantic doc date from OCR
+   - fallback to filename date only if OCR date is unreliable
+   - format as `YYYY-MM-DD`, or `YYYY-MM`, or `YYYY`.
+4. Create title from OCR (short, specific, filesystem-safe).
+5. Propose filename: `<date> - <title>.<ext>`.
+6. Present full rename plan (`OLD -> NEW`) and ask for explicit confirmation.
+7. After confirmation, rename files and refresh Ringbinder paths (rename command if available, otherwise `ringbinder sweep` on affected roots).
 
 ### Rules
-- Never rename anything until the user explicitly confirms the full proposed list.
-- Every proposed name must include a normalized date; only fallback to filename date when OCR doesn’t contain a reliable one.
-- Do not invent titles; base them on text you actually read via `ringbinder read`.
+- Do not rename anything before explicit user confirmation.
+- Every proposed name must include a normalized date.
+- Do not invent titles; base them on retrieved OCR text.

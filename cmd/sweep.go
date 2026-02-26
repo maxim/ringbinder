@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 func init() {
 	rootCmd.AddCommand(sweepCmd)
 	sweepCmd.Flags().Bool("redo", false, "Delete all data and re-sweep from scratch")
+	sweepCmd.Flags().IntP("concurrency", "j", 4, "Number of concurrent file processing workers")
 	sweepCmd.Flags().StringSlice("exclude", nil, "File paths to exclude from sweep")
 }
 
@@ -32,6 +34,13 @@ var sweepCmd = &cobra.Command{
 	Short: "Scan filesystem paths for PDFs and images",
 	Long:  "Scans the given paths (or paths from config) for PNG, JPEG, and PDF files and indexes them in the database.",
 	RunE:  runSweep,
+}
+
+type sweepResult struct {
+	fi        scanner.FileInfo
+	checksum  string
+	pageCount int
+	err       error
 }
 
 func runSweep(cmd *cobra.Command, args []string) error {
@@ -90,6 +99,16 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read redo flag: %w", err)
 	}
+	concurrency := 4
+	if cmd.Flags().Lookup("concurrency") != nil {
+		concurrency, err = cmd.Flags().GetInt("concurrency")
+		if err != nil {
+			return fmt.Errorf("read concurrency flag: %w", err)
+		}
+	}
+	if concurrency < 1 {
+		return fmt.Errorf("--concurrency must be >= 1")
+	}
 	if redo {
 		var documentCount int
 		if err := database.QueryRow("SELECT COUNT(*) FROM documents").Scan(&documentCount); err != nil {
@@ -115,12 +134,16 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Deleted %d documents.\n", deletedCount)
 	}
 
-	ctx := cmd.Context()
-	if ctx == nil {
-		ctx = context.Background()
+	baseCtx := cmd.Context()
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
+
 	s := scanner.NewScanner()
 	results := make(chan scanner.FileInfo, 100)
+	processed := make(chan sweepResult, 100)
 
 	// Run scan in background
 	scanErr := make(chan error, 1)
@@ -130,6 +153,7 @@ func runSweep(cmd *cobra.Command, args []string) error {
 
 	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
 	var scanned atomic.Int64
+	stopSweepSpinner := func() {}
 	if isTTY {
 		var spinnerPtr atomic.Pointer[progress.Spinner]
 		sweepSpinner := progress.NewSpinner(80*time.Millisecond, func() {
@@ -141,77 +165,127 @@ func runSweep(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stdout, "\r%c %d files scanned   ", frame, scanned.Load())
 		})
 		spinnerPtr.Store(sweepSpinner)
-		defer func() {
-			sweepSpinner.Stop()
-			fmt.Fprintf(os.Stdout, "\r                                                                                \r")
-		}()
+		var stopOnce sync.Once
+		stopSweepSpinner = func() {
+			stopOnce.Do(func() {
+				sweepSpinner.Stop()
+				fmt.Fprintf(os.Stdout, "\r                                                                                \r")
+			})
+		}
+		defer stopSweepSpinner()
 	}
 
 	var newCount, updatedCount, restoredCount, unchangedCount int
 	seenPaths := make(map[string]bool)
 
-	for fi := range results {
-		scanned.Add(1)
+	var workerWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
 
-		if excludeSet[fi.Path] {
-			continue
-		}
+			for fi := range results {
+				scanned.Add(1)
 
-		seenPaths[fi.Path] = true
+				if excludeSet[fi.Path] {
+					continue
+				}
 
-		// Compute checksum
-		cs, err := checksum.SHA256File(fi.Path)
-		if err != nil {
-			fmt.Printf("  warning: checksum failed for %s: %v\n", fi.Path, err)
-			continue
-		}
+				// If canceled, keep draining scanner output to avoid blocking scanner goroutine.
+				if ctx.Err() != nil {
+					continue
+				}
 
-		// Count pages
-		pageCount := 1
-		if fi.ContentType == "pdf" {
-			pc, err := pdf.PageCount(fi.Path)
-			if err != nil {
-				fmt.Printf("  warning: page count failed for %s: %v\n", fi.Path, err)
-				continue
+				res := sweepResult{
+					fi:        fi,
+					pageCount: 1,
+				}
+
+				cs, err := checksum.SHA256File(fi.Path)
+				if err != nil {
+					res.err = fmt.Errorf("checksum failed for %s: %w", fi.Path, err)
+					processed <- res
+					continue
+				}
+				res.checksum = cs
+
+				if fi.ContentType == "pdf" {
+					pc, err := pdf.PageCount(fi.Path)
+					if err != nil {
+						res.err = fmt.Errorf("page count failed for %s: %w", fi.Path, err)
+						processed <- res
+						continue
+					}
+					res.pageCount = pc
+				}
+
+				processed <- res
 			}
-			pageCount = pc
+		}()
+	}
+
+	go func() {
+		workerWg.Wait()
+		close(processed)
+	}()
+
+	var dbErr error
+
+	for res := range processed {
+		if dbErr != nil {
+			continue
+		}
+
+		seenPaths[res.fi.Path] = true
+
+		if res.err != nil {
+			fmt.Printf("  warning: %v\n", res.err)
+			continue
 		}
 
 		// Check existing record
-		existing, err := database.GetDocumentByPath(fi.Path)
+		existing, err := database.GetDocumentByPath(res.fi.Path)
 		if err != nil {
-			return fmt.Errorf("query document: %w", err)
+			dbErr = fmt.Errorf("query document: %w", err)
+			cancel()
+			continue
 		}
 
 		desiredPending := true
 		checksumChanged := false
 		mtimeChanged := false
 		if existing != nil {
-			checksumChanged = existing.Checksum != cs
-			mtimeChanged = !existing.ModifiedAt.Equal(fi.ModTime)
+			checksumChanged = existing.Checksum != res.checksum
+			mtimeChanged = !existing.ModifiedAt.Equal(res.fi.ModTime)
 			desiredPending = existing.OCRPending || (checksumChanged && mtimeChanged)
 		}
 
-		content, err := database.GetContentByChecksum(cs)
+		content, err := database.GetContentByChecksum(res.checksum)
 		if err != nil {
-			return fmt.Errorf("query content: %w", err)
+			dbErr = fmt.Errorf("query content: %w", err)
+			cancel()
+			continue
 		}
 
 		if content == nil {
-			contentID, err := database.InsertContent(cs, pageCount)
+			contentID, err := database.InsertContent(res.checksum, res.pageCount)
 			if err != nil {
-				return fmt.Errorf("insert content: %w", err)
+				dbErr = fmt.Errorf("insert content: %w", err)
+				cancel()
+				continue
 			}
 			content = &db.Content{
 				ID:         contentID,
-				Checksum:   cs,
-				PageCount:  pageCount,
+				Checksum:   res.checksum,
+				PageCount:  res.pageCount,
 				OCRPending: true,
 			}
 
 			if !desiredPending {
 				if err := database.MarkContentOCRDone(contentID); err != nil {
-					return fmt.Errorf("mark content OCR done: %w", err)
+					dbErr = fmt.Errorf("mark content OCR done: %w", err)
+					cancel()
+					continue
 				}
 				content.OCRPending = false
 			}
@@ -219,21 +293,27 @@ func runSweep(cmd *cobra.Command, args []string) error {
 
 		if existing == nil {
 			// New file
-			if _, err := database.InsertDocument(fi.Path, content.ID, fi.ModTime, fi.ModTime); err != nil {
-				return fmt.Errorf("insert document: %w", err)
+			if _, err := database.InsertDocument(res.fi.Path, content.ID, res.fi.ModTime, res.fi.ModTime); err != nil {
+				dbErr = fmt.Errorf("insert document: %w", err)
+				cancel()
+				continue
 			}
 			newCount++
 		} else if existing.Deleted {
 			// Was soft-deleted, now reappeared
-			if err := database.RestoreDocument(existing.ID, content.ID, fi.ModTime); err != nil {
-				return fmt.Errorf("restore document: %w", err)
+			if err := database.RestoreDocument(existing.ID, content.ID, res.fi.ModTime); err != nil {
+				dbErr = fmt.Errorf("restore document: %w", err)
+				cancel()
+				continue
 			}
 			restoredCount++
 		} else {
 			contentChanged := existing.ContentID != content.ID
 			if checksumChanged || mtimeChanged || contentChanged {
-				if err := database.UpdateDocument(existing.ID, content.ID, fi.ModTime); err != nil {
-					return fmt.Errorf("update document: %w", err)
+				if err := database.UpdateDocument(existing.ID, content.ID, res.fi.ModTime); err != nil {
+					dbErr = fmt.Errorf("update document: %w", err)
+					cancel()
+					continue
 				}
 				if checksumChanged {
 					updatedCount++
@@ -246,9 +326,14 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if err := <-scanErr; err != nil {
+	if err := <-scanErr; err != nil && dbErr == nil {
 		return fmt.Errorf("scan: %w", err)
 	}
+
+	if dbErr != nil {
+		return dbErr
+	}
+	stopSweepSpinner()
 
 	// Soft-delete files no longer present
 	deletedCount, err := database.SoftDeleteMissing(seenPaths, paths)
@@ -259,8 +344,8 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cleanup orphan contents: %w", err)
 	}
 
-	fmt.Printf("Sweep complete: %d new, %d updated, %d restored, %d deleted, %d unchanged\n",
-		newCount, updatedCount, restoredCount, deletedCount, unchangedCount)
+	fmt.Printf("Sweep complete: %d scanned, %d new, %d updated, %d restored, %d deleted, %d unchanged\n",
+		scanned.Load(), newCount, updatedCount, restoredCount, deletedCount, unchangedCount)
 
 	return nil
 }

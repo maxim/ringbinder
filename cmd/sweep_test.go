@@ -29,6 +29,7 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 
 	cmd := &cobra.Command{}
 	cmd.Flags().Bool("redo", false, "")
+	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
 	}
@@ -158,6 +159,7 @@ func TestSweep_DoesNotClearExistingPendingOnTouch(t *testing.T) {
 
 	cmd := &cobra.Command{}
 	cmd.Flags().Bool("redo", false, "")
+	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
 	}
@@ -204,6 +206,7 @@ func TestSweep_DuplicateFileSharesContent(t *testing.T) {
 
 	cmd := &cobra.Command{}
 	cmd.Flags().Bool("redo", false, "")
+	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep() error = %v", err)
 	}
@@ -230,6 +233,134 @@ func TestSweep_DuplicateFileSharesContent(t *testing.T) {
 		}
 		if contentRows != 1 {
 			t.Fatalf("content rows = %d, want 1", contentRows)
+		}
+	})
+}
+
+func TestSweep_ExcludeSkipsFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgFile = ""
+
+	scanDir := t.TempDir()
+	includedPath := filepath.Join(scanDir, "included.png")
+	excludedPath := filepath.Join(scanDir, "excluded.png")
+
+	if err := os.WriteFile(includedPath, []byte("included"), 0644); err != nil {
+		t.Fatalf("WriteFile(included) error = %v", err)
+	}
+	if err := os.WriteFile(excludedPath, []byte("excluded"), 0644); err != nil {
+		t.Fatalf("WriteFile(excluded) error = %v", err)
+	}
+
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("redo", false, "")
+	cmd.Flags().StringSlice("exclude", nil, "")
+	if err := cmd.Flags().Set("exclude", excludedPath); err != nil {
+		t.Fatalf("Set(exclude) error = %v", err)
+	}
+	if err := runSweep(cmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep() error = %v", err)
+	}
+
+	withDB(t, func(database *db.DB) {
+		included, err := database.GetDocumentByPath(includedPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(included) error = %v", err)
+		}
+		if included == nil {
+			t.Fatalf("included doc = nil, want indexed document")
+		}
+
+		excluded, err := database.GetDocumentByPath(excludedPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(excluded) error = %v", err)
+		}
+		if excluded != nil {
+			t.Fatalf("excluded doc = %+v, want nil", excluded)
+		}
+	})
+}
+
+func TestSweep_ExcludeSoftDeletesPreviouslySwept(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgFile = ""
+
+	scanDir := t.TempDir()
+	docPath := filepath.Join(scanDir, "a.png")
+	keepPath := filepath.Join(scanDir, "b.png")
+
+	content := []byte("shared-content")
+	if err := os.WriteFile(docPath, content, 0644); err != nil {
+		t.Fatalf("WriteFile(a) error = %v", err)
+	}
+	if err := os.WriteFile(keepPath, content, 0644); err != nil {
+		t.Fatalf("WriteFile(b) error = %v", err)
+	}
+
+	initialCmd := &cobra.Command{}
+	initialCmd.Flags().Bool("redo", false, "")
+	initialCmd.Flags().StringSlice("exclude", nil, "")
+	if err := runSweep(initialCmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep(initial) error = %v", err)
+	}
+
+	withDB(t, func(database *db.DB) {
+		doc, err := database.GetDocumentByPath(docPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(initial) error = %v", err)
+		}
+		if doc == nil {
+			t.Fatalf("initial doc = nil, want indexed document")
+		}
+		if doc.Deleted {
+			t.Fatalf("initial doc.Deleted = true, want false")
+		}
+
+		keep, err := database.GetDocumentByPath(keepPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(initial keep) error = %v", err)
+		}
+		if keep == nil {
+			t.Fatalf("initial keep doc = nil, want indexed document")
+		}
+		if keep.Deleted {
+			t.Fatalf("initial keep doc.Deleted = true, want false")
+		}
+	})
+
+	excludeCmd := &cobra.Command{}
+	excludeCmd.Flags().Bool("redo", false, "")
+	excludeCmd.Flags().StringSlice("exclude", nil, "")
+	if err := excludeCmd.Flags().Set("exclude", docPath); err != nil {
+		t.Fatalf("Set(exclude) error = %v", err)
+	}
+	if err := runSweep(excludeCmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep(exclude) error = %v", err)
+	}
+
+	withDB(t, func(database *db.DB) {
+		doc, err := database.GetDocumentByPath(docPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(exclude) error = %v", err)
+		}
+		if doc == nil {
+			t.Fatalf("excluded doc = nil, want soft-deleted document")
+		}
+		if !doc.Deleted {
+			t.Fatalf("excluded doc.Deleted = false, want true")
+		}
+
+		keep, err := database.GetDocumentByPath(keepPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(exclude keep) error = %v", err)
+		}
+		if keep == nil {
+			t.Fatalf("keep doc = nil, want indexed document")
+		}
+		if keep.Deleted {
+			t.Fatalf("keep doc.Deleted = true, want false")
 		}
 	})
 }

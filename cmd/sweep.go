@@ -24,6 +24,7 @@ import (
 func init() {
 	rootCmd.AddCommand(sweepCmd)
 	sweepCmd.Flags().Bool("redo", false, "Delete all data and re-sweep from scratch")
+	sweepCmd.Flags().StringSlice("exclude", nil, "File paths to exclude from sweep")
 }
 
 var sweepCmd = &cobra.Command{
@@ -54,6 +55,29 @@ func runSweep(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("resolve path %q: %w", p, err)
 		}
 		paths[i] = abs
+	}
+
+	excludePaths, err := cmd.Flags().GetStringSlice("exclude")
+	if err != nil {
+		return fmt.Errorf("read exclude flag: %w", err)
+	}
+	excludeSet := make(map[string]bool, len(excludePaths))
+	for _, p := range excludePaths {
+		if strings.ContainsAny(p, "*?[") {
+			return fmt.Errorf("exclude path %q contains glob characters; only exact file paths are supported", p)
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return fmt.Errorf("resolve exclude path %q: %w", p, err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return fmt.Errorf("stat exclude path %q: %w", p, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("exclude path %q is a directory; only files are supported", p)
+		}
+		excludeSet[abs] = true
 	}
 
 	database, err := db.Open(config.DefaultDir())
@@ -128,6 +152,10 @@ func runSweep(cmd *cobra.Command, args []string) error {
 
 	for fi := range results {
 		scanned.Add(1)
+
+		if excludeSet[fi.Path] {
+			continue
+		}
 
 		seenPaths[fi.Path] = true
 

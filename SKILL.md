@@ -1,9 +1,13 @@
 ---
 name: ringbinder
-description: Use ringbinder to find documents, answer with citations, and propose file renames (confirm before applying)
+description: Use ringbinder to find documents, list documents, answer with citations, and propose file renames.
 ---
 
 # Ringbinder
+
+## List recent documents, or by date / time range
+
+Read `ringbinder doc list --help` to learn what's possible.
 
 ## Find information in documents
 

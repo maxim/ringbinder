@@ -1,18 +1,11 @@
 ---
 name: ringbinder
-description: Use ringbinder CLI to retrieve OCR evidence from SQLite FTS, answer with citations, and propose safe file renames (confirm before applying).
-compatibility: Requires ringbinder in PATH and a populated DB (run ringbinder sweep + ringbinder ocr first).
+description: Use ringbinder to find documents, answer with citations, and propose file renames (confirm before applying)
 ---
 
 # Ringbinder
 
-## Setup
-- Populate/update index:
-  - `ringbinder sweep <paths...>`
-  - `ringbinder ocr`
-- Prefer machine output: `--json` (find uses NDJSON).
-
-## Capability A: Evidence-based Q&A (no embeddings)
+## Find information in documents
 
 ### Retrieval loop
 1. Build probe set (5–20 probes):
@@ -50,21 +43,23 @@ compatibility: Requires ringbinder in PATH and a populated DB (run ringbinder sw
 - If evidence is weak, run more probes (OR/raw/trigram) or ask one targeted clarifying question.
 - Prefer reading fewer pages deeply over many snippets shallowly.
 
-## Capability B: Propose and apply renames for timestamp-like filenames
+## Capability B: Rename Documents/Unsorted files that have stamp-like filenames
 
 ### Procedure
-1. Identify candidates with timestamp-like basenames.
-2. Read OCR for each candidate:
+1. Identify candidates with timestamp-like basenames
+   - Run this command `./ringbinder find '/Users/max/Documents/Unsorted/___________________.% /Users/max/Documents/Unsorted/20' --mode and --json --limit 10000`
+2. Select only the ones that do indeed have timestamp names
+3. Read the OCR text for each candidate:
    - start: `ringbinder read --json --path <path> --page 0 --context 1`
-   - expand pages only if needed.
-3. Extract date:
+   - expand pages only if needed
+4. Extract date:
    - prefer semantic doc date from OCR
    - fallback to filename date only if OCR date is unreliable
    - format as `YYYY-MM-DD`, or `YYYY-MM`, or `YYYY`.
-4. Create title from OCR (short, specific, filesystem-safe).
-5. Propose filename: `<date> - <title>.<ext>`.
-6. Present full rename plan (`OLD -> NEW`) and ask for explicit confirmation.
-7. After confirmation, rename files and refresh Ringbinder paths (rename command if available, otherwise `ringbinder sweep` on affected roots).
+5. Create title from OCR (short, specific, filesystem-safe).
+6. Propose filename: `<date> - <title>.<ext>`.
+7. Present full rename plan (`OLD -> NEW`) and ask for explicit confirmation.
+8. After confirmation, rename files and refresh Ringbinder paths (rename command if available, otherwise `ringbinder sweep` on affected roots).
 
 ### Rules
 - Do not rename anything before explicit user confirmation.

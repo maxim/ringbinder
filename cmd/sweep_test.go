@@ -365,6 +365,129 @@ func TestSweep_ExcludeSoftDeletesPreviouslySwept(t *testing.T) {
 	})
 }
 
+func TestSweep_GlobPathFiltersAndSoftDeletesWithinRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgFile = ""
+
+	scanDir := t.TempDir()
+	nestedDir := filepath.Join(scanDir, "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	keepPath := filepath.Join(nestedDir, "keep.png")
+	dropPath := filepath.Join(nestedDir, "drop.jpg")
+	content := []byte("shared-content")
+	if err := os.WriteFile(keepPath, content, 0644); err != nil {
+		t.Fatalf("WriteFile(keep) error = %v", err)
+	}
+	if err := os.WriteFile(dropPath, content, 0644); err != nil {
+		t.Fatalf("WriteFile(drop) error = %v", err)
+	}
+
+	initialCmd := &cobra.Command{}
+	initialCmd.Flags().Bool("redo", false, "")
+	initialCmd.Flags().StringSlice("exclude", nil, "")
+	if err := runSweep(initialCmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep(initial) error = %v", err)
+	}
+
+	globCmd := &cobra.Command{}
+	globCmd.Flags().Bool("redo", false, "")
+	globCmd.Flags().StringSlice("exclude", nil, "")
+	if err := runSweep(globCmd, []string{filepath.Join(scanDir, "**", "*.png")}); err != nil {
+		t.Fatalf("runSweep(glob) error = %v", err)
+	}
+
+	withDB(t, func(database *db.DB) {
+		keep, err := database.GetDocumentByPath(keepPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(keep) error = %v", err)
+		}
+		if keep == nil {
+			t.Fatalf("keep doc = nil, want indexed document")
+		}
+		if keep.Deleted {
+			t.Fatalf("keep doc.Deleted = true, want false")
+		}
+
+		drop, err := database.GetDocumentByPath(dropPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(drop) error = %v", err)
+		}
+		if drop == nil {
+			t.Fatalf("drop doc = nil, want soft-deleted document")
+		}
+		if !drop.Deleted {
+			t.Fatalf("drop doc.Deleted = false, want true")
+		}
+	})
+}
+
+func TestSweep_GlobExcludeSkipsAndSoftDeletes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgFile = ""
+
+	scanDir := t.TempDir()
+	nestedDir := filepath.Join(scanDir, "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	keepPath := filepath.Join(scanDir, "keep.png")
+	excludedPath := filepath.Join(nestedDir, "excluded.png")
+	content := []byte("shared-content")
+	if err := os.WriteFile(keepPath, content, 0644); err != nil {
+		t.Fatalf("WriteFile(keep) error = %v", err)
+	}
+	if err := os.WriteFile(excludedPath, content, 0644); err != nil {
+		t.Fatalf("WriteFile(excluded) error = %v", err)
+	}
+
+	initialCmd := &cobra.Command{}
+	initialCmd.Flags().Bool("redo", false, "")
+	initialCmd.Flags().StringSlice("exclude", nil, "")
+	if err := runSweep(initialCmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep(initial) error = %v", err)
+	}
+
+	excludeCmd := &cobra.Command{}
+	excludeCmd.Flags().Bool("redo", false, "")
+	excludeCmd.Flags().StringSlice("exclude", nil, "")
+	if err := excludeCmd.Flags().Set("exclude", "*excluded*.png"); err != nil {
+		t.Fatalf("Set(exclude) error = %v", err)
+	}
+	if err := runSweep(excludeCmd, []string{scanDir}); err != nil {
+		t.Fatalf("runSweep(exclude glob) error = %v", err)
+	}
+
+	withDB(t, func(database *db.DB) {
+		keep, err := database.GetDocumentByPath(keepPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(keep) error = %v", err)
+		}
+		if keep == nil {
+			t.Fatalf("keep doc = nil, want indexed document")
+		}
+		if keep.Deleted {
+			t.Fatalf("keep doc.Deleted = true, want false")
+		}
+
+		excluded, err := database.GetDocumentByPath(excludedPath)
+		if err != nil {
+			t.Fatalf("GetDocumentByPath(excluded) error = %v", err)
+		}
+		if excluded == nil {
+			t.Fatalf("excluded doc = nil, want soft-deleted document")
+		}
+		if !excluded.Deleted {
+			t.Fatalf("excluded doc.Deleted = false, want true")
+		}
+	})
+}
+
 func withDB(t *testing.T, fn func(database *db.DB)) {
 	t.Helper()
 

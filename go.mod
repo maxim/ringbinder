@@ -3,6 +3,8 @@ module github.com/maxim/ringbinder
 go 1.25
 
 require (
+	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/mattn/go-isatty v0.0.20
 	github.com/pdfcpu/pdfcpu v0.11.1
 	github.com/spf13/cobra v1.10.2
 	gopkg.in/yaml.v3 v3.0.1
@@ -17,7 +19,6 @@ require (
 	github.com/hhrutter/pkcs7 v0.2.0 // indirect
 	github.com/hhrutter/tiff v1.0.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

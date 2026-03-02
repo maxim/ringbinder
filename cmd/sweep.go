@@ -16,6 +16,7 @@ import (
 	"github.com/maxim/ringbinder/internal/checksum"
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
+	"github.com/maxim/ringbinder/internal/pathutil"
 	"github.com/maxim/ringbinder/internal/pdf"
 	"github.com/maxim/ringbinder/internal/progress"
 	"github.com/maxim/ringbinder/internal/scanner"
@@ -26,7 +27,7 @@ func init() {
 	rootCmd.AddCommand(sweepCmd)
 	sweepCmd.Flags().Bool("redo", false, "Delete all data and re-sweep from scratch")
 	sweepCmd.Flags().IntP("concurrency", "j", 4, "Number of concurrent file processing workers")
-	sweepCmd.Flags().StringSlice("exclude", nil, "File paths to exclude from sweep")
+	sweepCmd.Flags().StringSlice("exclude", nil, "File path or glob patterns to exclude from sweep")
 }
 
 var sweepCmd = &cobra.Command{
@@ -57,36 +58,51 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no paths provided and none configured in %s", config.DefaultPath())
 	}
 
-	// Resolve to absolute paths
-	for i, p := range paths {
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			return fmt.Errorf("resolve path %q: %w", p, err)
-		}
-		paths[i] = abs
+	resolvedPaths, sweepRoots, pathWarnings, err := pathutil.ResolveGlobs(paths)
+	if err != nil {
+		return fmt.Errorf("resolve sweep paths: %w", err)
+	}
+	for _, warning := range pathWarnings {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
+	}
+	if len(resolvedPaths) == 0 {
+		return fmt.Errorf("no files or directories matched provided sweep paths")
 	}
 
-	excludePaths, err := cmd.Flags().GetStringSlice("exclude")
+	excludePatterns, err := cmd.Flags().GetStringSlice("exclude")
 	if err != nil {
 		return fmt.Errorf("read exclude flag: %w", err)
 	}
-	excludeSet := make(map[string]bool, len(excludePaths))
-	for _, p := range excludePaths {
-		if strings.ContainsAny(p, "*?[") {
-			return fmt.Errorf("exclude path %q contains glob characters; only exact file paths are supported", p)
+	for i, pattern := range excludePatterns {
+		pattern = config.ExpandHome(pattern)
+		if !containsGlobMeta(pattern) {
+			abs, err := filepath.Abs(pattern)
+			if err != nil {
+				return fmt.Errorf("resolve exclude path %q: %w", pattern, err)
+			}
+			info, err := os.Stat(abs)
+			if err != nil {
+				return fmt.Errorf("stat exclude path %q: %w", pattern, err)
+			}
+			if info.IsDir() {
+				return fmt.Errorf("exclude path %q is a directory; only files are supported", pattern)
+			}
+			excludePatterns[i] = abs
+			continue
 		}
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			return fmt.Errorf("resolve exclude path %q: %w", p, err)
+		if containsPathSeparator(pattern) && !filepath.IsAbs(pattern) {
+			abs, err := filepath.Abs(pattern)
+			if err != nil {
+				return fmt.Errorf("resolve exclude glob %q: %w", pattern, err)
+			}
+			pattern = abs
 		}
-		info, err := os.Stat(abs)
-		if err != nil {
-			return fmt.Errorf("stat exclude path %q: %w", p, err)
+		excludePatterns[i] = pattern
+	}
+	if len(excludePatterns) > 0 {
+		if _, err := pathutil.MatchesAny(resolvedPaths[0], excludePatterns); err != nil {
+			return fmt.Errorf("validate exclude patterns: %w", err)
 		}
-		if info.IsDir() {
-			return fmt.Errorf("exclude path %q is a directory; only files are supported", p)
-		}
-		excludeSet[abs] = true
 	}
 
 	database, err := db.Open(config.DefaultDir())
@@ -148,7 +164,7 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	// Run scan in background
 	scanErr := make(chan error, 1)
 	go func() {
-		scanErr <- s.Scan(ctx, paths, results)
+		scanErr <- s.Scan(ctx, resolvedPaths, results)
 	}()
 
 	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
@@ -187,8 +203,18 @@ func runSweep(cmd *cobra.Command, args []string) error {
 			for fi := range results {
 				scanned.Add(1)
 
-				if excludeSet[fi.Path] {
-					continue
+				if len(excludePatterns) > 0 {
+					excluded, err := pathutil.MatchesAny(fi.Path, excludePatterns)
+					if err != nil {
+						processed <- sweepResult{
+							fi:  fi,
+							err: fmt.Errorf("exclude matching failed for %s: %w", fi.Path, err),
+						}
+						continue
+					}
+					if excluded {
+						continue
+					}
 				}
 
 				// If canceled, keep draining scanner output to avoid blocking scanner goroutine.
@@ -336,7 +362,7 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	stopSweepSpinner()
 
 	// Soft-delete files no longer present
-	deletedCount, err := database.SoftDeleteMissing(seenPaths, paths)
+	deletedCount, err := database.SoftDeleteMissing(seenPaths, sweepRoots)
 	if err != nil {
 		return fmt.Errorf("soft delete: %w", err)
 	}
@@ -348,4 +374,12 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		scanned.Load(), newCount, updatedCount, restoredCount, deletedCount, unchangedCount)
 
 	return nil
+}
+
+func containsGlobMeta(path string) bool {
+	return strings.ContainsAny(path, "*?[{")
+}
+
+func containsPathSeparator(path string) bool {
+	return strings.Contains(path, "/") || strings.Contains(path, `\`)
 }

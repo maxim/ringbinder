@@ -43,7 +43,7 @@ description: Use ringbinder to find documents, answer with citations, and propos
 - If evidence is weak, run more probes (OR/raw/trigram) or ask one targeted clarifying question.
 - Prefer reading fewer pages deeply over many snippets shallowly.
 
-## Capability B: Rename Documents/Unsorted files that have stamp-like filenames
+## Rename Documents/Unsorted files that have stamp-like filenames
 
 ### Procedure
 1. Identify candidates with timestamp-like basenames

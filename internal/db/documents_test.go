@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -158,6 +159,102 @@ func TestAllDocuments_IncludesNonPending(t *testing.T) {
 	ids := map[int64]bool{all[0].ID: true, all[1].ID: true}
 	if !ids[id1] || !ids[id2] {
 		t.Fatalf("AllDocuments() returned ids %v, want %d and %d", ids, id1, id2)
+	}
+}
+
+func TestListDocuments(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	makeTime := func(day int) time.Time {
+		t.Helper()
+		return time.Date(2025, time.January, day, 0, 0, 0, 0, time.UTC)
+	}
+
+	insertDocument := func(path string, createdAt time.Time, pageCount int) int64 {
+		t.Helper()
+		contentID, err := database.InsertContent(fmt.Sprintf("checksum-%s", path), pageCount)
+		if err != nil {
+			t.Fatalf("InsertContent(%q) error = %v", path, err)
+		}
+		docID, err := database.InsertDocument(path, contentID, createdAt, createdAt)
+		if err != nil {
+			t.Fatalf("InsertDocument(%q) error = %v", path, err)
+		}
+		return docID
+	}
+
+	firstID := insertDocument("/docs/first.pdf", makeTime(1), 1)
+	secondID := insertDocument("/docs/second.pdf", makeTime(2), 2)
+	thirdID := insertDocument("/docs/third.pdf", makeTime(3), 3)
+	deletedID := insertDocument("/docs/deleted.pdf", makeTime(4), 4)
+
+	if _, err := database.Exec("UPDATE documents SET deleted = 1 WHERE id = ?", deletedID); err != nil {
+		t.Fatalf("mark deleted error = %v", err)
+	}
+
+	assertPaths := func(docs []Document, want []string) {
+		t.Helper()
+		if len(docs) != len(want) {
+			t.Fatalf("ListDocuments() returned %d docs, want %d", len(docs), len(want))
+		}
+		for i, doc := range docs {
+			if doc.Path != want[i] {
+				t.Fatalf("ListDocuments() doc[%d].Path = %q, want %q", i, doc.Path, want[i])
+			}
+			if doc.ID == deletedID {
+				t.Fatalf("ListDocuments() included deleted document id %d", deletedID)
+			}
+		}
+	}
+
+	all, err := database.ListDocuments(ListOptions{})
+	if err != nil {
+		t.Fatalf("ListDocuments(all) error = %v", err)
+	}
+	assertPaths(all, []string{"/docs/third.pdf", "/docs/second.pdf", "/docs/first.pdf"})
+
+	after := makeTime(2)
+	afterDocs, err := database.ListDocuments(ListOptions{After: &after})
+	if err != nil {
+		t.Fatalf("ListDocuments(after) error = %v", err)
+	}
+	assertPaths(afterDocs, []string{"/docs/third.pdf", "/docs/second.pdf"})
+
+	before := makeTime(3)
+	beforeDocs, err := database.ListDocuments(ListOptions{Before: &before})
+	if err != nil {
+		t.Fatalf("ListDocuments(before) error = %v", err)
+	}
+	assertPaths(beforeDocs, []string{"/docs/second.pdf", "/docs/first.pdf"})
+
+	rangeStart := makeTime(2)
+	rangeEnd := makeTime(3)
+	rangeDocs, err := database.ListDocuments(ListOptions{
+		After:  &rangeStart,
+		Before: &rangeEnd,
+	})
+	if err != nil {
+		t.Fatalf("ListDocuments(range) error = %v", err)
+	}
+	assertPaths(rangeDocs, []string{"/docs/second.pdf"})
+
+	pagedDocs, err := database.ListDocuments(ListOptions{
+		Limit:  1,
+		Offset: 1,
+	})
+	if err != nil {
+		t.Fatalf("ListDocuments(limit/offset) error = %v", err)
+	}
+	assertPaths(pagedDocs, []string{"/docs/second.pdf"})
+
+	if all[0].ID != thirdID || all[1].ID != secondID || all[2].ID != firstID {
+		t.Fatalf("ListDocuments(all) returned ids [%d %d %d], want [%d %d %d]", all[0].ID, all[1].ID, all[2].ID, thirdID, secondID, firstID)
 	}
 }
 

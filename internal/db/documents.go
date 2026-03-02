@@ -20,6 +20,13 @@ type Document struct {
 	Deleted    bool
 }
 
+type ListOptions struct {
+	After  *time.Time
+	Before *time.Time
+	Limit  int
+	Offset int
+}
+
 type documentScanner interface {
 	Scan(dest ...any) error
 }
@@ -216,6 +223,43 @@ func (db *DB) AllDocuments() ([]Document, error) {
 		 WHERE d.deleted = 0
 		 ORDER BY d.id`,
 	)
+}
+
+func (db *DB) ListDocuments(opts ListOptions) ([]Document, error) {
+	queryBuilder := strings.Builder{}
+	queryBuilder.WriteString(
+		`SELECT d.id, d.path, d.content_id, d.created_at, d.modified_at, d.deleted,
+		        c.checksum, c.page_count, c.ocr_pending
+		 FROM documents d
+		 JOIN contents c ON c.id = d.content_id
+		 WHERE d.deleted = 0`,
+	)
+
+	args := make([]any, 0, 4)
+	if opts.After != nil {
+		queryBuilder.WriteString(" AND d.created_at >= ?")
+		args = append(args, opts.After.Format(time.RFC3339Nano))
+	}
+	if opts.Before != nil {
+		queryBuilder.WriteString(" AND d.created_at < ?")
+		args = append(args, opts.Before.Format(time.RFC3339Nano))
+	}
+
+	queryBuilder.WriteString(" ORDER BY d.created_at DESC")
+
+	if opts.Limit > 0 {
+		queryBuilder.WriteString(" LIMIT ?")
+		args = append(args, opts.Limit)
+		if opts.Offset > 0 {
+			queryBuilder.WriteString(" OFFSET ?")
+			args = append(args, opts.Offset)
+		}
+	} else if opts.Offset > 0 {
+		queryBuilder.WriteString(" LIMIT -1 OFFSET ?")
+		args = append(args, opts.Offset)
+	}
+
+	return db.queryDocuments(queryBuilder.String(), args...)
 }
 
 func (db *DB) queryDocuments(query string, args ...any) ([]Document, error) {

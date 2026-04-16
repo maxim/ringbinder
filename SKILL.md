@@ -47,12 +47,12 @@ Read `ringbinder doc list --help` to learn what's possible.
 - If evidence is weak, run more probes (OR/raw/trigram) or ask one targeted clarifying question.
 - Prefer reading fewer pages deeply over many snippets shallowly.
 
-## Rename Documents/Unsorted files that have stamp-like filenames
+## Rename Documents/Unsorted files that have timestamp-like filenames
 
 ### Procedure
-1. Identify candidates with timestamp-like basenames
-   - Run this command `./ringbinder find '/Users/max/Documents/Unsorted/___________________.% /Users/max/Documents/Unsorted/20' --mode and --json --limit 10000`
-2. Select only the ones that do indeed have timestamp names
+1. Use ringbinder to identify candidate files with names that are either timestamp-only or similar to "Clipboard [date]"
+   - This command can help find timestamp-only names: `./ringbinder find '/Users/max/Documents/Unsorted/___________________.% /Users/max/Documents/Unsorted/20' --mode and --json --limit 10000`
+2. Select only the ones that do indeed have non-descriptive names
 3. Read the OCR text for each candidate:
    - start: `ringbinder read --json --path <path> --page 0 --context 1`
    - expand pages only if needed
@@ -63,7 +63,7 @@ Read `ringbinder doc list --help` to learn what's possible.
 5. Create title from OCR (short, specific, filesystem-safe).
 6. Propose filename: `<date> - <title>.<ext>`.
 7. Present full rename plan (`OLD -> NEW`) and ask for explicit confirmation.
-8. After confirmation, rename files and refresh Ringbinder paths (rename command if available, otherwise `ringbinder sweep` on affected roots).
+8. After confirmation, rename files and ringbinder sweep the whole Unsorted directory: (`ringbinder sweep /Users/max/Documents/Unsorted`).
 
 ### Rules
 - Do not rename anything before explicit user confirmation.

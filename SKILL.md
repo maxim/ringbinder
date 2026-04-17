@@ -18,6 +18,11 @@ Read `ringbinder doc list --help` to learn what's possible.
    - expert probes: `--fts '<raw fts5 query>'`
    - OCR-noise fallback: repeat key probes with `--trigram`
 
+### Raw FTS safety
+- `--fts` is good; prefer known-good patterns: terms, quoted phrases, `AND`/`OR`/`NOT`, and parentheses.
+- Don’t guess advanced syntax like `NEAR/5` unless you’ve confirmed ringbinder supports it.
+- If a raw FTS query errors, simplify it or split it into multiple `--fts` probes.
+
 2. Run each probe:
    - `ringbinder find --json --limit 50 --offset 0 <query>`
    - or `ringbinder find --json --fts '<raw>'`
@@ -46,6 +51,7 @@ Read `ringbinder doc list --help` to learn what's possible.
 - Never guess; only claim what you can quote from `read` output.
 - If evidence is weak, run more probes (OR/raw/trigram) or ask one targeted clarifying question.
 - Prefer reading fewer pages deeply over many snippets shallowly.
+- When using `--fts`, prefer known-good patterns; if it errors, simplify.
 
 ## Rename Documents/Unsorted files that have timestamp-like filenames
 

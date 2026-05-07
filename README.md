@@ -76,6 +76,63 @@ ringbinder read --path "/Users/you/Documents/taxes/assessment.pdf" --page 0 --co
 
 The database lives at `~/.config/ringbinder/ringbinder.db`.
 
+## Database structure
+
+Ringbinder keeps the schema intentionally small. `documents` is the filesystem view, `contents` is the de-duplicated file identity, `pages` is OCR output, and the FTS tables are SQLite virtual indexes fed by triggers on `pages`.
+
+```mermaid
+---
+title: Ringbinder SQLite schema
+---
+erDiagram
+    CONTENTS ||--o{ DOCUMENTS : "has file paths"
+    CONTENTS ||--o{ PAGES : "has OCR pages"
+    PAGES ||..|| PAGES_FTS : "mirrors rowid"
+    PAGES ||..|| PAGES_FTS_TRIGRAM : "mirrors rowid"
+
+    CONTENTS {
+        int id PK
+        string checksum UK "file content hash"
+        int page_count
+        int ocr_pending "1 until OCR completes"
+    }
+
+    DOCUMENTS {
+        int id PK
+        string path UK
+        int content_id FK
+        string created_at "RFC3339Nano"
+        string modified_at "RFC3339Nano"
+        int deleted "soft delete flag"
+    }
+
+    PAGES {
+        int id PK
+        int content_id FK
+        int page_index "0-based"
+        string markdown "OCR result"
+        string search_text "normalized for FTS"
+    }
+
+    PAGES_FTS {
+        int rowid "mirrors pages.id"
+        string search_text "standard FTS5"
+    }
+
+    PAGES_FTS_TRIGRAM {
+        int rowid "mirrors pages.id"
+        string search_text "FTS5 trigram"
+    }
+```
+
+A few details:
+
+- `documents.content_id` points at `contents.id`; multiple paths can share one content row when files are byte-identical.
+- `pages.content_id` points at `contents.id` with `ON DELETE CASCADE`, so OCR pages are removed when orphaned content is cleaned up.
+- `pages` is unique by `(content_id, page_index)`, which lets OCR upserts replace page text in place.
+- `pages_fts` and `pages_fts_trigram` are external-content FTS5 indexes over `pages.search_text`, maintained by the `pages_ai`, `pages_ad`, and `pages_au` triggers.
+- Most reads, searches, and listings filter out rows where `documents.deleted = 1`; those soft-deleted paths let future sweeps restore the same row if the file comes back.
+
 ## Configuration
 
 By default Ringbinder reads:

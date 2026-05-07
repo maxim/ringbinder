@@ -232,4 +232,4 @@ main.go     entry point
 
 ## License
 
-A license has not been added yet. Add a `LICENSE` file before publishing the repository.
+Ringbinder is released under the MIT License. See [LICENSE](LICENSE).

@@ -3,8 +3,10 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -13,13 +15,17 @@ type DB struct {
 	*sql.DB
 }
 
-func Open(dir string) (*DB, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("create config dir: %w", err)
+func Open(path string) (*DB, error) {
+	dbPath, err := normalizeDatabasePath(path)
+	if err != nil {
+		return nil, err
 	}
 
-	dbPath := filepath.Join(dir, "ringbinder.db")
-	sqlDB, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return nil, fmt.Errorf("create database dir: %w", err)
+	}
+
+	sqlDB, err := sql.Open("sqlite", databaseDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -31,6 +37,44 @@ func Open(dir string) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+func normalizeDatabasePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("database path is empty")
+	}
+	if strings.HasSuffix(path, string(filepath.Separator)) {
+		return "", fmt.Errorf("database path is a directory; provide a SQLite file path")
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	if info, err := os.Stat(absPath); err == nil {
+		if info.IsDir() {
+			return "", fmt.Errorf("database path is a directory; provide a SQLite file path")
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat database path: %w", err)
+	}
+
+	return absPath, nil
+}
+
+func databaseDSN(path string) string {
+	query := url.Values{}
+	query.Add("_pragma", "journal_mode(wal)")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "busy_timeout(5000)")
+
+	dsn := url.URL{
+		Scheme:   "file",
+		Path:     path,
+		RawQuery: query.Encode(),
+	}
+	return dsn.String()
 }
 
 func (db *DB) migrate() error {

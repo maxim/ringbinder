@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -98,7 +99,7 @@ func TestNormalizeSearchText(t *testing.T) {
 func TestSearch_MultiWordMatchesNonContiguous(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -130,7 +131,7 @@ func TestSearch_MultiWordMatchesNonContiguous(t *testing.T) {
 func TestSearchWithOptions_ModeOR(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -179,7 +180,7 @@ func TestSearchWithOptions_ModeOR(t *testing.T) {
 func TestSearchWithOptions_UseTrigram(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -230,7 +231,7 @@ func TestSearchWithOptions_UseTrigram(t *testing.T) {
 func TestSearchWithOptions_SearchSourceFields(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -292,7 +293,7 @@ func TestSearchWithOptions_SearchSourceFields(t *testing.T) {
 func TestSearchWithOptions_LimitOffset(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -330,7 +331,7 @@ func TestSearchWithOptions_LimitOffset(t *testing.T) {
 func TestSearch_ReturnsPageCount(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -359,7 +360,7 @@ func TestSearch_ReturnsPageCount(t *testing.T) {
 func TestSearch_MatchesFilename(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -389,7 +390,7 @@ func TestSearch_MatchesFilename(t *testing.T) {
 func TestSearch_MatchesPath(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -419,7 +420,7 @@ func TestSearch_MatchesPath(t *testing.T) {
 func TestGetPageMarkdownByPathAndIndex(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -453,7 +454,7 @@ func TestGetPageMarkdownByPathAndIndex(t *testing.T) {
 func TestGetPagesMarkdownByPathAndRange(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -488,7 +489,7 @@ func TestGetPagesMarkdownByPathAndRange(t *testing.T) {
 func TestUpsertPage_StoresNormalizedSearchText(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -514,7 +515,7 @@ func TestUpsertPage_StoresNormalizedSearchText(t *testing.T) {
 func TestReplaceContentPages_Atomic(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

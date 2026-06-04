@@ -3,8 +3,6 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/maxim/ringbinder/internal/config"
-	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
 	"github.com/spf13/cobra"
 )
@@ -22,9 +20,9 @@ var costCmd = &cobra.Command{
 }
 
 func runCost(cmd *cobra.Command, args []string) error {
-	database, err := db.Open(config.DefaultDir())
+	database, err := openDatabase(cmd)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
 	}
 	defer database.Close()
 

@@ -74,7 +74,7 @@ ringbinder find "property tax" --verbose
 ringbinder read --path "/Users/you/Documents/taxes/assessment.pdf" --page 0 --context 1
 ```
 
-The database lives at `~/.config/ringbinder/ringbinder.db`.
+By default, the database lives at `~/.config/ringbinder/ringbinder.db`. You can override it with `database_path` in config or the global `--database` flag.
 
 ## Database structure
 
@@ -150,6 +150,16 @@ paths:
   - /Volumes/Archive/scans
 ```
 
+Optionally, set a custom SQLite database file path:
+
+```yaml
+database_path: ~/.local/share/ringbinder/ringbinder.db
+paths:
+  - ~/Documents
+```
+
+`database_path` is a file path, not a directory. If omitted, Ringbinder uses `~/.config/ringbinder/ringbinder.db`.
+
 You can also pass paths directly:
 
 ```sh
@@ -160,6 +170,12 @@ Use `--config` to point at a different config file:
 
 ```sh
 ringbinder --config ./ringbinder.yml sweep
+```
+
+Use `--database` to point at a different SQLite database file for any command. The flag overrides `database_path` from config:
+
+```sh
+ringbinder --database ./ringbinder.db find "property tax"
 ```
 
 Globs are supported, including `**`. During a sweep you can exclude individual files or glob patterns:
@@ -268,7 +284,7 @@ The included `SKILL.md` is an example agent skill that explains how to use Ringb
 
 ## Privacy and storage
 
-Ringbinder keeps its index and OCR text in a local SQLite database under `~/.config/ringbinder/`.
+Ringbinder keeps its index and OCR text in a local SQLite database. By default it uses `~/.config/ringbinder/ringbinder.db`; set `database_path` or pass `--database` to use a different file.
 
 OCR is the one networked step: `ringbinder ocr` sends each pending document or image to the Mistral OCR API. If that is not acceptable for a folder, do not include that folder in your config.
 

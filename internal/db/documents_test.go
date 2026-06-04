@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -9,7 +10,7 @@ import (
 func TestInsertDocument_WithContentID(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -50,7 +51,7 @@ func TestInsertDocument_WithContentID(t *testing.T) {
 func TestUpdateDocument_ChangesContentID(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -100,7 +101,7 @@ func TestUpdateDocument_ChangesContentID(t *testing.T) {
 func TestAllDocuments_IncludesNonPending(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -165,7 +166,7 @@ func TestAllDocuments_IncludesNonPending(t *testing.T) {
 func TestListDocuments(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -261,7 +262,7 @@ func TestListDocuments(t *testing.T) {
 func TestAllStats_IncludesNonPending(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -326,7 +327,7 @@ func TestAllStats_IncludesNonPending(t *testing.T) {
 func TestSoftDeleteMissing_OnlyDeletesWithinRoots(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -377,7 +378,7 @@ func TestSoftDeleteMissing_OnlyDeletesWithinRoots(t *testing.T) {
 func TestResetAllDocuments(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

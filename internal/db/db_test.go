@@ -3,7 +3,9 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,7 +14,8 @@ func TestOpen_FreshDB(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	db, err := Open(dir)
+	dbPath := filepath.Join(dir, "ringbinder.db")
+	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -126,7 +129,7 @@ func TestOpen_MigratesV1ToV2(t *testing.T) {
 		t.Fatalf("rawDB.Close() error = %v", err)
 	}
 
-	database, err := Open(dir)
+	database, err := Open(rawDBPath)
 	if err != nil {
 		t.Fatalf("Open() migrate error = %v", err)
 	}
@@ -156,6 +159,77 @@ func TestOpen_MigratesV1ToV2(t *testing.T) {
 	}
 	if results[0].Path != "/docs/migrate.pdf" {
 		t.Fatalf("result path = %q, want %q", results[0].Path, "/docs/migrate.pdf")
+	}
+}
+
+func TestOpen_CreatesParentDirectory(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "missing", "nested", "ringbinder.db")
+	database, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database file stat error = %v", err)
+	}
+}
+
+func TestOpen_SupportsURICharactersInPath(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "dir with spaces", "db?name#1.sqlite")
+	database, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database file stat error = %v", err)
+	}
+}
+
+func TestOpen_RelativePathIsResolvedFromWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	database, err := Open(filepath.Join("data", "ringbinder.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	wantPath := filepath.Join(dir, "data", "ringbinder.db")
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("database file stat error = %v", err)
+	}
+}
+
+func TestOpen_RejectsDirectoryPath(t *testing.T) {
+	t.Parallel()
+
+	_, err := Open(t.TempDir())
+	if err == nil {
+		t.Fatalf("Open() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "database path is a directory") {
+		t.Fatalf("Open() error = %q, want directory error", err.Error())
+	}
+}
+
+func TestOpen_RejectsTrailingSeparator(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "new-db-dir") + string(filepath.Separator)
+	_, err := Open(path)
+	if err == nil {
+		t.Fatalf("Open() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "database path is a directory") {
+		t.Fatalf("Open() error = %q, want directory error", err.Error())
 	}
 }
 

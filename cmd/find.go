@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/mattn/go-isatty"
-	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/format"
 	"github.com/spf13/cobra"
@@ -53,9 +52,9 @@ var findCmd = &cobra.Command{
 func runFind(cmd *cobra.Command, args []string) error {
 	query := strings.Join(args, " ")
 
-	database, err := db.Open(config.DefaultDir())
+	database, err := openDatabase(cmd)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
 	}
 	defer database.Close()
 

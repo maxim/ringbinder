@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/spf13/cobra"
 )
@@ -69,9 +68,9 @@ func runDocGet(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--path is required")
 	}
 
-	database, err := db.Open(config.DefaultDir())
+	database, err := openDatabase(cmd)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
 	}
 	defer database.Close()
 
@@ -124,9 +123,9 @@ func runDocList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parse --before: %w", err)
 	}
 
-	database, err := db.Open(config.DefaultDir())
+	database, err := openDatabase(cmd)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
 	}
 	defer database.Close()
 

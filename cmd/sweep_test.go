@@ -491,7 +491,7 @@ func TestSweep_GlobExcludeSkipsAndSoftDeletes(t *testing.T) {
 func withDB(t *testing.T, fn func(database *db.DB)) {
 	t.Helper()
 
-	database, err := db.Open(config.DefaultDir())
+	database, err := db.Open(config.DefaultDatabasePath())
 	if err != nil {
 		t.Fatalf("db.Open() error = %v", err)
 	}

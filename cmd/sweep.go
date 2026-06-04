@@ -45,13 +45,17 @@ type sweepResult struct {
 }
 
 func runSweep(cmd *cobra.Command, args []string) error {
-	cfg, err := config.Load(cfgFile)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+	var cfg *config.Config
+	if len(args) == 0 || !databaseFlagProvided(cmd) {
+		var err error
+		cfg, err = loadConfig()
+		if err != nil {
+			return err
+		}
 	}
 
 	paths := args
-	if len(paths) == 0 {
+	if len(paths) == 0 && cfg != nil {
 		paths = cfg.Paths
 	}
 	if len(paths) == 0 {
@@ -105,9 +109,9 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	database, err := db.Open(config.DefaultDir())
+	database, err := openDatabaseWithConfig(cmd, cfg)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
 	}
 	defer database.Close()
 

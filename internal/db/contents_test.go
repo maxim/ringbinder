@@ -1,6 +1,7 @@
 package db
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +10,7 @@ import (
 func TestGetContentByChecksum(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -49,7 +50,7 @@ func TestGetContentByChecksum(t *testing.T) {
 func TestInsertContent(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -73,7 +74,7 @@ func TestInsertContent(t *testing.T) {
 func TestMarkContentOCRDone(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -103,7 +104,7 @@ func TestMarkContentOCRDone(t *testing.T) {
 func TestCleanupOrphanContents(t *testing.T) {
 	t.Parallel()
 
-	database, err := Open(t.TempDir())
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

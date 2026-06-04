@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Paths []string `yaml:"paths"`
+	Paths        []string `yaml:"paths"`
+	DatabasePath string   `yaml:"database_path"`
 }
 
 func DefaultDir() string {
@@ -24,6 +26,10 @@ func DefaultDir() string {
 
 func DefaultPath() string {
 	return filepath.Join(DefaultDir(), "config.yml")
+}
+
+func DefaultDatabasePath() string {
+	return filepath.Join(DefaultDir(), "ringbinder.db")
 }
 
 func Load(path string) (*Config, error) {
@@ -49,16 +55,42 @@ func Load(path string) (*Config, error) {
 		cfg.Paths[i] = ExpandHome(p)
 	}
 
+	cfg.DatabasePath = strings.TrimSpace(cfg.DatabasePath)
+	if cfg.DatabasePath != "" {
+		cfg.DatabasePath = ExpandHome(cfg.DatabasePath)
+	}
+
 	return &cfg, nil
 }
 
 func ExpandHome(path string) string {
-	if len(path) >= 2 && path[:2] == "~/" {
-		home, err := os.UserHomeDir()
-		if err != nil || home == "" {
-			return path // return unexpanded if home dir unavailable
-		}
-		return filepath.Join(home, path[2:])
+	if path != "~" && !(len(path) >= 2 && path[:2] == "~/") {
+		return path
 	}
-	return path
+
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path // return unexpanded if home dir unavailable
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
+func ResolveDatabasePath(cliPath string, cliProvided bool, cfgPath string) (string, error) {
+	if cliProvided {
+		path := strings.TrimSpace(cliPath)
+		if path == "" {
+			return "", fmt.Errorf("--database cannot be empty")
+		}
+		return ExpandHome(path), nil
+	}
+
+	path := strings.TrimSpace(cfgPath)
+	if path != "" {
+		return ExpandHome(path), nil
+	}
+
+	return DefaultDatabasePath(), nil
 }

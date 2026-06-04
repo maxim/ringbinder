@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +17,7 @@ import (
 func TestProcessOCR_SkipsAlreadyOCRdContent(t *testing.T) {
 	t.Parallel()
 
-	database, err := db.Open(t.TempDir())
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("db.Open() error = %v", err)
 	}
@@ -71,7 +72,7 @@ func TestProcessOCR_SkipsAlreadyOCRdContent(t *testing.T) {
 func TestProcessOCR_ConcurrentExecution(t *testing.T) {
 	t.Parallel()
 
-	database, err := db.Open(t.TempDir())
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("db.Open() error = %v", err)
 	}
@@ -126,7 +127,7 @@ func TestProcessOCR_ConcurrentExecution(t *testing.T) {
 func TestProcessOCR_ErrorDoesNotBlockOthers(t *testing.T) {
 	t.Parallel()
 
-	database, err := db.Open(t.TempDir())
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("db.Open() error = %v", err)
 	}
@@ -181,7 +182,7 @@ func TestProcessOCR_ErrorDoesNotBlockOthers(t *testing.T) {
 func TestProcessOCR_TimeoutDoesNotCancelOthers(t *testing.T) {
 	t.Parallel()
 
-	database, err := db.Open(t.TempDir())
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("db.Open() error = %v", err)
 	}
@@ -235,7 +236,7 @@ func TestProcessOCR_TimeoutDoesNotCancelOthers(t *testing.T) {
 func TestProcessOCR_ContextCancellation(t *testing.T) {
 	t.Parallel()
 
-	database, err := db.Open(t.TempDir())
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("db.Open() error = %v", err)
 	}

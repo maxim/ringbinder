@@ -7,7 +7,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var cfgFile string
+var (
+	cfgFile      string
+	databaseFile string
+)
 
 var rootCmd = &cobra.Command{
 	Use:   "ringbinder",
@@ -21,6 +24,7 @@ func Execute() error {
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/ringbinder/config.yml)")
+	rootCmd.PersistentFlags().StringVar(&databaseFile, "database", "", "database file path (default ~/.config/ringbinder/ringbinder.db)")
 }
 
 func exitErr(msg string, args ...any) {

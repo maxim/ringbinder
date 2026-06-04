@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/maxim/ringbinder/internal/config"
-	"github.com/maxim/ringbinder/internal/db"
 	"github.com/spf13/cobra"
 )
 
@@ -56,9 +54,9 @@ func runRead(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	database, err := db.Open(config.DefaultDir())
+	database, err := openDatabase(cmd)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return err
 	}
 	defer database.Close()
 

@@ -209,7 +209,7 @@ ringbinder cost
 ringbinder cost --redo
 ```
 
-The estimate uses the price baked into the current build. Check Mistral's pricing before a large run.
+The estimate uses the price baked into the current build. Ringbinder asks Mistral to describe detected images and graphics so those descriptions are searchable, so the estimate uses the annotated-page price of `$0.0050/page` (`$5 / 1000 pages`). Check Mistral's pricing before a large run.
 
 ### `ocr`
 

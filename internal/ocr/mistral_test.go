@@ -17,7 +17,7 @@ import (
 func TestMistralPricePerPage(t *testing.T) {
 	t.Parallel()
 
-	if got, want := MistralPricePerPage(), 0.002; got != want {
+	if got, want := MistralPricePerPage(), 0.005; got != want {
 		t.Fatalf("MistralPricePerPage() = %v, want %v", got, want)
 	}
 }
@@ -224,41 +224,115 @@ func TestRetry_TransportErrorContextCancelled(t *testing.T) {
 	}
 }
 
-func TestOCRFile_SendsBBoxAnnotationFormat(t *testing.T) {
+func TestOCRFile_SendsOCR4AnnotatedDataURLRequests(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+	const encodedInput = "dGVzdA=="
 
-		var req mistralRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
+	tests := []struct {
+		name         string
+		fileName     string
+		fileType     string
+		documentType string
+		documentURL  string
+		imageURL     string
+	}{
+		{
+			name:         "pdf",
+			fileName:     "input.pdf",
+			fileType:     "pdf",
+			documentType: "document_url",
+			documentURL:  "data:application/pdf;base64," + encodedInput,
+		},
+		{
+			name:         "jpeg",
+			fileName:     "input.jpeg",
+			fileType:     "jpeg",
+			documentType: "image_url",
+			imageURL:     "data:image/jpeg;base64," + encodedInput,
+		},
+		{
+			name:         "png",
+			fileName:     "input.png",
+			fileType:     "png",
+			documentType: "image_url",
+			imageURL:     "data:image/png;base64," + encodedInput,
+		},
+	}
 
-		if req.BBoxAnnotationFormat.Type != "json_schema" {
-			t.Fatalf("bbox_annotation_format.type = %q, want %q", req.BBoxAnnotationFormat.Type, "json_schema")
-		}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-		schema := req.BBoxAnnotationFormat.JSONSchema.Schema
-		if _, ok := schema.Properties["image_type"]; !ok {
-			t.Fatalf("schema missing image_type property")
-		}
-		if _, ok := schema.Properties["description"]; !ok {
-			t.Fatalf("schema missing description property")
-		}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
 
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"pages":[]}`))
-	}))
-	defer server.Close()
+				var req mistralRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
 
-	input := writeTempOCRFile(t, "input.pdf", []byte("test"))
+				if got, want := req.Model, "mistral-ocr-4-0"; got != want {
+					t.Fatalf("model = %q, want %q", got, want)
+				}
+				if got, want := req.Document.Type, tt.documentType; got != want {
+					t.Fatalf("document.type = %q, want %q", got, want)
+				}
+				if got, want := req.Document.DocumentURL, tt.documentURL; got != want {
+					t.Fatalf("document.document_url = %q, want %q", got, want)
+				}
+				if got, want := req.Document.ImageURL, tt.imageURL; got != want {
+					t.Fatalf("document.image_url = %q, want %q", got, want)
+				}
 
-	client := NewMistralClient("test-key")
-	client.endpoint = server.URL
+				format := req.BBoxAnnotationFormat
+				if got, want := format.Type, "json_schema"; got != want {
+					t.Fatalf("bbox_annotation_format.type = %q, want %q", got, want)
+				}
+				if got, want := format.JSONSchema.Name, "image_annotation"; got != want {
+					t.Fatalf("bbox_annotation_format.json_schema.name = %q, want %q", got, want)
+				}
+				if !format.JSONSchema.Strict {
+					t.Fatalf("bbox_annotation_format.json_schema.strict = false, want true")
+				}
 
-	if _, err := client.OCRFile(context.Background(), input, "pdf"); err != nil {
-		t.Fatalf("OCRFile() error = %v", err)
+				schema := format.JSONSchema.Schema
+				if got, want := schema.Type, "object"; got != want {
+					t.Fatalf("schema.type = %q, want %q", got, want)
+				}
+				if _, ok := schema.Properties["image_type"]; !ok {
+					t.Fatalf("schema missing image_type property")
+				}
+				if _, ok := schema.Properties["description"]; !ok {
+					t.Fatalf("schema missing description property")
+				}
+				if schema.AdditionalProperties {
+					t.Fatalf("schema.additionalProperties = true, want false")
+				}
+
+				required := make(map[string]bool, len(schema.Required))
+				for _, name := range schema.Required {
+					required[name] = true
+				}
+				if !required["image_type"] || !required["description"] {
+					t.Fatalf("schema.required = %v, want image_type and description", schema.Required)
+				}
+
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"pages":[]}`))
+			}))
+			defer server.Close()
+
+			input := writeTempOCRFile(t, tt.fileName, []byte("test"))
+
+			client := NewMistralClient("test-key")
+			client.endpoint = server.URL
+
+			if _, err := client.OCRFile(context.Background(), input, tt.fileType); err != nil {
+				t.Fatalf("OCRFile() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -268,6 +342,8 @@ func TestOCRFile_ParsesImageAnnotations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
+			"model":"mistral-ocr-4-0",
+			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{
 					"index":0,
@@ -316,6 +392,8 @@ func TestOCRFile_ParsesStringImageAnnotation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
+			"model":"mistral-ocr-4-0",
+			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{
 					"index":0,
@@ -355,12 +433,68 @@ func TestOCRFile_ParsesStringImageAnnotation(t *testing.T) {
 	}
 }
 
+func TestOCRFile_ParsesEscapedJSONStringImageAnnotation(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"model":"mistral-ocr-4-0",
+			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
+			"pages":[
+				{
+					"index":0,
+					"markdown":"Page text",
+					"dimensions":{"dpi":200,"width":1700,"height":2200},
+					"images":[
+						{
+							"id":"img-0.jpeg",
+							"top_left_x":100,
+							"top_left_y":50,
+							"bottom_right_x":400,
+							"bottom_right_y":300,
+							"image_annotation":"{\"image_type\":\"diagram\",\"description\":\"A diagram showing how scanned documents flow into searchable Markdown\"}"
+						}
+					],
+					"tables":[],
+					"hyperlinks":[],
+					"header":"",
+					"footer":"",
+					"confidence_scores":{"page":0.99},
+					"blocks":[{"type":"text","text":"Page text"}]
+				}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	input := writeTempOCRFile(t, "input.pdf", []byte("test"))
+
+	client := NewMistralClient("test-key")
+	client.endpoint = server.URL
+
+	result, err := client.OCRFile(context.Background(), input, "pdf")
+	if err != nil {
+		t.Fatalf("OCRFile() error = %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+
+	want := "Page text\n\n[Image: diagram — A diagram showing how scanned documents flow into searchable Markdown]"
+	if got := result[0].Markdown; got != want {
+		t.Fatalf("markdown = %q, want %q", got, want)
+	}
+}
+
 func TestOCRFile_NoImages(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
+			"model":"mistral-ocr-4-0",
+			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{
 					"index":0,

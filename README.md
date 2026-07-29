@@ -221,7 +221,7 @@ ringbinder ocr --redo
 ringbinder ocr --concurrency 2
 ```
 
-`ocr` requires `MISTRAL_API_KEY`. Files larger than 200 MB are skipped by the OCR client.
+`ocr` requires `MISTRAL_API_KEY`. Large PDFs are chunked internally to fit API limits; Ringbinder does not split or modify your document files.
 
 ### `find`
 

@@ -18,12 +18,14 @@ type mistralDocument struct {
 }
 
 type mistralResponse struct {
-	Pages []mistralPage `json:"pages"`
-	Model string        `json:"model"`
+	// Pointers preserve null page objects and absent indexes so malformed
+	// responses cannot silently become valid page zero results.
+	Pages []*mistralPage `json:"pages"`
+	Model string         `json:"model"`
 }
 
 type mistralPage struct {
-	Index      int               `json:"index"`
+	Index      *int              `json:"index"` // nil means the required field was absent
 	Markdown   string            `json:"markdown"`
 	Dimensions *mistralDimension `json:"dimensions,omitempty"`
 	Images     []mistralImage    `json:"images,omitempty"`

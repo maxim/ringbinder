@@ -163,9 +163,9 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 				}
 			}
 
-			writeMu.Lock()
-			err = database.ReplaceContentPages(job.content.ID, pageInputs)
-			writeMu.Unlock()
+			err = replacePagesWhileActive(ctx, &writeMu, func() error {
+				return database.ReplaceContentPages(job.content.ID, pageInputs)
+			})
 			if err != nil {
 				tracker.WorkerError(slotID, err)
 				return
@@ -180,6 +180,22 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 		return err
 	}
 	return nil
+}
+
+func replacePagesWhileActive(ctx context.Context, writeMu *sync.Mutex, replace func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
+	// Cancellation cannot interrupt a SQLite transaction already in progress,
+	// so the last safe boundary is immediately after acquiring the write lock.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return replace()
 }
 
 func allLiveContents(database *db.DB) ([]db.Content, error) {

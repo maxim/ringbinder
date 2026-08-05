@@ -8,14 +8,20 @@ import (
 )
 
 var (
+	version      = "devel"
 	cfgFile      string
 	databaseFile string
 )
 
-var rootCmd = &cobra.Command{
-	Use:   "ringbinder",
-	Short: "Scan, OCR, and search your documents",
-	Long:  "Ringbinder scans your filesystem for PDFs and images, runs them through OCR, and lets you full-text search the results. Use --json on supported commands for automation/tooling.",
+var rootCmd = newRootCommand()
+
+func newRootCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:     "ringbinder",
+		Short:   "Scan, OCR, and search your documents",
+		Long:    "Ringbinder scans your filesystem for PDFs and images, runs them through OCR, and lets you full-text search the results. Use --json on supported commands for automation/tooling.",
+		Version: version,
+	}
 }
 
 func Execute() error {

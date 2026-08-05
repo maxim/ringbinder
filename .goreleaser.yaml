@@ -1,0 +1,78 @@
+version: 2
+
+builds:
+  - id: ringbinder
+    main: .
+    binary: ringbinder
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - arm64
+      - amd64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    ldflags:
+      - -s -w -buildid= -X github.com/maxim/ringbinder/cmd.version=v{{ .Version }}
+
+archives:
+  - id: ringbinder
+    ids:
+      - ringbinder
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    builds_info:
+      group: root
+      owner: root
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: LICENSE
+        info:
+          group: root
+          owner: root
+          mtime: "{{ .CommitDate }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# GoReleaser 2.16 hard-deprecated formula generation in favor of casks. Ringbinder
+# intentionally stays on 2.15.4 because this tap requires an architecture-selecting formula.
+brews:
+  - name: ringbinder
+    ids:
+      - ringbinder
+    repository:
+      owner: maxim
+      name: homebrew-tap
+      branch: "ringbinder-{{ .Version }}"
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      pull_request:
+        enabled: true
+        draft: false
+        base:
+          owner: maxim
+          name: homebrew-tap
+          branch: main
+    directory: Formula
+    url_template: "https://github.com/maxim/ringbinder/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    commit_msg_template: "Update ringbinder to {{ .Tag }}"
+    commit_author:
+      name: GoReleaser
+      email: bot@goreleaser.com
+    homepage: https://github.com/maxim/ringbinder
+    description: Scan, OCR, and search local PDFs and images
+    license: MIT
+    install: |
+      bin.install "ringbinder"
+    test: |
+      assert_equal "ringbinder version v#{version}\n", shell_output("#{bin}/ringbinder --version")
+      # The explicit testpath database isolates this test from user config, state, and API credentials.
+      output = shell_output("#{bin}/ringbinder --database #{testpath}/ringbinder.db cost")
+      assert_match "No documents pending OCR.", output
+      assert_path_exists testpath/"ringbinder.db"

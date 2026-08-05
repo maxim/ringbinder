@@ -1,0 +1,589 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable release tag (for example, v0.1.0)
+        required: true
+        type: string
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      prior_latest_version: ${{ steps.release.outputs.prior_latest_version }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out selected commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Validate release request
+        id: release
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Releases must be dispatched from main, not $GITHUB_REF." >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version must match stable SemVer vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+
+          if tag=$(git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_VERSION" 2>&1); then
+            echo "Tag $RELEASE_VERSION already exists: $tag" >&2
+            exit 1
+          else
+            status=$?
+            if [[ $status -ne 2 ]]; then
+              echo "$tag" >&2
+              exit "$status"
+            fi
+          fi
+
+          if ! remote_tags=$(git ls-remote --tags --refs origin); then
+            echo "Could not read release tags from origin." >&2
+            exit 1
+          fi
+          stable_tags=()
+          while IFS=$'\t' read -r _ ref; do
+            tag=${ref#refs/tags/}
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              stable_tags+=("$tag")
+            fi
+          done <<< "$remote_tags"
+
+          prior_latest_version=""
+          if (( ${#stable_tags[@]} == 0 )); then
+            if [[ "$RELEASE_VERSION" != "v0.1.0" ]]; then
+              echo "The first stable release must be v0.1.0, not $RELEASE_VERSION." >&2
+              exit 1
+            fi
+          else
+            mapfile -t sorted_tags < <(printf '%s\n' "${stable_tags[@]}" | sort -V)
+            prior_latest_version=${sorted_tags[${#sorted_tags[@]}-1]}
+            mapfile -t ordered_versions < <(
+              printf '%s\n' "$prior_latest_version" "$RELEASE_VERSION" | sort -V
+            )
+            if [[ "${ordered_versions[${#ordered_versions[@]}-1]}" != "$RELEASE_VERSION" ]]; then
+              echo "$RELEASE_VERSION must be strictly greater than latest stable tag $prior_latest_version." >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "prior_latest_version=$prior_latest_version"
+            echo "release_sha=$RELEASE_SHA"
+            echo "version=$RELEASE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Preflight Homebrew tap token
+        # Ringbinder's GITHUB_TOKEN is repository-scoped, so the tap needs a dedicated token.
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN is empty; it must access maxim/homebrew-tap." >&2
+            exit 1
+          fi
+          if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+            echo "HOMEBREW_TAP_TOKEN cannot authenticate with GitHub." >&2
+            exit 1
+          fi
+          if ! repo_json=$(gh api repos/maxim/homebrew-tap); then
+            echo "HOMEBREW_TAP_TOKEN cannot read maxim/homebrew-tap." >&2
+            exit 1
+          fi
+          if ! jq -e '
+            .permissions.admin == true or
+            .permissions.maintain == true or
+            .permissions.push == true
+          ' <<< "$repo_json" >/dev/null; then
+            echo "HOMEBREW_TAP_TOKEN needs effective write, maintain, or admin permission on maxim/homebrew-tap." >&2
+            exit 1
+          fi
+          if ! pulls_json=$(gh api 'repos/maxim/homebrew-tap/pulls?state=open&per_page=1'); then
+            echo "HOMEBREW_TAP_TOKEN cannot read pull requests in maxim/homebrew-tap." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "array"' <<< "$pulls_json" >/dev/null; then
+            echo "The tap pull request API returned an unexpected response." >&2
+            exit 1
+          fi
+
+          probe_dir=$(mktemp -d)
+          trap 'rm -rf "$probe_dir"' EXIT
+          api_status() {
+            local output=$1
+            shift
+            gh api --include "$@" > "$output" 2>/dev/null || true
+            local protocol status rest
+            IFS=' ' read -r protocol status rest < "$output" || true
+            if [[ "$protocol" == HTTP/* ]]; then
+              printf '%s' "$status"
+            else
+              printf 'no HTTP response'
+            fi
+          }
+
+          # '^' cannot occur in a Git ref, and the zero object ID cannot resolve, so this
+          # probes Contents write permission without any possibility of creating a branch.
+          invalid_ref="refs/heads/ringbinder-write-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}^invalid"
+          ref_status=$(api_status "$probe_dir/ref-write" \
+            --method POST repos/maxim/homebrew-tap/git/refs \
+            -f ref="$invalid_ref" \
+            -f sha=0000000000000000000000000000000000000000)
+          if [[ "$ref_status" != 422 ]]; then
+            echo "Tap Contents write preflight expected HTTP 422 validation failure; received $ref_status." >&2
+            exit 1
+          fi
+
+          # Confirm this run-specific valid branch name is absent before asking GitHub to
+          # reject a PR from it, so Pull requests write is tested without creating a PR.
+          missing_head="ringbinder-pr-write-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          missing_status=$(api_status "$probe_dir/ref-read" \
+            "repos/maxim/homebrew-tap/git/ref/heads/$missing_head")
+          if [[ "$missing_status" != 404 ]]; then
+            echo "Tap PR write preflight head must not exist; ref lookup received HTTP $missing_status." >&2
+            exit 1
+          fi
+          pr_status=$(api_status "$probe_dir/pr-write" \
+            --method POST repos/maxim/homebrew-tap/pulls \
+            -f title="Ringbinder permission preflight $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT" \
+            -f head="$missing_head" \
+            -f base=main)
+          if [[ "$pr_status" != 422 ]]; then
+            echo "Tap Pull requests write preflight expected HTTP 422 validation failure; received $pr_status." >&2
+            exit 1
+          fi
+
+  test:
+    needs: validate
+    strategy:
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out tested commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+  release:
+    needs:
+      - validate
+      - test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tested commit and tags
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.15.4
+          install-only: true
+
+      - name: Check GoReleaser configuration
+        run: goreleaser check
+
+      - name: Build snapshot from tested commit
+        env:
+          RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          goreleaser release --snapshot --clean
+          test "$(jq -r '.commit' dist/metadata.json)" = "$RELEASE_SHA"
+
+      - name: Validate snapshot artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          snapshot_version=$(jq -er '.version | select(type == "string" and length > 0)' dist/metadata.json)
+          expected_archives=(
+            "ringbinder_${snapshot_version}_darwin_amd64.tar.gz"
+            "ringbinder_${snapshot_version}_darwin_arm64.tar.gz"
+            "ringbinder_${snapshot_version}_linux_amd64.tar.gz"
+            "ringbinder_${snapshot_version}_linux_arm64.tar.gz"
+          )
+          archives=(dist/*.tar.gz)
+          if (( ${#archives[@]} != 4 )); then
+            echo "Expected exactly four snapshot archives, found ${#archives[@]}." >&2
+            exit 1
+          fi
+          for archive in "${expected_archives[@]}"; do
+            if [[ ! -f "dist/$archive" ]]; then
+              echo "Missing expected snapshot archive: $archive" >&2
+              exit 1
+            fi
+          done
+
+          if ! jq -e '
+            ([.[] | select(.type == "Metadata")] | length == 1) and
+            ([.[] | select(.type == "Binary")] | length == 4) and
+            ([.[] | select(.type == "Archive")] | length == 4) and
+            ([.[] | select(.type == "Checksum")] | length == 1) and
+            ([.[] | select(.type == "Homebrew Formula")] | length == 1) and
+            all(.[].type;
+              . == "Metadata" or
+              . == "Binary" or
+              . == "Archive" or
+              . == "Checksum" or
+              . == "Homebrew Formula"
+            )
+          ' dist/artifacts.json >/dev/null; then
+            echo "GoReleaser produced an unexpected artifact type or count." >&2
+            exit 1
+          fi
+
+          checksum_path=$(jq -er '[.[] | select(.type == "Checksum")][0].path' dist/artifacts.json)
+          manifest_files=(dist/*.txt)
+          if [[ "$checksum_path" != "dist/checksums.txt" || ! -f "$checksum_path" ]] ||
+            (( ${#manifest_files[@]} != 1 )); then
+            echo "Expected exactly one checksum manifest at dist/checksums.txt." >&2
+            exit 1
+          fi
+
+          formula_path=$(jq -er '[.[] | select(.type == "Homebrew Formula")][0].path' dist/artifacts.json)
+          if [[ ! -f "$formula_path" ]]; then
+            echo "Generated formula is missing: $formula_path" >&2
+            exit 1
+          fi
+          ruby -c "$formula_path"
+
+          ruby - "$formula_path" "$checksum_path" dist/metadata.json "${expected_archives[@]}" <<'RUBY'
+          require "digest"
+          require "json"
+
+          formula_path, checksum_path, metadata_path, *archives = ARGV
+          metadata = JSON.parse(File.read(metadata_path))
+          tag = metadata.fetch("tag")
+          version = metadata.fetch("version")
+          manifest = File.readlines(checksum_path, chomp: true)
+          abort "checksums.txt must contain exactly four entries" unless manifest.length == 4
+
+          checksums = manifest.to_h do |line|
+            match = line.match(/\A([0-9a-f]{64})  ([^\s]+)\z/)
+            abort "malformed checksum entry: #{line.inspect}" unless match
+            [match[2], match[1]]
+          end
+          abort "checksums.txt does not name exactly the four archives" unless checksums.keys.sort == archives.sort
+
+          archives.each do |archive|
+            actual = Digest::SHA256.file(File.join("dist", archive)).hexdigest
+            abort "checksum mismatch for #{archive}" unless checksums.fetch(archive) == actual
+          end
+
+          targets = {
+            ["macos", "if Hardware::CPU.intel?"] => "darwin_amd64",
+            ["macos", "if Hardware::CPU.arm?"] => "darwin_arm64",
+            ["linux", "if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?"] => "linux_amd64",
+            ["linux", "if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?"] => "linux_arm64"
+          }
+          records = {}
+          versions = []
+          platform = nil
+          target = nil
+          File.foreach(formula_path) do |line|
+            stripped = line.strip
+            abort "formula must not declare dependencies" if stripped.match?(/\Adepends_on\b/)
+
+            case stripped
+            when "on_macos do"
+              platform = "macos"
+              target = nil
+            when "on_linux do"
+              platform = "linux"
+              target = nil
+            when /\Aversion "([^"]+)"\z/
+              versions << Regexp.last_match(1)
+            when /\Aif Hardware::CPU\./
+              target = targets.fetch([platform, stripped]) do
+                abort "unexpected formula target condition: #{stripped}"
+              end
+              abort "duplicate formula target: #{target}" if records.key?(target)
+              records[target] = {}
+            when /\Aurl "([^"]+)"\z/
+              abort "formula URL appears outside a target" unless target
+              abort "duplicate URL for #{target}" if records.fetch(target).key?(:url)
+              records.fetch(target)[:url] = Regexp.last_match(1)
+            when /\Asha256 "([0-9a-f]{64})"\z/
+              abort "formula checksum appears outside a target" unless target
+              abort "duplicate checksum for #{target}" if records.fetch(target).key?(:sha256)
+              records.fetch(target)[:sha256] = Regexp.last_match(1)
+            end
+          end
+
+          abort "formula version must equal metadata.version" unless versions == [version]
+          expected_targets = %w[darwin_amd64 darwin_arm64 linux_amd64 linux_arm64]
+          abort "formula target mappings are incomplete" unless records.keys.sort == expected_targets.sort
+          expected_targets.each do |name|
+            archive = "ringbinder_#{version}_#{name}.tar.gz"
+            expected_url = "https://github.com/maxim/ringbinder/releases/download/#{tag}/#{archive}"
+            record = records.fetch(name)
+            abort "formula URL mismatch for #{name}" unless record[:url] == expected_url
+            abort "formula checksum mismatch for #{name}" unless record[:sha256] == checksums.fetch(archive)
+          end
+          RUBY
+
+          (
+            cd dist
+            sha256sum --check --strict checksums.txt
+          )
+
+          payload_dir=$(mktemp -d)
+          trap 'rm -rf "$payload_dir"' EXIT
+          for archive in "${expected_archives[@]}"; do
+            members=$(tar -tzf "dist/$archive" | LC_ALL=C sort)
+            if [[ "$members" != $'LICENSE\nringbinder' ]]; then
+              echo "$archive must contain exactly LICENSE and ringbinder." >&2
+              printf 'Found:\n%s\n' "$members" >&2
+              exit 1
+            fi
+
+            if [[ ! "$archive" =~ _(darwin|linux)_(amd64|arm64)\.tar\.gz$ ]]; then
+              echo "Cannot derive target from archive name: $archive" >&2
+              exit 1
+            fi
+            goos=${BASH_REMATCH[1]}
+            goarch=${BASH_REMATCH[2]}
+            target="${goos}_${goarch}"
+            mkdir "$payload_dir/$target"
+            tar -xzf "dist/$archive" -C "$payload_dir/$target"
+            payload="$payload_dir/$target/ringbinder"
+
+            go version -m "$payload" > "$payload_dir/$target/build-info.txt"
+            ruby - "$payload_dir/$target/build-info.txt" "$goos" "$goarch" <<'RUBY'
+          path, goos, goarch = ARGV
+          settings = Hash.new { |hash, key| hash[key] = [] }
+          File.foreach(path) do |line|
+            match = line.chomp.match(/\A\tbuild\t([^=]+)=(.*)\z/)
+            settings[match[1]] << match[2] if match
+          end
+          {"GOOS" => goos, "GOARCH" => goarch, "CGO_ENABLED" => "0"}.each do |key, expected|
+            abort "#{key} must be exactly #{expected}" unless settings[key] == [expected]
+          end
+          RUBY
+
+            file_info=$(file -b "$payload")
+            case "$target" in
+              darwin_amd64)
+                [[ "$file_info" == *"Mach-O 64-bit"* &&
+                  "$file_info" == *"executable"* && "$file_info" == *"x86_64"* ]]
+                ;;
+              darwin_arm64)
+                [[ "$file_info" == *"Mach-O 64-bit"* &&
+                  "$file_info" == *"executable"* && "$file_info" == *"arm64"* ]]
+                ;;
+              linux_amd64)
+                [[ "$file_info" == "ELF 64-bit LSB executable,"*"x86-64"*"statically linked"* ]]
+                ;;
+              linux_arm64)
+                [[ "$file_info" == "ELF 64-bit LSB executable,"*"ARM aarch64"*"statically linked"* ]]
+                ;;
+              *)
+                echo "Unexpected payload target: $target" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          mkdir "$payload_dir/home"
+          linux_amd64="$payload_dir/linux_amd64/ringbinder"
+          HOME="$payload_dir/home" "$linux_amd64" --version > "$payload_dir/version.txt"
+          diff -u <(printf 'ringbinder version v%s\n' "$snapshot_version") "$payload_dir/version.txt"
+          HOME="$payload_dir/home" "$linux_amd64" \
+            --database "$payload_dir/ringbinder.db" cost > "$payload_dir/cost.txt"
+          diff -u <(printf 'No documents pending OCR.\n') "$payload_dir/cost.txt"
+          test -f "$payload_dir/ringbinder.db"
+
+      # The immutable tag points to the SHA already exercised by both platform test jobs.
+      - name: Create immutable release tag
+        env:
+          PRIOR_LATEST_VERSION: ${{ needs.validate.outputs.prior_latest_version }}
+          RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! remote_tags=$(git ls-remote --tags --refs origin); then
+            echo "Could not recheck release tags immediately before tagging." >&2
+            exit 1
+          fi
+          stable_tags=()
+          release_tag_exists=false
+          while IFS=$'\t' read -r _ ref; do
+            tag=${ref#refs/tags/}
+            if [[ "$tag" == "$RELEASE_VERSION" ]]; then
+              release_tag_exists=true
+            fi
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              stable_tags+=("$tag")
+            fi
+          done <<< "$remote_tags"
+
+          if [[ "$release_tag_exists" == true ]]; then
+            echo "Tag $RELEASE_VERSION appeared while tests were running." >&2
+            exit 1
+          fi
+
+          current_latest_version=""
+          if (( ${#stable_tags[@]} > 0 )); then
+            mapfile -t sorted_tags < <(printf '%s\n' "${stable_tags[@]}" | sort -V)
+            current_latest_version=${sorted_tags[${#sorted_tags[@]}-1]}
+          fi
+          if [[ "$current_latest_version" != "$PRIOR_LATEST_VERSION" ]]; then
+            echo "Latest stable tag changed from ${PRIOR_LATEST_VERSION:-<none>} to ${current_latest_version:-<none>} while tests were running." >&2
+            exit 1
+          fi
+
+          git tag "$RELEASE_VERSION" "$RELEASE_SHA"
+          git push origin "refs/tags/$RELEASE_VERSION"
+
+      - name: Publish release and tap pull request
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          # 2.16 hard-deprecated formula generation in favor of casks.
+          version: v2.15.4
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Require and register tap pull request for auto-merge
+        id: tap_pr
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tap_branch="ringbinder-${RELEASE_VERSION#v}"
+          # GoReleaser exposes no pull request number. The owner-qualified REST filter
+          # excludes same-named branches from forks before the result is validated again.
+          if ! prs_json=$(gh api --method GET repos/maxim/homebrew-tap/pulls \
+            -f head="maxim:$tap_branch" \
+            -f base=main \
+            -f state=open \
+            -f per_page=100); then
+            echo "Could not query the tap pull request API." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "array" and length == 1' <<< "$prs_json" >/dev/null; then
+            pr_count=$(jq -r 'if type == "array" then length else "invalid response" end' <<< "$prs_json")
+            echo "Expected one open tap pull request from maxim:$tap_branch; found $pr_count." >&2
+            exit 1
+          fi
+          pr_number=$(jq -er '.[0].number | select(type == "number")' <<< "$prs_json")
+          if ! pr_json=$(gh api "repos/maxim/homebrew-tap/pulls/$pr_number"); then
+            echo "Could not fetch tap pull request #$pr_number for validation." >&2
+            exit 1
+          fi
+          if ! jq -e \
+            --arg head_ref "$tap_branch" '
+              .state == "open" and
+              .head.repo.full_name == "maxim/homebrew-tap" and
+              .head.ref == $head_ref and
+              .base.repo.full_name == "maxim/homebrew-tap" and
+              .base.ref == "main"
+            ' <<< "$pr_json" >/dev/null; then
+            echo "Tap pull request #$pr_number does not have the exact expected repositories and refs." >&2
+            exit 1
+          fi
+
+          gh pr merge "$pr_number" \
+            --repo maxim/homebrew-tap \
+            --auto \
+            --squash \
+            --delete-branch
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for tap pull request to merge
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PR_NUMBER: ${{ steps.tap_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          max_attempts=120
+          poll_seconds=20
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            state=$(gh pr view "$PR_NUMBER" \
+              --repo maxim/homebrew-tap \
+              --json state \
+              --jq '.state')
+            case "$state" in
+              MERGED)
+                echo "Tap pull request #$PR_NUMBER merged."
+                exit 0
+                ;;
+              CLOSED)
+                echo "Tap pull request #$PR_NUMBER closed without merging." >&2
+                exit 1
+                ;;
+              OPEN)
+                ;;
+              *)
+                echo "Tap pull request #$PR_NUMBER returned unexpected state: $state" >&2
+                exit 1
+                ;;
+            esac
+
+            if (( attempt == max_attempts )); then
+              echo "Timed out waiting for tap pull request #$PR_NUMBER to merge." >&2
+              exit 1
+            fi
+            echo "Tap pull request #$PR_NUMBER is still open; waiting for required checks."
+            sleep "$poll_seconds"
+          done

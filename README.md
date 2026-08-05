@@ -22,7 +22,15 @@ My use case is just scanning every piece of paper I come across (as well as imme
 
 ## Install
 
-Ringbinder is a Go CLI. It currently targets macOS and Linux.
+Ringbinder currently targets macOS and Linux. Install the standalone binary with Homebrew:
+
+```sh
+brew install maxim/tap/ringbinder
+```
+
+### Developer alternatives
+
+With a Go toolchain installed, you can install the latest source directly:
 
 ```sh
 go install github.com/maxim/ringbinder@latest

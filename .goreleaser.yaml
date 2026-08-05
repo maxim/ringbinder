@@ -42,7 +42,8 @@ checksum:
   algorithm: sha256
 
 # GoReleaser 2.16 hard-deprecated formula generation in favor of casks. Ringbinder
-# intentionally stays on 2.15.4 because this tap requires an architecture-selecting formula.
+# stays on 2.15.4 for an architecture-selecting formula; the release workflow removes
+# its redundant version stanza because current Homebrew derives the version from the URL.
 brews:
   - name: ringbinder
     ids:

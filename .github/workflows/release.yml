@@ -301,6 +301,11 @@ jobs:
           fi
           ruby -c "$formula_path"
 
+          # Current Homebrew rejects GoReleaser's explicit version because the release
+          # URL already provides it. Validate the same normalized formula sent to the tap.
+          ruby scripts/normalize-homebrew-formula.rb "$formula_path" "$snapshot_version"
+          ruby -c "$formula_path"
+
           ruby - "$formula_path" "$checksum_path" dist/metadata.json "${expected_archives[@]}" <<'RUBY'
           require "digest"
           require "json"
@@ -331,7 +336,6 @@ jobs:
             ["linux", "if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?"] => "linux_arm64"
           }
           records = {}
-          versions = []
           platform = nil
           target = nil
           File.foreach(formula_path) do |line|
@@ -345,8 +349,8 @@ jobs:
             when "on_linux do"
               platform = "linux"
               target = nil
-            when /\Aversion "([^"]+)"\z/
-              versions << Regexp.last_match(1)
+            when /\Aversion\b/
+              abort "formula must let Homebrew derive version from its release URL"
             when /\Aif Hardware::CPU\./
               target = targets.fetch([platform, stripped]) do
                 abort "unexpected formula target condition: #{stripped}"
@@ -364,7 +368,6 @@ jobs:
             end
           end
 
-          abort "formula version must equal metadata.version" unless versions == [version]
           expected_targets = %w[darwin_amd64 darwin_arm64 linux_amd64 linux_arm64]
           abort "formula target mappings are incomplete" unless records.keys.sort == expected_targets.sort
           expected_targets.each do |name|
@@ -501,8 +504,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
-      - name: Require and register tap pull request for auto-merge
-        id: tap_pr
+      - name: Normalize generated Homebrew formula
+        id: normalize_formula
+        # GoReleaser 2.15 has no option to omit its audit-redundant version stanza.
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
@@ -510,47 +514,210 @@ jobs:
           set -euo pipefail
 
           tap_branch="ringbinder-${RELEASE_VERSION#v}"
+          formula_endpoint="repos/maxim/homebrew-tap/contents/Formula/ringbinder.rb"
+          original_formula=dist/homebrew/Formula/ringbinder.rb
+          max_get_attempts=5
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          retry_get() {
+            local output=$1
+            local description=$2
+            shift 2
+            for ((attempt = 1; attempt <= max_get_attempts; attempt++)); do
+              if gh api "$@" > "$output" 2>/dev/null; then
+                return 0
+              fi
+              if (( attempt == max_get_attempts )); then
+                echo "Could not $description after $max_get_attempts attempts." >&2
+                return 1
+              fi
+              sleep $((1 << (attempt - 1)))
+            done
+          }
+
+          test -f "$original_formula"
+          cp "$original_formula" "$tmpdir/normalized.rb"
+          ruby scripts/normalize-homebrew-formula.rb \
+            "$tmpdir/normalized.rb" \
+            "${RELEASE_VERSION#v}"
+          normalized_git_sha=$(git hash-object "$tmpdir/normalized.rb")
+
+          # The generated branch is safe to modify only if GoReleaser published the exact
+          # production formula that this run generated locally. Never normalize unknown bytes.
+          retry_get "$tmpdir/initial.json" "fetch the generated tap formula" \
+            "$formula_endpoint?ref=$tap_branch"
+          jq -er '.sha | select(type == "string" and length > 0)' \
+            "$tmpdir/initial.json" >/dev/null
+          jq -er '.content | select(type == "string")' "$tmpdir/initial.json" |
+            tr -d '\n' | base64 --decode > "$tmpdir/remote.rb"
+          if ! cmp -s "$tmpdir/remote.rb" "$original_formula"; then
+            echo "The generated tap formula does not exactly match this run's local formula." >&2
+            exit 1
+          fi
+
+          # Re-read before every conditional write. This turns a lost successful PUT response
+          # into success on the next GET and prevents duplicate or no-op normalization commits.
+          reconciled=false
+          max_reconcile_attempts=5
+          for ((round = 1; round <= max_reconcile_attempts; round++)); do
+            retry_get "$tmpdir/current.json" "reconcile the tap formula" \
+              "$formula_endpoint?ref=$tap_branch"
+            current_sha=$(jq -er '.sha | select(type == "string" and length > 0)' \
+              "$tmpdir/current.json")
+            jq -er '.content | select(type == "string")' "$tmpdir/current.json" |
+              tr -d '\n' | base64 --decode > "$tmpdir/remote.rb"
+
+            if cmp -s "$tmpdir/remote.rb" "$tmpdir/normalized.rb"; then
+              reconciled=true
+              break
+            fi
+            if ! cmp -s "$tmpdir/remote.rb" "$original_formula"; then
+              echo "The tap formula diverged while normalization was being reconciled." >&2
+              exit 1
+            fi
+            if (( round == max_reconcile_attempts )); then
+              break
+            fi
+
+            # Keep the formula bytes in a request file so neither the token nor base64
+            # content can appear in the command line or workflow log.
+            base64 -w 0 < "$tmpdir/normalized.rb" > "$tmpdir/content.txt"
+            jq -n \
+              --arg branch "$tap_branch" \
+              --rawfile content "$tmpdir/content.txt" \
+              --arg message "Remove redundant formula version" \
+              --arg sha "$current_sha" \
+              '{branch: $branch, content: $content, message: $message, sha: $sha}' \
+              > "$tmpdir/update.json"
+            if ! gh api --method PUT "$formula_endpoint" \
+              --input "$tmpdir/update.json" >/dev/null 2>&1; then
+              echo "Tap formula update attempt $round was not confirmed; reconciling." >&2
+            fi
+            sleep $((1 << (round - 1)))
+          done
+          if [[ "$reconciled" != true ]]; then
+            echo "Could not confirm the normalized tap formula after bounded reconciliation." >&2
+            exit 1
+          fi
+
+          # Pin outputs to one exact branch commit, not merely to a moving branch name.
+          retry_get "$tmpdir/ref.json" "fetch the normalized tap branch head" \
+            "repos/maxim/homebrew-tap/git/ref/heads/$tap_branch"
+          branch_head_sha=$(jq -er '
+            select(.object.type == "commit") |
+            .object.sha | select(type == "string" and length > 0)
+          ' "$tmpdir/ref.json")
+          retry_get "$tmpdir/final.json" "fetch the formula at the normalized branch head" \
+            "$formula_endpoint?ref=$branch_head_sha"
+          formula_blob_sha=$(jq -er '.sha | select(type == "string" and length > 0)' \
+            "$tmpdir/final.json")
+          jq -er '.content | select(type == "string")' "$tmpdir/final.json" |
+            tr -d '\n' | base64 --decode > "$tmpdir/final.rb"
+          if ! cmp -s "$tmpdir/final.rb" "$tmpdir/normalized.rb" ||
+            [[ "$formula_blob_sha" != "$normalized_git_sha" ]]; then
+            echo "The normalized tap branch head does not contain the known formula bytes." >&2
+            exit 1
+          fi
+
+          {
+            echo "formula_blob_sha=$formula_blob_sha"
+            echo "branch_head_sha=$branch_head_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate and pin tap pull request
+        id: tap_pr
+        env:
+          EXPECTED_BLOB_SHA: ${{ steps.normalize_formula.outputs.formula_blob_sha }}
+          EXPECTED_HEAD_SHA: ${{ steps.normalize_formula.outputs.branch_head_sha }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tap_branch="ringbinder-${RELEASE_VERSION#v}"
+          max_get_attempts=5
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          retry_get() {
+            local output=$1
+            local description=$2
+            shift 2
+            for ((attempt = 1; attempt <= max_get_attempts; attempt++)); do
+              if gh api "$@" > "$output" 2>/dev/null; then
+                return 0
+              fi
+              if (( attempt == max_get_attempts )); then
+                echo "Could not $description after $max_get_attempts attempts." >&2
+                return 1
+              fi
+              sleep $((1 << (attempt - 1)))
+            done
+          }
+
           # GoReleaser exposes no pull request number. The owner-qualified REST filter
           # excludes same-named branches from forks before the result is validated again.
-          if ! prs_json=$(gh api --method GET repos/maxim/homebrew-tap/pulls \
+          retry_get "$tmpdir/prs.json" "query the tap pull request API" \
+            --method GET repos/maxim/homebrew-tap/pulls \
             -f head="maxim:$tap_branch" \
             -f base=main \
             -f state=open \
-            -f per_page=100); then
-            echo "Could not query the tap pull request API." >&2
-            exit 1
-          fi
-          if ! jq -e 'type == "array" and length == 1' <<< "$prs_json" >/dev/null; then
-            pr_count=$(jq -r 'if type == "array" then length else "invalid response" end' <<< "$prs_json")
+            -f per_page=100
+          if ! jq -e 'type == "array" and length == 1' "$tmpdir/prs.json" >/dev/null; then
+            pr_count=$(jq -r 'if type == "array" then length else "invalid response" end' \
+              "$tmpdir/prs.json")
             echo "Expected one open tap pull request from maxim:$tap_branch; found $pr_count." >&2
             exit 1
           fi
-          pr_number=$(jq -er '.[0].number | select(type == "number")' <<< "$prs_json")
-          if ! pr_json=$(gh api "repos/maxim/homebrew-tap/pulls/$pr_number"); then
-            echo "Could not fetch tap pull request #$pr_number for validation." >&2
-            exit 1
-          fi
+          pr_number=$(jq -er '.[0].number | select(type == "number")' "$tmpdir/prs.json")
+          retry_get "$tmpdir/pr.json" "fetch tap pull request #$pr_number" \
+            "repos/maxim/homebrew-tap/pulls/$pr_number"
           if ! jq -e \
-            --arg head_ref "$tap_branch" '
+            --arg head_ref "$tap_branch" \
+            --arg head_sha "$EXPECTED_HEAD_SHA" '
               .state == "open" and
+              .head.label == ("maxim:" + $head_ref) and
               .head.repo.full_name == "maxim/homebrew-tap" and
               .head.ref == $head_ref and
+              .head.sha == $head_sha and
               .base.repo.full_name == "maxim/homebrew-tap" and
               .base.ref == "main"
-            ' <<< "$pr_json" >/dev/null; then
-            echo "Tap pull request #$pr_number does not have the exact expected repositories and refs." >&2
+            ' "$tmpdir/pr.json" >/dev/null; then
+            echo "Tap pull request #$pr_number does not have the exact expected repositories, refs, and head SHA." >&2
             exit 1
           fi
 
-          gh pr merge "$pr_number" \
-            --repo maxim/homebrew-tap \
-            --auto \
-            --squash \
-            --delete-branch
-          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          retry_get "$tmpdir/files.json" "fetch tap pull request #$pr_number files" \
+            --method GET "repos/maxim/homebrew-tap/pulls/$pr_number/files" \
+            -f per_page=100
+          if ! jq -e '
+            type == "array" and
+            length == 1 and
+            .[0].filename == "Formula/ringbinder.rb"
+          ' "$tmpdir/files.json" >/dev/null; then
+            echo "Tap pull request #$pr_number must change only Formula/ringbinder.rb." >&2
+            exit 1
+          fi
 
-      - name: Wait for tap pull request to merge
+          retry_get "$tmpdir/formula.json" "fetch the formula at the tap pull request head" \
+            "repos/maxim/homebrew-tap/contents/Formula/ringbinder.rb?ref=$EXPECTED_HEAD_SHA"
+          pr_formula_sha=$(jq -er '.sha | select(type == "string" and length > 0)' \
+            "$tmpdir/formula.json")
+          if [[ "$pr_formula_sha" != "$EXPECTED_BLOB_SHA" ]]; then
+            echo "Tap pull request #$pr_number does not contain the pinned normalized formula." >&2
+            exit 1
+          fi
+
+          {
+            echo "pr_number=$pr_number"
+            echo "head_sha=$EXPECTED_HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for required checks and merge pinned tap pull request
         env:
+          EXPECTED_BLOB_SHA: ${{ steps.normalize_formula.outputs.formula_blob_sha }}
+          EXPECTED_HEAD_SHA: ${{ steps.tap_pr.outputs.head_sha }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           PR_NUMBER: ${{ steps.tap_pr.outputs.pr_number }}
         run: |
@@ -558,32 +725,112 @@ jobs:
 
           max_attempts=120
           poll_seconds=20
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          merged=false
           for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-            state=$(gh pr view "$PR_NUMBER" \
+            if ! gh pr view "$PR_NUMBER" \
               --repo maxim/homebrew-tap \
-              --json state \
-              --jq '.state')
-            case "$state" in
-              MERGED)
-                echo "Tap pull request #$PR_NUMBER merged."
-                exit 0
-                ;;
-              CLOSED)
-                echo "Tap pull request #$PR_NUMBER closed without merging." >&2
+              --json headRefOid,state \
+              > "$tmpdir/pr.json" 2>/dev/null; then
+              echo "Could not read tap pull request #$PR_NUMBER; retrying." >&2
+            else
+              state=$(jq -er '.state | select(type == "string")' "$tmpdir/pr.json")
+              head_sha=$(jq -er '.headRefOid | select(type == "string" and length > 0)' \
+                "$tmpdir/pr.json")
+              if [[ "$head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
+                echo "Tap pull request #$PR_NUMBER head changed from $EXPECTED_HEAD_SHA to $head_sha." >&2
                 exit 1
-                ;;
-              OPEN)
-                ;;
-              *)
-                echo "Tap pull request #$PR_NUMBER returned unexpected state: $state" >&2
-                exit 1
-                ;;
-            esac
+              fi
+
+              case "$state" in
+                MERGED)
+                  merged=true
+                  echo "Tap pull request #$PR_NUMBER merged; verifying the formula on main."
+                  break
+                  ;;
+                CLOSED)
+                  echo "Tap pull request #$PR_NUMBER closed without merging." >&2
+                  exit 1
+                  ;;
+                OPEN)
+                  checks_status=0
+                  gh pr checks "$PR_NUMBER" \
+                    --repo maxim/homebrew-tap \
+                    --required \
+                    --json bucket,name \
+                    > "$tmpdir/checks.json" 2>/dev/null || checks_status=$?
+
+                  if ! jq -e 'type == "array"' "$tmpdir/checks.json" >/dev/null 2>&1; then
+                    echo "Could not read required checks for tap pull request #$PR_NUMBER; retrying." >&2
+                  elif jq -e 'any(.[]; .bucket == "fail" or .bucket == "cancel")' \
+                    "$tmpdir/checks.json" >/dev/null; then
+                    failed_checks=$(jq -r '
+                      [.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] |
+                      join(", ")
+                    ' "$tmpdir/checks.json")
+                    echo "Required checks failed or were cancelled: $failed_checks" >&2
+                    exit 1
+                  elif jq -e 'length > 0 and all(.[]; .bucket == "pass")' \
+                    "$tmpdir/checks.json" >/dev/null; then
+                    if (( attempt == max_attempts )); then
+                      echo "Required checks passed, but no retry remains to confirm the merge." >&2
+                      exit 1
+                    fi
+                    echo "All required checks passed; merging pinned head $EXPECTED_HEAD_SHA."
+                    if ! gh pr merge "$PR_NUMBER" \
+                      --repo maxim/homebrew-tap \
+                      --squash \
+                      --delete-branch \
+                      --match-head-commit "$EXPECTED_HEAD_SHA"; then
+                      echo "Merge was not confirmed; reconciling pull request state." >&2
+                    fi
+                  elif (( checks_status != 0 && checks_status != 8 )); then
+                    echo "Required-check query failed transiently; retrying." >&2
+                  elif (( $(jq 'length' "$tmpdir/checks.json") == 0 )); then
+                    echo "No required checks are reported yet; waiting."
+                  else
+                    echo "Required checks are not all passing yet; waiting."
+                  fi
+                  ;;
+                *)
+                  echo "Tap pull request #$PR_NUMBER returned unexpected state: $state" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
 
             if (( attempt == max_attempts )); then
-              echo "Timed out waiting for tap pull request #$PR_NUMBER to merge." >&2
+              echo "Timed out waiting to merge tap pull request #$PR_NUMBER." >&2
               exit 1
             fi
-            echo "Tap pull request #$PR_NUMBER is still open; waiting for required checks."
             sleep "$poll_seconds"
+          done
+
+          if [[ "$merged" != true ]]; then
+            echo "Tap pull request #$PR_NUMBER was not observed in the merged state." >&2
+            exit 1
+          fi
+
+          max_get_attempts=5
+          for ((attempt = 1; attempt <= max_get_attempts; attempt++)); do
+            if gh api \
+              'repos/maxim/homebrew-tap/contents/Formula/ringbinder.rb?ref=main' \
+              > "$RUNNER_TEMP/tap-main-formula.json" 2>/dev/null; then
+              main_formula_sha=$(jq -er '.sha | select(type == "string" and length > 0)' \
+                "$RUNNER_TEMP/tap-main-formula.json")
+              if [[ "$main_formula_sha" == "$EXPECTED_BLOB_SHA" ]]; then
+                echo "Tap main contains the pinned normalized formula."
+                exit 0
+              fi
+              echo "Tap main has not exposed the pinned formula yet; retrying." >&2
+            else
+              echo "Could not read the formula from tap main; retrying." >&2
+            fi
+            if (( attempt == max_get_attempts )); then
+              echo "Tap main did not expose the pinned formula after $max_get_attempts attempts." >&2
+              exit 1
+            fi
+            sleep $((1 << (attempt - 1)))
           done

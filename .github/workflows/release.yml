@@ -250,6 +250,7 @@ jobs:
     permissions:
       contents: write
     env:
+      # Pin bump-formula-pr output bytes so interrupted releases can reconcile exactly.
       HOMEBREW_BREW_SHA: 7b0f22a4ab77567edef114c8dfc423fb96e2fbaa # 6.0.15
       HOMEBREW_NO_AUTO_UPDATE: 1
     steps:

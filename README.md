@@ -22,7 +22,7 @@ My use case is just scanning every piece of paper I come across (as well as imme
 
 ## Install
 
-Ringbinder currently targets macOS and Linux. Install the standalone binary with Homebrew:
+Ringbinder currently targets macOS and Linux. Install it with Homebrew, which compiles the pinned release source using Go as a build-only dependency:
 
 ```sh
 brew install maxim/tap/ringbinder

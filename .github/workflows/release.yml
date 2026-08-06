@@ -414,7 +414,7 @@ jobs:
           test "$(git -C "$brew_repo" rev-parse HEAD)" = "$HOMEBREW_BREW_SHA"
 
       - name: Derive expected formula with Homebrew
-        id: formula
+        id: formula_bump
         env:
           RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
@@ -488,12 +488,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Inspect resumable tap state
-        id: tap_state
+        id: tap_update
         env:
-          EXPECTED_BLOB_SHA: ${{ steps.formula.outputs.expected_blob_sha }}
-          FORMULA_STATE: ${{ steps.formula.outputs.formula_state }}
+          EXPECTED_BLOB_SHA: ${{ steps.formula_bump.outputs.expected_blob_sha }}
+          FORMULA_STATE: ${{ steps.formula_bump.outputs.formula_state }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          TAP_BRANCH: ${{ steps.formula.outputs.branch }}
+          TAP_BRANCH: ${{ steps.formula_bump.outputs.branch }}
         run: |
           set -euo pipefail
 
@@ -578,7 +578,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            echo "state=merged" >> "$GITHUB_OUTPUT"
+            echo "tap_update_state=merged" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [[ "$FORMULA_STATE" == merged ]]; then
@@ -592,7 +592,7 @@ jobs:
                 echo "A tap PR exists without its expected release branch." >&2
                 exit 1
               fi
-              echo "state=absent" >> "$GITHUB_OUTPUT"
+              echo "tap_update_state=absent" >> "$GITHUB_OUTPUT"
               ;;
             200)
               gh api "repos/maxim/homebrew-tap/git/ref/heads/$TAP_BRANCH" \
@@ -619,7 +619,7 @@ jobs:
                 echo "The existing tap PR is closed or draft and cannot be resumed." >&2
                 exit 1
               fi
-              echo "state=existing" >> "$GITHUB_OUTPUT"
+              echo "tap_update_state=existing" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "Could not determine tap branch state; received HTTP $branch_status." >&2
@@ -628,7 +628,7 @@ jobs:
           esac
 
       - name: Publish formula bump once
-        if: steps.tap_state.outputs.state == 'absent'
+        if: steps.tap_update.outputs.tap_update_state == 'absent'
         env:
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_AUTHOR_NAME: Ringbinder Release Bot
@@ -637,7 +637,7 @@ jobs:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          TAP_MAIN_SHA: ${{ steps.formula.outputs.tap_main_sha }}
+          TAP_MAIN_SHA: ${{ steps.formula_bump.outputs.tap_main_sha }}
         run: |
           set -euo pipefail
 
@@ -704,12 +704,12 @@ jobs:
 
       - name: Validate branch and create only a missing PR
         id: tap_pr
-        if: steps.tap_state.outputs.state != 'merged'
+        if: steps.tap_update.outputs.tap_update_state != 'merged'
         env:
-          EXPECTED_BLOB_SHA: ${{ steps.formula.outputs.expected_blob_sha }}
+          EXPECTED_BLOB_SHA: ${{ steps.formula_bump.outputs.expected_blob_sha }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          TAP_BRANCH: ${{ steps.formula.outputs.branch }}
+          TAP_BRANCH: ${{ steps.formula_bump.outputs.branch }}
         run: |
           set -euo pipefail
 
@@ -787,13 +787,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Wait for exact checks and merge pinned tap PR
-        if: steps.tap_state.outputs.state != 'merged'
+        if: steps.tap_update.outputs.tap_update_state != 'merged'
         env:
-          EXPECTED_BLOB_SHA: ${{ steps.formula.outputs.expected_blob_sha }}
+          EXPECTED_BLOB_SHA: ${{ steps.formula_bump.outputs.expected_blob_sha }}
           EXPECTED_HEAD_SHA: ${{ steps.tap_pr.outputs.head_sha }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           PR_NUMBER: ${{ steps.tap_pr.outputs.pr_number }}
-          TAP_BRANCH: ${{ steps.formula.outputs.branch }}
+          TAP_BRANCH: ${{ steps.formula_bump.outputs.branch }}
         run: |
           set -euo pipefail
 
@@ -871,7 +871,7 @@ jobs:
           fi
 
           current_head_sha=$EXPECTED_HEAD_SHA
-          update_requested_head=""
+          pending_update_from_head=""
           update_wait_attempts=0
           update_count=0
           merge_attempts=0
@@ -919,12 +919,12 @@ jobs:
             gh api "repos/maxim/homebrew-tap/pulls/$PR_NUMBER" > "$tmpdir/pr-observed.json"
             observed_head=$(jq -er '.head.sha | select(type == "string")' "$tmpdir/pr-observed.json")
             if [[ "$observed_head" != "$current_head_sha" ]]; then
-              if [[ -z "$update_requested_head" || "$current_head_sha" != "$update_requested_head" ]]; then
+              if [[ -z "$pending_update_from_head" || "$current_head_sha" != "$pending_update_from_head" ]]; then
                 echo "Tap PR head changed without the workflow's guarded base update." >&2
                 exit 1
               fi
               current_head_sha=$observed_head
-              update_requested_head=""
+              pending_update_from_head=""
               update_wait_attempts=0
               validate_pr
               echo "Repinned tap PR after updating it from main: $current_head_sha"
@@ -947,7 +947,7 @@ jobs:
             mergeable_state=$(jq -er '.mergeable_state' "$tmpdir/pr-observed.json")
             case "$mergeable_state" in
               behind)
-                if [[ "$update_requested_head" == "$current_head_sha" ]]; then
+                if [[ "$pending_update_from_head" == "$current_head_sha" ]]; then
                   ((update_wait_attempts += 1))
                   if (( update_wait_attempts > 10 )); then
                     echo "Timed out waiting for the guarded tap branch update." >&2
@@ -962,7 +962,7 @@ jobs:
                   gh api --method PUT \
                     "repos/maxim/homebrew-tap/pulls/$PR_NUMBER/update-branch" \
                     -f expected_head_sha="$current_head_sha" >/dev/null
-                  update_requested_head=$current_head_sha
+                  pending_update_from_head=$current_head_sha
                   update_wait_attempts=0
                   echo "Updating exact tap PR head from main before fresh checks."
                 fi
@@ -1064,9 +1064,9 @@ jobs:
           done
 
       - name: Confirm already-merged formula
-        if: steps.tap_state.outputs.state == 'merged'
+        if: steps.tap_update.outputs.tap_update_state == 'merged'
         env:
-          EXPECTED_BLOB_SHA: ${{ steps.formula.outputs.expected_blob_sha }}
+          EXPECTED_BLOB_SHA: ${{ steps.formula_bump.outputs.expected_blob_sha }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail

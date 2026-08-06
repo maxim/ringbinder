@@ -476,7 +476,6 @@ jobs:
 
           ruby -c "$tap_repo/Formula/ringbinder.rb"
           expected_blob_sha=$(git -C "$tap_repo" hash-object Formula/ringbinder.rb)
-          cp "$tap_repo/Formula/ringbinder.rb" "$RUNNER_TEMP/expected-ringbinder.rb"
 
           git -C "$tap_repo" reset --hard origin/main
           git -C "$tap_repo" clean -ffd
@@ -648,13 +647,38 @@ jobs:
             exit 1
           fi
           cleanup() {
-            git -C "$tap_repo" remote set-url origin \
-              https://github.com/maxim/homebrew-tap.git 2>/dev/null || true
-            git -C "$tap_repo" config --unset-all remote.origin.pushurl 2>/dev/null || true
-            git -C "$tap_repo" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
-            git -C "$tap_repo" config --unset-all credential.helper 2>/dev/null || true
-            git -C "$tap_repo" reset --hard origin/main >/dev/null 2>&1 || true
-            git -C "$tap_repo" clean -ffd >/dev/null 2>&1 || true
+            local original_status=$?
+            local cleanup_status=0
+
+            unset_local_config() {
+              local key=$1
+              if git -C "$tap_repo" config --local --get-all "$key" >/dev/null 2>&1 &&
+                ! git -C "$tap_repo" config --local --unset-all "$key"; then
+                echo "Could not remove tap Git config $key." >&2
+                cleanup_status=1
+              fi
+            }
+
+            if ! git -C "$tap_repo" remote set-url origin \
+              https://github.com/maxim/homebrew-tap.git; then
+              echo "Could not restore the unauthenticated tap origin." >&2
+              cleanup_status=1
+            fi
+            unset_local_config remote.origin.pushurl
+            unset_local_config http.https://github.com/.extraheader
+            unset_local_config credential.helper
+            if ! git -C "$tap_repo" reset --hard origin/main; then
+              echo "Could not reset the tap checkout to origin/main." >&2
+              cleanup_status=1
+            fi
+            if ! git -C "$tap_repo" clean -ffd; then
+              echo "Could not clean the tap checkout." >&2
+              cleanup_status=1
+            fi
+            if (( cleanup_status != 0 )); then
+              return "$cleanup_status"
+            fi
+            return "$original_status"
           }
           trap cleanup EXIT
 
@@ -942,16 +966,14 @@ jobs:
                   update_wait_attempts=0
                   echo "Updating exact tap PR head from main before fresh checks."
                 fi
+                sleep "$poll_seconds"
+                continue
                 ;;
               dirty)
                 echo "Tap PR cannot be updated cleanly from main." >&2
                 exit 1
                 ;;
             esac
-            if [[ -n "$update_requested_head" ]]; then
-              sleep "$poll_seconds"
-              continue
-            fi
 
             checks_status=0
             gh pr checks "$PR_NUMBER" \
@@ -1058,14 +1080,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          if tap_repo=$(brew --repo maxim/tap 2>/dev/null); then
-            git -C "$tap_repo" remote set-url origin \
-              https://github.com/maxim/homebrew-tap.git 2>/dev/null || true
-            git -C "$tap_repo" config --unset-all remote.origin.pushurl 2>/dev/null || true
-            git -C "$tap_repo" config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
-            git -C "$tap_repo" config --unset-all credential.helper 2>/dev/null || true
-            git -C "$tap_repo" reset --hard origin/main >/dev/null 2>&1 || true
-            git -C "$tap_repo" clean -ffd >/dev/null 2>&1 || true
-            brew untap --force maxim/tap >/dev/null 2>&1 || true
+          if ! tap_repo=$(brew --repo maxim/tap 2>/dev/null); then
+            echo "Tap checkout was not created; no tap credentials need cleanup."
+            exit 0
           fi
-          rm -f "$RUNNER_TEMP/expected-ringbinder.rb"
+
+          unset_local_config() {
+            local key=$1
+            if git -C "$tap_repo" config --local --get-all "$key" >/dev/null 2>&1; then
+              git -C "$tap_repo" config --local --unset-all "$key"
+            fi
+          }
+
+          git -C "$tap_repo" remote set-url origin \
+            https://github.com/maxim/homebrew-tap.git
+          unset_local_config remote.origin.pushurl
+          unset_local_config http.https://github.com/.extraheader
+          unset_local_config credential.helper
+          test "$(git -C "$tap_repo" remote get-url origin)" = \
+            https://github.com/maxim/homebrew-tap.git
+          test -z "$(git -C "$tap_repo" config --local --get-all remote.origin.pushurl || true)"
+          test -z "$(git -C "$tap_repo" config --local --get-all http.https://github.com/.extraheader || true)"
+          test -z "$(git -C "$tap_repo" config --local --get-all credential.helper || true)"
+          git -C "$tap_repo" reset --hard origin/main
+          git -C "$tap_repo" clean -ffd
+          brew untap --force maxim/tap

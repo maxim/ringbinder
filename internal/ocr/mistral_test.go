@@ -231,7 +231,7 @@ func TestRetry_TransportErrorContextCancelled(t *testing.T) {
 	}
 }
 
-func TestOCRFile_SendsOCR4AnnotatedDataURLRequests(t *testing.T) {
+func TestOCRFile_SendsOCR41AnnotatedDataURLRequests(t *testing.T) {
 	t.Parallel()
 
 	pdfInput := testPDF("page 0")
@@ -284,7 +284,7 @@ func TestOCRFile_SendsOCR4AnnotatedDataURLRequests(t *testing.T) {
 					t.Fatalf("decode request: %v", err)
 				}
 
-				if got, want := req.Model, "mistral-ocr-4-0"; got != want {
+				if got, want := req.Model, "mistral-ocr-4-1"; got != want {
 					t.Fatalf("model = %q, want %q", got, want)
 				}
 				if got, want := req.Document.Type, tt.documentType; got != want {
@@ -353,7 +353,7 @@ func TestOCRFile_ParsesImageAnnotations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
-			"model":"mistral-ocr-4-0",
+			"model":"mistral-ocr-4-1",
 			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{
@@ -403,7 +403,7 @@ func TestOCRFile_ParsesStringImageAnnotation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
-			"model":"mistral-ocr-4-0",
+			"model":"mistral-ocr-4-1",
 			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{
@@ -450,7 +450,7 @@ func TestOCRFile_ParsesEscapedJSONStringImageAnnotation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
-			"model":"mistral-ocr-4-0",
+			"model":"mistral-ocr-4-1",
 			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{
@@ -504,7 +504,7 @@ func TestOCRFile_NoImages(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{
-			"model":"mistral-ocr-4-0",
+			"model":"mistral-ocr-4-1",
 			"usage_info":{"pages_processed":1,"doc_size_bytes":4},
 			"pages":[
 				{

@@ -22,9 +22,9 @@ import (
 
 const (
 	mistralEndpoint = "https://api.mistral.ai/v1/ocr"
-	mistralModel    = "mistral-ocr-4-0"
+	mistralModel    = "mistral-ocr-4-1"
 	// Ringbinder always requests bbox_annotation_format to preserve searchable
-	// image/graphic descriptions, so estimates use OCR 4 annotated-page pricing.
+	// image/graphic descriptions, so estimates use OCR 4.1 annotated-page pricing.
 	mistralPricePerPage  = 0.005 // $5 per 1,000 pages
 	maxAttempts          = 5
 	maxRequestBytes      = 45 * 1024 * 1024

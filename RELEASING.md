@@ -159,7 +159,7 @@ For the one-time `v0.1.0` formula transition, an installation made with the old 
 
 Before the tag is created, fix and push `main`, then start a new **Run workflow** dispatch for the same requested version. Do not use **Re-run jobs**: a rerun retains the failed run's original commit and workflow definition.
 
-After tagging, rerun only when recovering the latest stable version at the exact SHA captured by the failed run. The workflow can safely converge these interrupted states:
+After tagging, fix and push `main` if the workflow itself needs repair, then start a new **Run workflow** dispatch for the latest stable version. The current workflow definition derives the protected tag's exact SHA and retests that source before it resumes publication. The workflow can safely converge these interrupted states:
 
 - the exact tag exists but the GitHub Release does not;
 - the exact immutable, zero-upload release exists but the bump branch does not;

@@ -33,16 +33,18 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Validate release request
         id: release
         env:
-          RELEASE_SHA: ${{ github.sha }}
           RELEASE_VERSION: ${{ inputs.version }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+
+          release_sha=$WORKFLOW_SHA
 
           if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
             echo "Releases must be dispatched from main, not $GITHUB_REF." >&2
@@ -83,10 +85,16 @@ jobs:
               echo "Recovery may reuse only latest stable tag $latest_version." >&2
               exit 1
             fi
-            if [[ "$release_tag_sha" != "$RELEASE_SHA" ]]; then
-              echo "Tag $RELEASE_VERSION points to $release_tag_sha, not tested SHA $RELEASE_SHA." >&2
+            # Tag creation remains available to release automation, so recovery
+            # must not trust a tag pointing outside the selected main history.
+            if ! git merge-base --is-ancestor "$release_tag_sha" "$WORKFLOW_SHA"; then
+              echo "Tag $RELEASE_VERSION is not part of selected main history." >&2
               exit 1
             fi
+            # Recovery runs the current workflow definition but always retests
+            # and republishes from the protected tag's exact immutable source.
+            # This permits automation fixes without moving the release tag.
+            release_sha=$release_tag_sha
             release_mode=recovery
           else
             if [[ -z "$latest_version" ]]; then
@@ -110,7 +118,7 @@ jobs:
           {
             echo "prior_latest_version=$latest_version"
             echo "release_mode=$release_mode"
-            echo "release_sha=$RELEASE_SHA"
+            echo "release_sha=$release_sha"
             echo "version=$RELEASE_VERSION"
           } >> "$GITHUB_OUTPUT"
 
@@ -932,7 +940,15 @@ jobs:
             fi
 
             state=$(jq -er '.state' "$tmpdir/pr-observed.json")
-            is_merged=$(jq -er '.merged' "$tmpdir/pr-observed.json")
+            # jq -e treats the valid boolean false as a command failure, which
+            # would abort every open PR before its checks can finish.
+            is_merged=$(jq -r '
+              if (.merged | type) == "boolean" then
+                .merged | tostring
+              else
+                error("invalid merged state")
+              end
+            ' "$tmpdir/pr-observed.json")
             if [[ "$is_merged" == true ]]; then
               merged=true
               break

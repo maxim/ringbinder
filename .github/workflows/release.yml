@@ -261,6 +261,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # GITHUB_TOKEN cannot read the admin-only immutable-release setting or
+      # ruleset bypass actors. RELEASING.md checks both with operator admin auth;
+      # publication below still verifies GitHub marked the release immutable.
       - name: Create or validate immutable release tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -270,11 +273,6 @@ jobs:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-
-          if [[ "$(gh api repos/maxim/ringbinder/immutable-releases --jq .enabled)" != true ]]; then
-            echo "Repository release immutability must be enabled before creating a tag." >&2
-            exit 1
-          fi
 
           ruleset_dir=$(mktemp -d)
           trap 'rm -rf "$ruleset_dir"' EXIT
@@ -286,8 +284,6 @@ jobs:
             if jq -e '
               .target == "tag" and
               .enforcement == "active" and
-              (.bypass_actors | type) == "array" and
-              (.bypass_actors | length) == 0 and
               .conditions.ref_name.include == ["refs/tags/v*"] and
               .conditions.ref_name.exclude == [] and
               ([.rules[].type] | sort == ["deletion", "update"])
@@ -865,13 +861,11 @@ jobs:
           ' "$RUNNER_TEMP/tap-rules.json")
           gh api "repos/maxim/homebrew-tap/rulesets/$required_ruleset_id" \
             > "$RUNNER_TEMP/tap-required-ruleset.json"
-          if ! jq -e '
-            .enforcement == "active" and
-            (.bypass_actors | type) == "array" and
-            (.bypass_actors | length) == 0
-          ' \
+          # The limited tap token cannot see bypass actors. The operator preflight
+          # checks them with admin auth before dispatching the release.
+          if ! jq -e '.enforcement == "active"' \
             "$RUNNER_TEMP/tap-required-ruleset.json" >/dev/null; then
-            echo "Tap required checks must not have ruleset bypass actors." >&2
+            echo "Tap required-check ruleset must be active." >&2
             exit 1
           fi
 

@@ -73,8 +73,44 @@ HOMEBREW_NO_INSTALL_FROM_API=1 brew audit --strict maxim/tap/ringbinder
 1. Ensure `main` is clean and contains every intended release change.
 2. Finalize [`CHANGELOG.md`](CHANGELOG.md) with the release version and date.
 3. Run `go test ./...` locally.
-4. Open [Ringbinder Actions](https://github.com/maxim/ringbinder/actions/workflows/release.yml), select **Run workflow**, choose `main`, and enter the next stable tag such as `v0.2.0`.
-5. Wait for the release workflow and the tap's macOS/Linux jobs to finish.
+4. Run the admin-only safety preflight using GitHub CLI authentication with administration access to both repositories:
+
+   ```sh
+   set -euo pipefail
+
+   test "$(gh api repos/maxim/ringbinder/immutable-releases --jq .enabled)" = true
+
+   matching_tag_rulesets="$({
+     for id in $(gh api repos/maxim/ringbinder/rulesets \
+       --jq '.[] | select(.target == "tag") | .id'); do
+       gh api "repos/maxim/ringbinder/rulesets/$id"
+     done
+   } | jq -s '[.[] | select(
+     .target == "tag" and
+     .enforcement == "active" and
+     (.bypass_actors | type) == "array" and
+     (.bypass_actors | length) == 0 and
+     .conditions.ref_name.include == ["refs/tags/v*"] and
+     .conditions.ref_name.exclude == [] and
+     ([.rules[].type] | sort == ["deletion", "update"])
+   )] | length')"
+   test "$matching_tag_rulesets" = 1
+
+   tap_ruleset_id="$(gh api repos/maxim/homebrew-tap/rules/branches/main --jq '
+     [.[] | select(.type == "required_status_checks") | .ruleset_id] |
+     unique | if length == 1 then .[0] else error("ambiguous ruleset") end
+   ')"
+   gh api "repos/maxim/homebrew-tap/rulesets/$tap_ruleset_id" |
+     jq -e '
+       .enforcement == "active" and
+       (.bypass_actors | type) == "array" and
+       (.bypass_actors | length) == 0
+     ' >/dev/null
+   ```
+
+   GitHub's workflow tokens cannot read the immutable-release setting or ruleset bypass actors. The workflow checks every field visible to its limited tokens and still validates that GitHub marked the published release immutable before it updates Homebrew.
+5. Open [Ringbinder Actions](https://github.com/maxim/ringbinder/actions/workflows/release.yml), select **Run workflow**, choose `main`, and enter the next stable tag such as `v0.2.0`.
+6. Wait for the release workflow and the tap's macOS/Linux jobs to finish.
 
 The workflow:
 
@@ -121,7 +157,7 @@ For the one-time `v0.1.0` formula transition, an installation made with the old 
 
 ## Failure recovery
 
-Before the tag is created, fix `main` and rerun the same requested version.
+Before the tag is created, fix and push `main`, then start a new **Run workflow** dispatch for the same requested version. Do not use **Re-run jobs**: a rerun retains the failed run's original commit and workflow definition.
 
 After tagging, rerun only when recovering the latest stable version at the exact SHA captured by the failed run. The workflow can safely converge these interrupted states:
 

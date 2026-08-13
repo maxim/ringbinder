@@ -71,9 +71,10 @@ HOMEBREW_NO_INSTALL_FROM_API=1 brew audit --strict maxim/tap/ringbinder
 ## Production release
 
 1. Ensure `main` is clean and contains every intended release change.
-2. Run `go test ./...` locally.
-3. Open [Ringbinder Actions](https://github.com/maxim/ringbinder/actions/workflows/release.yml), select **Run workflow**, choose `main`, and enter the next stable tag such as `v0.2.0`.
-4. Wait for the release workflow and the tap's macOS/Linux jobs to finish.
+2. Finalize [`CHANGELOG.md`](CHANGELOG.md) with the release version and date.
+3. Run `go test ./...` locally.
+4. Open [Ringbinder Actions](https://github.com/maxim/ringbinder/actions/workflows/release.yml), select **Run workflow**, choose `main`, and enter the next stable tag such as `v0.2.0`.
+5. Wait for the release workflow and the tap's macOS/Linux jobs to finish.
 
 The workflow:
 

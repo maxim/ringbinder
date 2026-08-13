@@ -1,0 +1,26 @@
+# Changelog
+
+Notable changes to Ringbinder are documented here.
+
+## [Unreleased]
+
+## [0.2.0] - 2026-08-13
+
+### Changed
+
+- New OCR requests use Mistral OCR 4.1. Existing OCR results remain unchanged; use `ocr --redo` to explicitly reprocess them.
+- Homebrew installs build the tagged Ringbinder source instead of downloading project-built binary archives. Go remains a build-only dependency.
+
+## [0.1.0] - 2026-08-05
+
+### Added
+
+- Initial public release.
+- Incremental PDF and image scanning with checksum deduplication, soft deletion, restoration, glob paths, and exclusions.
+- Mistral OCR with per-page Markdown, searchable image descriptions, cost estimates, retries, concurrency, and oversized-PDF chunking.
+- SQLite FTS5, trigram, and path search, plus page/context reading and JSON output for scripts and agents.
+- Homebrew installation on macOS and Linux.
+
+[Unreleased]: https://github.com/maxim/ringbinder/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/maxim/ringbinder/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/maxim/ringbinder/releases/tag/v0.1.0

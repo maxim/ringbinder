@@ -27,10 +27,15 @@ func TestSpinnerFrameAdvancesEachTick(t *testing.T) {
 	t.Parallel()
 
 	framesCh := make(chan rune, 32)
+	ready := make(chan struct{})
 	var spinner *Spinner
 	spinner = NewSpinner(10*time.Millisecond, func() {
+		// NewSpinner starts this callback's goroutine before returning. Wait
+		// until the test publishes the returned pointer before reading it.
+		<-ready
 		framesCh <- spinner.Frame()
 	})
+	close(ready)
 
 	target := len(spinnerFrames) + 2
 	frames := make([]rune, 0, target)

@@ -45,6 +45,45 @@ paths:
 	}
 }
 
+func TestLoad_PreservesOCRSettingPresence(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(cfgPath, []byte("model: '   '\nocr_concurrency: 0\n"), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Model == nil || *cfg.Model != "   " {
+		t.Fatalf("Model = %#v, want present whitespace value", cfg.Model)
+	}
+	if cfg.OCRConcurrency == nil || *cfg.OCRConcurrency != 0 {
+		t.Fatalf("OCRConcurrency = %#v, want present zero value", cfg.OCRConcurrency)
+	}
+
+	blankPath := filepath.Join(t.TempDir(), "blank.yml")
+	if err := os.WriteFile(blankPath, []byte("model:\nocr_concurrency:\n"), 0644); err != nil {
+		t.Fatalf("WriteFile(blank) error = %v", err)
+	}
+	blank, err := Load(blankPath)
+	if err != nil {
+		t.Fatalf("Load(blank) error = %v", err)
+	}
+	if blank.Model == nil || *blank.Model != "" || blank.OCRConcurrency == nil || *blank.OCRConcurrency != 0 {
+		t.Fatalf("blank OCR settings = (%#v, %#v), want present zero values", blank.Model, blank.OCRConcurrency)
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "missing.yml")
+	missing, err := Load(missingPath)
+	if err != nil {
+		t.Fatalf("Load(missing) error = %v", err)
+	}
+	if missing.Model != nil || missing.OCRConcurrency != nil {
+		t.Fatalf("missing OCR settings = (%#v, %#v), want nil", missing.Model, missing.OCRConcurrency)
+	}
+}
+
 func TestLoad_EmptyDatabasePathIsOmitted(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yml")
 	if err := os.WriteFile(cfgPath, []byte("database_path: '   '\n"), 0644); err != nil {

@@ -4,6 +4,15 @@ Notable changes to Ringbinder are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in Gemini OCR with structured searchable page and visual descriptions, provider-specific concurrency, retries, PDF chunking, and actual usage-based run cost reporting.
+- Provider selection through `--model mistral|gemini` or config, plus offline provider-specific cost estimates.
+
+### Fixed
+
+- `cost --redo` now counts checksum-deduplicated content once instead of counting duplicate document paths.
+
 ## [0.2.0] - 2026-08-13
 
 ### Changed

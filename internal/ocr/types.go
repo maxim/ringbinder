@@ -20,8 +20,13 @@ type mistralDocument struct {
 type mistralResponse struct {
 	// Pointers preserve null page objects and absent indexes so malformed
 	// responses cannot silently become valid page zero results.
-	Pages []*mistralPage `json:"pages"`
-	Model string         `json:"model"`
+	Pages     []*mistralPage `json:"pages"`
+	Model     string         `json:"model"`
+	UsageInfo *mistralUsage  `json:"usage_info"`
+}
+
+type mistralUsage struct {
+	PagesProcessed *int `json:"pages_processed"`
 }
 
 type mistralPage struct {

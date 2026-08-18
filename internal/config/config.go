@@ -10,8 +10,38 @@ import (
 )
 
 type Config struct {
-	Paths        []string `yaml:"paths"`
-	DatabasePath string   `yaml:"database_path"`
+	Paths          []string `yaml:"paths"`
+	DatabasePath   string   `yaml:"database_path"`
+	Model          *string  `yaml:"model"`
+	OCRConcurrency *int     `yaml:"ocr_concurrency"`
+}
+
+func (c *Config) UnmarshalYAML(node *yaml.Node) error {
+	type plainConfig Config
+	var decoded plainConfig
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = Config(decoded)
+
+	// yaml.v3 maps a present null scalar to a nil pointer just like an absent
+	// key. Preserve key presence so command validation rejects explicit blanks
+	// rather than silently selecting provider defaults.
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "model":
+			if c.Model == nil {
+				empty := ""
+				c.Model = &empty
+			}
+		case "ocr_concurrency":
+			if c.OCRConcurrency == nil {
+				zero := 0
+				c.OCRConcurrency = &zero
+			}
+		}
+	}
+	return nil
 }
 
 func DefaultDir() string {

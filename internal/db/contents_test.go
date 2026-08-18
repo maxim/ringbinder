@@ -101,6 +101,38 @@ func TestMarkContentOCRDone(t *testing.T) {
 	}
 }
 
+func TestLiveContents_DeduplicatesPathsAndIncludesCompletedContent(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	contentID, err := database.InsertContent("shared", 3)
+	if err != nil {
+		t.Fatalf("InsertContent() error = %v", err)
+	}
+	for _, path := range []string{"/docs/a.pdf", "/docs/b.pdf"} {
+		if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
+			t.Fatalf("InsertDocument(%q) error = %v", path, err)
+		}
+	}
+	if err := database.MarkContentOCRDone(contentID); err != nil {
+		t.Fatalf("MarkContentOCRDone() error = %v", err)
+	}
+
+	contents, err := database.LiveContents()
+	if err != nil {
+		t.Fatalf("LiveContents() error = %v", err)
+	}
+	if len(contents) != 1 || contents[0].ID != contentID || contents[0].PageCount != 3 {
+		t.Fatalf("LiveContents() = %+v, want one shared content", contents)
+	}
+}
+
 func TestCleanupOrphanContents(t *testing.T) {
 	t.Parallel()
 

@@ -10,6 +10,5 @@ type PageResult struct {
 }
 
 type Provider interface {
-	OCRFile(ctx context.Context, filePath string, fileType string) ([]PageResult, error)
-	PricePerPage() float64
+	OCRFile(ctx context.Context, filePath string, fileType string) ([]PageResult, BillingReport, error)
 }

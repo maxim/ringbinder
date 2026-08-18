@@ -340,7 +340,7 @@ func TestOCRFile_SendsOCR41AnnotatedDataURLRequests(t *testing.T) {
 			client := NewMistralClient("test-key")
 			client.endpoint = server.URL
 
-			if _, err := client.OCRFile(context.Background(), input, tt.fileType); err != nil {
+			if _, _, err := client.OCRFile(context.Background(), input, tt.fileType); err != nil {
 				t.Fatalf("OCRFile() error = %v", err)
 			}
 		})
@@ -384,7 +384,7 @@ func TestOCRFile_ParsesImageAnnotations(t *testing.T) {
 	client := NewMistralClient("test-key")
 	client.endpoint = server.URL
 
-	result, err := client.OCRFile(context.Background(), input, "pdf")
+	result, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err != nil {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -431,7 +431,7 @@ func TestOCRFile_ParsesStringImageAnnotation(t *testing.T) {
 	client := NewMistralClient("test-key")
 	client.endpoint = server.URL
 
-	result, err := client.OCRFile(context.Background(), input, "pdf")
+	result, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err != nil {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -484,7 +484,7 @@ func TestOCRFile_ParsesEscapedJSONStringImageAnnotation(t *testing.T) {
 	client := NewMistralClient("test-key")
 	client.endpoint = server.URL
 
-	result, err := client.OCRFile(context.Background(), input, "pdf")
+	result, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err != nil {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -522,7 +522,7 @@ func TestOCRFile_NoImages(t *testing.T) {
 	client := NewMistralClient("test-key")
 	client.endpoint = server.URL
 
-	result, err := client.OCRFile(context.Background(), input, "pdf")
+	result, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err != nil {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -693,7 +693,7 @@ func TestOCRFileRejectsLocallyOversizedSinglePDFPageBeforeHTTP(t *testing.T) {
 		return nil, pdfutil.ErrRangeTooLarge
 	}
 
-	results, err := client.OCRFile(context.Background(), input, "pdf")
+	results, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err == nil || !strings.Contains(err.Error(), "source page 1 exceeds") {
 		t.Fatalf("OCRFile() error = %v, want page-specific local size error", err)
 	}
@@ -727,7 +727,7 @@ func TestOCRFileStopsAfterLateChunkValidationFailure(t *testing.T) {
 		return []byte{byte(start), byte(end)}, nil
 	}
 
-	results, err := client.OCRFile(context.Background(), input, "pdf")
+	results, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err == nil {
 		t.Fatalf("OCRFile() error = nil")
 	}
@@ -758,7 +758,7 @@ func TestOCRFileTerminalSinglePage413(t *testing.T) {
 	client.endpoint = server.URL
 	client.pageCount = func(context.Context, io.ReadSeeker) (int, error) { return 1, nil }
 
-	results, err := client.OCRFile(context.Background(), input, "pdf")
+	results, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err == nil || !strings.Contains(err.Error(), "source page 1 was rejected as too large") || !strings.Contains(err.Error(), "API error 413") {
 		t.Fatalf("OCRFile() error = %v, want terminal page-specific 413", err)
 	}
@@ -795,7 +795,7 @@ func TestOCRFileChunksPDFSequentiallyAndOffsetsPages(t *testing.T) {
 		return []byte{byte(start), byte(end)}, nil
 	}
 
-	results, err := client.OCRFile(context.Background(), input, "pdf")
+	results, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err != nil {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -847,7 +847,7 @@ func TestOCRFileRecursivelyBisectsOnly413(t *testing.T) {
 		return []byte{byte(start), byte(end)}, nil
 	}
 
-	results, err := client.OCRFile(context.Background(), input, "pdf")
+	results, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err != nil {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -882,7 +882,7 @@ func TestOCRFileDoesNotSplitGeneric422(t *testing.T) {
 		return []byte{byte(start), byte(end)}, nil
 	}
 
-	_, err := client.OCRFile(context.Background(), input, "pdf")
+	_, _, err := client.OCRFile(context.Background(), input, "pdf")
 	if err == nil || !strings.Contains(err.Error(), "API error 422") {
 		t.Fatalf("OCRFile() error = %v, want API error 422", err)
 	}
@@ -907,7 +907,7 @@ func TestOCRFileRejectsOversizedImageBeforeHTTP(t *testing.T) {
 	}
 	client.requestByteLimit = framing + base64.StdEncoding.EncodedLen(1)
 
-	_, err = client.OCRFile(context.Background(), input, "png")
+	_, _, err = client.OCRFile(context.Background(), input, "png")
 	if err == nil || !strings.Contains(err.Error(), "oversized png image cannot be transformed") {
 		t.Fatalf("OCRFile() error = %v", err)
 	}
@@ -930,7 +930,7 @@ func TestOCRFileCallerDeadlineEndsBeforeClientTimeout(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := client.OCRFile(ctx, input, "png")
+	_, _, err := client.OCRFile(ctx, input, "png")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("OCRFile() error = %v, want deadline exceeded", err)
 	}

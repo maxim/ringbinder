@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -443,11 +444,149 @@ func TestProcessOCRReplacesAggregatedPagesOnceAndTrimsTail(t *testing.T) {
 	}
 }
 
+func TestProcessOCR_PrintsOneKnownCostLineForPartialFailure(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		contentID, err := database.InsertContent(fmt.Sprintf("billing-%d", i), 1)
+		if err != nil {
+			t.Fatalf("InsertContent() error = %v", err)
+		}
+		if _, err := database.InsertDocument(fmt.Sprintf("/docs/%d.pdf", i), contentID, now, now); err != nil {
+			t.Fatalf("InsertDocument() error = %v", err)
+		}
+	}
+
+	provider := &fakeOCRProvider{
+		pages: []ocr.PageResult{{PageIndex: 0, Markdown: "text"}},
+		reportByPath: map[string]ocr.BillingReport{
+			"/docs/0.pdf": {KnownCost: 700_000},
+			"/docs/1.pdf": {KnownCost: 680_000, Indeterminate: true},
+		},
+		errByPath: map[string]error{"/docs/1.pdf": errors.New("invalid output")},
+	}
+
+	output := captureStdout(t, func() {
+		if err := processOCR(context.Background(), database, provider, false, 2); err != nil {
+			t.Fatalf("processOCR() error = %v", err)
+		}
+	})
+	want := "Known OCR cost: $0.0014 (actual cost may be higher)"
+	if strings.Count(output, want) != 1 {
+		t.Fatalf("output = %q, want exactly one %q line", output, want)
+	}
+}
+
+func TestProcessOCR_PrintsCompleteCostLine(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	contentID, err := database.InsertContent("complete-billing", 1)
+	if err != nil {
+		t.Fatalf("InsertContent() error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/page.pdf", contentID, time.Now().UTC(), time.Now().UTC()); err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+	provider := &fakeOCRProvider{
+		pages:  []ocr.PageResult{{PageIndex: 0, Markdown: "text"}},
+		report: ocr.BillingReport{KnownCost: 1_380_000},
+	}
+
+	output := captureStdout(t, func() {
+		if err := processOCR(context.Background(), database, provider, false, 1); err != nil {
+			t.Fatalf("processOCR() error = %v", err)
+		}
+	})
+	if strings.Count(output, "OCR cost: $0.0014") != 1 || strings.Contains(output, "Known OCR cost") {
+		t.Fatalf("output = %q, want one complete cost line", output)
+	}
+}
+
+func TestProcessOCR_PrintsCostWhenDatabaseWriteFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+
+	contentID, err := database.InsertContent("write-failure-billing", 1)
+	if err != nil {
+		t.Fatalf("InsertContent() error = %v", err)
+	}
+	if _, err := database.InsertDocument("/docs/page.pdf", contentID, time.Now().UTC(), time.Now().UTC()); err != nil {
+		t.Fatalf("InsertDocument() error = %v", err)
+	}
+	started := make(chan struct{})
+	provider := &fakeOCRProvider{
+		delay:       50 * time.Millisecond,
+		firstCallCh: started,
+		pages:       []ocr.PageResult{{PageIndex: 0, Markdown: "text"}},
+		report:      ocr.BillingReport{KnownCost: 1_380_000},
+	}
+	closed := make(chan struct{})
+	go func() {
+		<-started
+		_ = database.Close()
+		close(closed)
+	}()
+
+	output := captureStdout(t, func() {
+		if err := processOCR(context.Background(), database, provider, false, 1); err != nil {
+			t.Fatalf("processOCR() error = %v", err)
+		}
+	})
+	<-closed
+	if strings.Count(output, "OCR cost: $0.0014") != 1 {
+		t.Fatalf("output = %q, want billed provider call after write failure", output)
+	}
+
+	reopened, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen database error = %v", err)
+	}
+	defer reopened.Close()
+	pending, err := reopened.PendingContents()
+	if err != nil {
+		t.Fatalf("PendingContents() error = %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending contents = %d, want failed write to remain pending", len(pending))
+	}
+}
+
+func TestProcessOCR_NoWorkOmitsCostLine(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	output := captureStdout(t, func() {
+		if err := processOCR(context.Background(), database, &fakeOCRProvider{}, false, 1); err != nil {
+			t.Fatalf("processOCR() error = %v", err)
+		}
+	})
+	if !strings.Contains(output, "No documents pending OCR.") || strings.Contains(output, "OCR cost:") {
+		t.Fatalf("output = %q, want no-work message without cost", output)
+	}
+}
+
 type fakeOCRProvider struct {
-	delay       time.Duration
-	pages       []ocr.PageResult
-	errByPath   map[string]error
-	firstCallCh chan struct{}
+	delay        time.Duration
+	pages        []ocr.PageResult
+	report       ocr.BillingReport
+	reportByPath map[string]ocr.BillingReport
+	errByPath    map[string]error
+	firstCallCh  chan struct{}
 
 	firstCallOnce sync.Once
 	calls         atomic.Int64
@@ -455,7 +594,7 @@ type fakeOCRProvider struct {
 	peak          atomic.Int32
 }
 
-func (p *fakeOCRProvider) OCRFile(ctx context.Context, filePath, fileType string) ([]ocr.PageResult, error) {
+func (p *fakeOCRProvider) OCRFile(ctx context.Context, filePath, fileType string) ([]ocr.PageResult, ocr.BillingReport, error) {
 	if p.firstCallCh != nil {
 		p.firstCallOnce.Do(func() {
 			close(p.firstCallCh)
@@ -478,20 +617,20 @@ func (p *fakeOCRProvider) OCRFile(ctx context.Context, filePath, fileType string
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, ocr.BillingReport{}, ctx.Err()
 		case <-timer.C:
 		}
 	}
 
+	report := p.report
+	if pathReport, ok := p.reportByPath[filePath]; ok {
+		report = pathReport
+	}
 	if err, ok := p.errByPath[filePath]; ok {
-		return nil, err
+		return nil, report, err
 	}
 
 	pages := make([]ocr.PageResult, len(p.pages))
 	copy(pages, p.pages)
-	return pages, nil
-}
-
-func (p *fakeOCRProvider) PricePerPage() float64 {
-	return 0
+	return pages, report, nil
 }

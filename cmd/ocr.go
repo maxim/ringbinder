@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/db"
@@ -17,25 +18,35 @@ import (
 
 func init() {
 	ocrCmd.Flags().Bool("redo", false, "Re-OCR all documents, not just pending ones")
-	ocrCmd.Flags().IntP("concurrency", "j", 4, "Number of concurrent OCR workers")
+	ocrCmd.Flags().String("model", "", "OCR provider: mistral or gemini")
+	ocrCmd.Flags().IntP("concurrency", "j", 0, "Number of concurrent OCR workers")
 	rootCmd.AddCommand(ocrCmd)
 }
 
 var ocrCmd = &cobra.Command{
 	Use:   "ocr",
 	Short: "Run OCR on documents",
-	Long:  "Processes all documents marked as OCR-pending through the Mistral OCR API and stores extracted text.\nUse --redo to re-process all documents regardless of pending status.",
+	Long:  "Processes all documents marked as OCR-pending through the selected OCR API and stores extracted text.\nUse --redo to re-process all documents regardless of pending status.",
 	RunE:  runOCR,
 }
 
 func runOCR(cmd *cobra.Command, args []string) error {
-	database, err := openDatabase(cmd)
+	cfg, err := loadCommandConfig(cmd, "model", "concurrency")
+	if err != nil {
+		return err
+	}
+	settings, err := resolveOCRSettings(cmd, cfg)
+	if err != nil {
+		return err
+	}
+	database, err := openDatabaseWithConfig(cmd, cfg)
 	if err != nil {
 		return err
 	}
 	defer database.Close()
 
-	client, err := ocr.NewMistralClientFromEnv()
+	runAt := time.Now().UTC()
+	provider, err := newOCRProvider(settings.model, runAt)
 	if err != nil {
 		return err
 	}
@@ -44,15 +55,18 @@ func runOCR(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read --redo flag: %w", err)
 	}
-	concurrency, err := cmd.Flags().GetInt("concurrency")
-	if err != nil {
-		return fmt.Errorf("read --concurrency flag: %w", err)
-	}
-	if concurrency < 1 {
-		return fmt.Errorf("--concurrency must be >= 1")
-	}
+	return processOCR(cmd.Context(), database, provider, redo, settings.concurrency)
+}
 
-	return processOCR(cmd.Context(), database, client, redo, concurrency)
+func newOCRProvider(model string, runAt time.Time) (ocr.Provider, error) {
+	switch model {
+	case modelMistral:
+		return ocr.NewMistralClientFromEnv()
+	case modelGemini:
+		return ocr.NewGeminiClientFromEnv(runAt)
+	default:
+		return nil, fmt.Errorf("invalid OCR model %q: allowed values are mistral, gemini", model)
+	}
 }
 
 func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, redo bool, concurrency int) error {
@@ -91,6 +105,9 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 	}
 
 	var writeMu sync.Mutex
+	var billingMu sync.Mutex
+	var billing ocr.BillingReport
+	attempted := 0
 	jobs := make([]ocrJob, 0, len(contents))
 	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
 	tracker := progress.New(os.Stdout, isTTY, len(contents), concurrency)
@@ -146,7 +163,11 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 			defer func() { slots <- slotID }()
 			tracker.WorkerStart(slotID, job.name)
 
-			pages, err := provider.OCRFile(ctx, job.path, job.fileTyp)
+			pages, report, err := provider.OCRFile(ctx, job.path, job.fileTyp)
+			billingMu.Lock()
+			billing.Add(report)
+			attempted++
+			billingMu.Unlock()
 			if err != nil {
 				if ctx.Err() != nil {
 					cancel(err)
@@ -176,6 +197,13 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, red
 	}
 	wg.Wait()
 	tracker.Finish()
+	if attempted > 0 {
+		if billing.Indeterminate {
+			fmt.Printf("Known OCR cost: %s (actual cost may be higher)\n", ocr.FormatCurrency(billing.KnownCost))
+		} else {
+			fmt.Printf("OCR cost: %s\n", ocr.FormatCurrency(billing.KnownCost))
+		}
+	}
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
@@ -199,26 +227,7 @@ func replacePagesWhileActive(ctx context.Context, writeMu *sync.Mutex, replace f
 }
 
 func allLiveContents(database *db.DB) ([]db.Content, error) {
-	docs, err := database.AllDocuments()
-	if err != nil {
-		return nil, err
-	}
-
-	seen := make(map[int64]bool)
-	contents := make([]db.Content, 0, len(docs))
-	for _, doc := range docs {
-		if seen[doc.ContentID] {
-			continue
-		}
-		seen[doc.ContentID] = true
-		contents = append(contents, db.Content{
-			ID:         doc.ContentID,
-			Checksum:   doc.Checksum,
-			PageCount:  doc.PageCount,
-			OCRPending: doc.OCRPending,
-		})
-	}
-	return contents, nil
+	return database.LiveContents()
 }
 
 func classifyPath(path string) string {

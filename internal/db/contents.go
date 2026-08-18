@@ -55,15 +55,26 @@ func (db *DB) MarkContentOCRDone(contentID int64) error {
 }
 
 func (db *DB) PendingContents() ([]Content, error) {
+	return db.liveContents(true)
+}
+
+func (db *DB) LiveContents() ([]Content, error) {
+	return db.liveContents(false)
+}
+
+func (db *DB) liveContents(pendingOnly bool) ([]Content, error) {
+	pendingClause := ""
+	if pendingOnly {
+		pendingClause = "AND c.ocr_pending = 1"
+	}
 	rows, err := db.Query(
 		`SELECT c.id, c.checksum, c.page_count, c.ocr_pending
 		 FROM contents c
-		 WHERE c.ocr_pending = 1
-		   AND EXISTS (
-		     SELECT 1
-		     FROM documents d
-		     WHERE d.content_id = c.id AND d.deleted = 0
-		   )
+		 WHERE EXISTS (
+		   SELECT 1
+		   FROM documents d
+		   WHERE d.content_id = c.id AND d.deleted = 0
+		 ) ` + pendingClause + `
 		 ORDER BY c.id`,
 	)
 	if err != nil {

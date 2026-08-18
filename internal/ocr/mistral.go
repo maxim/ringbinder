@@ -83,16 +83,16 @@ func MistralPricePerPage() float64 {
 	return mistralPricePerPage
 }
 
-func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType string) ([]PageResult, error) {
+func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType string) ([]PageResult, BillingReport, error) {
 	if _, err := dataURLPrefix(fileType); err != nil {
-		return nil, err
+		return nil, BillingReport{}, err
 	}
 	info, err := os.Stat(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("stat file: %w", err)
+		return nil, BillingReport{}, fmt.Errorf("stat file: %w", err)
 	}
 	if info.Size() < 0 || uint64(info.Size()) > uint64(^uint(0)>>1) {
-		return nil, fmt.Errorf("%s: file is too large to address in memory", filePath)
+		return nil, BillingReport{}, fmt.Errorf("%s: file is too large to address in memory", filePath)
 	}
 
 	if fileType == "pdf" {
@@ -101,47 +101,48 @@ func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType s
 	return c.ocrImage(ctx, filePath, fileType, info.Size())
 }
 
-func (c *MistralClient) ocrImage(ctx context.Context, filePath, fileType string, sourceSize int64) ([]PageResult, error) {
+func (c *MistralClient) ocrImage(ctx context.Context, filePath, fileType string, sourceSize int64) ([]PageResult, BillingReport, error) {
 	limit, err := c.effectiveDecodedLimit(fileType)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filePath, err)
+		return nil, BillingReport{}, fmt.Errorf("%s: %w", filePath, err)
 	}
 	if sourceSize > int64(limit) {
-		return nil, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
+		return nil, BillingReport{}, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
 	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("open file: %w", err)
+		return nil, BillingReport{}, fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
 
 	data, tooLarge, err := readLimited(ctx, f, limit)
 	if err != nil {
-		return nil, fmt.Errorf("%s: read file: %w", filePath, err)
+		return nil, BillingReport{}, fmt.Errorf("%s: read file: %w", filePath, err)
 	}
 	if tooLarge {
-		return nil, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
+		return nil, BillingReport{}, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
 	}
 	body, err := c.buildRequestBody(data, fileType)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filePath, err)
+		return nil, BillingReport{}, fmt.Errorf("%s: %w", filePath, err)
 	}
-	respBody, err := c.doWithRetryBody(ctx, body)
+	respBody, report, err := c.doWithRetryBodyBilling(ctx, body)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filePath, err)
+		return nil, report, fmt.Errorf("%s: %w", filePath, err)
 	}
 	results, err := decodeResults(respBody, 1)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filePath, err)
+		return nil, report, fmt.Errorf("%s: %w", filePath, err)
 	}
-	return results, nil
+	return results, report, nil
 }
 
-func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize int64) ([]PageResult, error) {
+func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize int64) ([]PageResult, BillingReport, error) {
+	var report BillingReport
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("open file: %w", err)
+		return nil, report, fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
 
@@ -151,10 +152,10 @@ func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize 
 	}
 	pageCount, err := counter(ctx, f)
 	if err != nil {
-		return nil, fmt.Errorf("%s: read PDF page count: %w", filePath, err)
+		return nil, report, fmt.Errorf("%s: read PDF page count: %w", filePath, err)
 	}
 	if pageCount < 1 {
-		return nil, fmt.Errorf("%s: PDF contains no pages", filePath)
+		return nil, report, fmt.Errorf("%s: PDF contains no pages", filePath)
 	}
 
 	// Mistral documents 1,000 pages as a source-document limit. Its `pages`
@@ -163,7 +164,7 @@ func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize 
 	// https://docs.mistral.ai/studio-api/document-processing/basic_ocr#faq
 	limit, err := c.effectiveDecodedLimit("pdf")
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filePath, err)
+		return nil, report, fmt.Errorf("%s: %w", filePath, err)
 	}
 	// Apply the serialized-body boundary to original PDFs even though this moves
 	// some provider-valid decoded files into extraction. Mistral does not specify
@@ -172,46 +173,47 @@ func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize 
 	if canSendOriginalPDF {
 		data, tooLarge, err := readLimited(ctx, f, limit)
 		if err != nil {
-			return nil, fmt.Errorf("%s: read file: %w", filePath, err)
+			return nil, report, fmt.Errorf("%s: read file: %w", filePath, err)
 		}
 		if !tooLarge {
 			body, err := c.buildRequestBody(data, "pdf")
 			if err != nil {
-				return nil, fmt.Errorf("%s: %w", filePath, err)
+				return nil, report, fmt.Errorf("%s: %w", filePath, err)
 			}
-			respBody, err := c.doWithRetryBody(ctx, body)
+			respBody, requestReport, err := c.doWithRetryBodyBilling(ctx, body)
+			report.Add(requestReport)
 			if err == nil {
 				results, err := decodeResults(respBody, pageCount)
 				if err != nil {
-					return nil, fmt.Errorf("%s: %w", filePath, err)
+					return nil, report, fmt.Errorf("%s: %w", filePath, err)
 				}
-				return results, nil
+				return results, report, nil
 			}
 
 			if !isPayloadTooLarge(err) {
-				return nil, fmt.Errorf("%s: %w", filePath, err)
+				return nil, report, fmt.Errorf("%s: %w", filePath, err)
 			}
 			if pageCount == 1 {
-				return nil, fmt.Errorf("%s: source page 1 was rejected as too large: %w", filePath, err)
+				return nil, report, fmt.Errorf("%s: source page 1 was rejected as too large: %w", filePath, err)
 			}
 
 			mid := pageCount / 2
 			var results []PageResult
-			if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, 0, mid, &results); err != nil {
-				return nil, err
+			if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, 0, mid, &results, &report); err != nil {
+				return nil, report, err
 			}
-			if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, mid, pageCount, &results); err != nil {
-				return nil, err
+			if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, mid, pageCount, &results, &report); err != nil {
+				return nil, report, err
 			}
-			return results, nil
+			return results, report, nil
 		}
 	}
 
 	var results []PageResult
-	if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, 0, pageCount, &results); err != nil {
-		return nil, err
+	if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, 0, pageCount, &results, &report); err != nil {
+		return nil, report, err
 	}
-	return results, nil
+	return results, report, nil
 }
 
 type pdfChunk struct {
@@ -228,6 +230,7 @@ func (c *MistralClient) ocrPDFInterval(
 	totalPages int,
 	start, end int,
 	results *[]PageResult,
+	report *BillingReport,
 ) error {
 	for pos := start; pos < end; {
 		if err := ctx.Err(); err != nil {
@@ -242,7 +245,8 @@ func (c *MistralClient) ocrPDFInterval(
 		if err != nil {
 			return fmt.Errorf("%s, %s: %w", filePath, formatPageRange(chunk.start, chunk.end), err)
 		}
-		respBody, err := c.doWithRetryBody(ctx, body)
+		respBody, requestReport, err := c.doWithRetryBodyBilling(ctx, body)
+		report.Add(requestReport)
 		if err != nil {
 			if !isPayloadTooLarge(err) {
 				return fmt.Errorf("%s, %s: %w", filePath, formatPageRange(chunk.start, chunk.end), err)
@@ -252,10 +256,10 @@ func (c *MistralClient) ocrPDFInterval(
 			}
 
 			mid := chunk.start + (chunk.end-chunk.start)/2
-			if err := c.ocrPDFInterval(ctx, source, filePath, sourceSize, totalPages, chunk.start, mid, results); err != nil {
+			if err := c.ocrPDFInterval(ctx, source, filePath, sourceSize, totalPages, chunk.start, mid, results, report); err != nil {
 				return err
 			}
-			if err := c.ocrPDFInterval(ctx, source, filePath, sourceSize, totalPages, mid, chunk.end, results); err != nil {
+			if err := c.ocrPDFInterval(ctx, source, filePath, sourceSize, totalPages, mid, chunk.end, results, report); err != nil {
 				return err
 			}
 			pos = chunk.end
@@ -631,6 +635,11 @@ func (c *MistralClient) doWithRetry(ctx context.Context, req mistralRequest) ([]
 }
 
 func (c *MistralClient) doWithRetryBody(ctx context.Context, body []byte) ([]byte, error) {
+	respBody, _, err := c.doWithRetryBodyBilling(ctx, body)
+	return respBody, err
+}
+
+func (c *MistralClient) doWithRetryBodyBilling(ctx context.Context, body []byte) ([]byte, BillingReport, error) {
 	endpoint := c.endpoint
 	if endpoint == "" {
 		endpoint = mistralEndpoint
@@ -648,31 +657,33 @@ func (c *MistralClient) doWithRetryBody(ctx context.Context, body []byte) ([]byt
 		httpClient = &http.Client{Timeout: requestTimeout}
 	}
 
+	var report BillingReport
 	backoff := 1.0 // seconds
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
 			if err := sleep(ctx, time.Duration(backoff*float64(time.Second))); err != nil {
-				return nil, err
+				return nil, report, err
 			}
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, report, err
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return nil, report, err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
+			report.Indeterminate = true
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, report, ctx.Err()
 			}
 			if attempt == maxAttempts {
-				return nil, fmt.Errorf("http request failed after %d attempts: %w", maxAttempts, err)
+				return nil, report, fmt.Errorf("http request failed after %d attempts: %w", maxAttempts, err)
 			}
 			backoff = math.Min(backoff*2, 60)
 			backoff = math.Min(backoff*(0.5+randFloat64()), 60)
@@ -682,16 +693,25 @@ func (c *MistralClient) doWithRetryBody(ctx context.Context, body []byte) ([]byt
 		respBody, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("read response: %w", err)
+			report.Indeterminate = true
+			return nil, report, fmt.Errorf("read response: %w", err)
 		}
 		if resp.StatusCode == http.StatusOK {
-			return respBody, nil
+			report.Add(mistralBilling(respBody))
+			return respBody, report, nil
 		}
 
+		usage := mistralBillingIfPresent(respBody)
+		if usage != nil {
+			report.Add(*usage)
+		}
 		retryable := resp.StatusCode == http.StatusTooManyRequests ||
 			(resp.StatusCode >= http.StatusInternalServerError && resp.StatusCode < 600)
+		if resp.StatusCode >= http.StatusInternalServerError && usage == nil {
+			report.Indeterminate = true
+		}
 		if !retryable || attempt == maxAttempts {
-			return nil, &apiError{StatusCode: resp.StatusCode, Body: respBody, Attempts: attempt}
+			return nil, report, &apiError{StatusCode: resp.StatusCode, Body: respBody, Attempts: attempt}
 		}
 
 		nextBackoff := math.Min(backoff*2, 60)
@@ -706,5 +726,26 @@ func (c *MistralClient) doWithRetryBody(ctx context.Context, body []byte) ([]byt
 		backoff = math.Min(nextBackoff*(0.5+randFloat64()), 60)
 	}
 
-	return nil, fmt.Errorf("max attempts exceeded")
+	return nil, report, fmt.Errorf("max attempts exceeded")
+}
+
+func mistralBilling(body []byte) BillingReport {
+	if report := mistralBillingIfPresent(body); report != nil {
+		return *report
+	}
+	return BillingReport{Indeterminate: true}
+}
+
+func mistralBillingIfPresent(body []byte) *BillingReport {
+	// Decode usage independently so malformed page output cannot hide an
+	// otherwise authoritative charge from the same response.
+	var envelope struct {
+		UsageInfo *mistralUsage `json:"usage_info"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope.UsageInfo == nil ||
+		envelope.UsageInfo.PagesProcessed == nil || *envelope.UsageInfo.PagesProcessed < 0 {
+		return nil
+	}
+	report := BillingReport{KnownCost: MistralCost(*envelope.UsageInfo.PagesProcessed)}
+	return &report
 }

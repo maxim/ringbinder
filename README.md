@@ -4,14 +4,14 @@ Ringbinder is a small CLI tool that keeps a single SQLite file of PDFs and image
 
 When using OCR, it just populates text in an associated db column, it doesn't inject the text back into the pdf files or anything like that.
 
-For OCR, it integrates with Mistral's API, because I tried it, and it does a good job of recognizing text and describing graphs and images for an acceptable (to me) price. So I can easily find all drawings of dragons that my kids made, for example.
+For OCR, it integrates with Mistral by default and offers Gemini as an opt-in provider. Both transcribe text and describe visual elements for search, so I can easily find all drawings of dragons that my kids made, for example.
 
 My use case is just scanning every piece of paper I come across (as well as immediately shredding most of them): physical mail, manuals, official documents, downloaded pdfs and images, my kids' schoolwork and drawings. I use an old ScanSnap S1500M that still works great for >15 years, and my iPhone's camera + a shortcut that scans into an iCloud-synced dir. Later I can find anything by having AI agents query the db for me. The other day I found who installed my house sump pump backup system (it was hand-written on a random page of an old disclosure doc).
 
 ## Features
 
 - Indexes PDF, PNG, JPEG, and JPG files
-- Runs OCR through the Mistral OCR API
+- Runs OCR through the Mistral or Gemini API
 - Stores OCR text locally as per-page Markdown
 - Searches with SQLite FTS5, including an optional trigram index for OCR-noisy matches
 - Falls back to path matches when the text index does not find anything
@@ -44,10 +44,12 @@ cd ringbinder
 go build -o ringbinder .
 ```
 
-You will also need a Mistral API key for OCR:
+OCR requires the key for the provider you select. Mistral is the default:
 
 ```sh
 export MISTRAL_API_KEY="..."
+# Or, when using --model gemini or model: gemini:
+export GEMINI_API_KEY="..."
 ```
 
 ## Quick start
@@ -69,7 +71,7 @@ Then run the usual loop:
 # Scan configured paths and add new/changed files to the local database.
 ringbinder sweep
 
-# Check the OCR cost for all pending docs before sending them to Mistral.
+# Check the OCR cost for all pending content before sending anything.
 ringbinder cost
 
 # OCR all pending documents.
@@ -156,7 +158,13 @@ paths:
   - ~/Documents
   - ~/Downloads/**/*.pdf
   - /Volumes/Archive/scans
+
+# Optional OCR settings:
+model: gemini
+ocr_concurrency: 20
 ```
+
+`model` accepts exactly `mistral` or `gemini` and defaults to `mistral`. `ocr_concurrency` applies only to OCR. Its provider default is 4 for Mistral and 20 for Gemini; `ocr --concurrency` overrides it.
 
 Optionally, set a custom SQLite database file path:
 
@@ -210,14 +218,17 @@ Useful flags:
 
 ### `cost`
 
-Estimates the Mistral OCR cost for pending documents.
+Estimates the selected provider's OCR cost for unique pending content. It is offline and does not require an API key or upload files.
 
 ```sh
 ringbinder cost
+ringbinder cost --model gemini
 ringbinder cost --redo
 ```
 
-The estimate uses the price baked into the current build. Ringbinder asks Mistral to describe detected images and graphics so those descriptions are searchable, so the estimate uses the annotated-page price of `$0.0050/page` (`$5 / 1000 pages`). Check Mistral's pricing before a large run.
+Mistral estimates are exact at the baked-in annotated-page price of `$0.0050/page` because Ringbinder requests image and graphic descriptions for search. Gemini estimates are visibly approximate: they assume about 560 medium-resolution input tokens per PDF page, 1,120 high-resolution input tokens per standalone image, 1,200 output-and-thinking tokens per page, and 250 input tokens of prompt/schema overhead per image request or planned 20-page PDF chunk. The baked-in standard paid Gemini rates are `$0.75/$3.75` per million input/output tokens through December 31, 2026 and `$1.50/$7.50` starting January 1, 2027 UTC. Actual generated length, byte-driven chunks, and retries can vary.
+
+`--redo` still counts each checksum-deduplicated content item once, even when several document paths share it.
 
 ### `ocr`
 
@@ -225,11 +236,14 @@ Runs OCR on pending content and stores extracted Markdown locally.
 
 ```sh
 ringbinder ocr
+ringbinder ocr --model gemini
 ringbinder ocr --redo
 ringbinder ocr --concurrency 2
 ```
 
-`ocr` requires `MISTRAL_API_KEY`. Large PDFs are chunked internally to fit API limits; Ringbinder does not split or modify your document files.
+`--model` overrides the configured provider. OCR requires only that provider's key (`MISTRAL_API_KEY` or `GEMINI_API_KEY`) and never falls back to the other provider. `--concurrency/-j` overrides `ocr_concurrency` and the provider default. Large PDFs are chunked internally to fit API limits; Ringbinder does not split or modify your document files.
+
+After attempting content, Ringbinder prints one actual cost total based on provider-reported usage. If usage is incomplete or a request outcome is ambiguous, it prints the known cost and warns that the actual cost may be higher. Existing OCR is unchanged when switching providers; use `ocr --redo` to replace it explicitly.
 
 ### `find`
 
@@ -294,7 +308,7 @@ The included `SKILL.md` is an example agent skill that explains how to use Ringb
 
 Ringbinder keeps its index and OCR text in a local SQLite database. By default it uses `~/.config/ringbinder/ringbinder.db`; set `database_path` or pass `--database` to use a different file.
 
-OCR is the one networked step: `ringbinder ocr` sends each pending document or image to the Mistral OCR API. If that is not acceptable for a folder, do not include that folder in your config.
+OCR is the one networked step: `ringbinder ocr` sends each pending document or image to the selected Mistral or Gemini API. `ringbinder cost` remains local and offline. If uploading a folder's documents to the selected provider is not acceptable, do not include that folder in your config.
 
 ## Development
 

@@ -28,7 +28,6 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 	}
 
 	cmd := &cobra.Command{}
-	cmd.Flags().Bool("redo", false, "")
 	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
@@ -158,7 +157,6 @@ func TestSweep_DoesNotClearExistingPendingOnTouch(t *testing.T) {
 	}
 
 	cmd := &cobra.Command{}
-	cmd.Flags().Bool("redo", false, "")
 	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
@@ -205,7 +203,6 @@ func TestSweep_DuplicateFileSharesContent(t *testing.T) {
 	}
 
 	cmd := &cobra.Command{}
-	cmd.Flags().Bool("redo", false, "")
 	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(cmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep() error = %v", err)
@@ -254,7 +251,6 @@ func TestSweep_ExcludeSkipsFile(t *testing.T) {
 	}
 
 	cmd := &cobra.Command{}
-	cmd.Flags().Bool("redo", false, "")
 	cmd.Flags().StringSlice("exclude", nil, "")
 	if err := cmd.Flags().Set("exclude", excludedPath); err != nil {
 		t.Fatalf("Set(exclude) error = %v", err)
@@ -300,7 +296,6 @@ func TestSweep_ExcludeSoftDeletesPreviouslySwept(t *testing.T) {
 	}
 
 	initialCmd := &cobra.Command{}
-	initialCmd.Flags().Bool("redo", false, "")
 	initialCmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(initialCmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
@@ -331,7 +326,6 @@ func TestSweep_ExcludeSoftDeletesPreviouslySwept(t *testing.T) {
 	})
 
 	excludeCmd := &cobra.Command{}
-	excludeCmd.Flags().Bool("redo", false, "")
 	excludeCmd.Flags().StringSlice("exclude", nil, "")
 	if err := excludeCmd.Flags().Set("exclude", docPath); err != nil {
 		t.Fatalf("Set(exclude) error = %v", err)
@@ -387,14 +381,12 @@ func TestSweep_GlobPathFiltersAndSoftDeletesWithinRoot(t *testing.T) {
 	}
 
 	initialCmd := &cobra.Command{}
-	initialCmd.Flags().Bool("redo", false, "")
 	initialCmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(initialCmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
 	}
 
 	globCmd := &cobra.Command{}
-	globCmd.Flags().Bool("redo", false, "")
 	globCmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(globCmd, []string{filepath.Join(scanDir, "**", "*.png")}); err != nil {
 		t.Fatalf("runSweep(glob) error = %v", err)
@@ -447,14 +439,12 @@ func TestSweep_GlobExcludeSkipsAndSoftDeletes(t *testing.T) {
 	}
 
 	initialCmd := &cobra.Command{}
-	initialCmd.Flags().Bool("redo", false, "")
 	initialCmd.Flags().StringSlice("exclude", nil, "")
 	if err := runSweep(initialCmd, []string{scanDir}); err != nil {
 		t.Fatalf("runSweep(initial) error = %v", err)
 	}
 
 	excludeCmd := &cobra.Command{}
-	excludeCmd.Flags().Bool("redo", false, "")
 	excludeCmd.Flags().StringSlice("exclude", nil, "")
 	if err := excludeCmd.Flags().Set("exclude", "*excluded*.png"); err != nil {
 		t.Fatalf("Set(exclude) error = %v", err)

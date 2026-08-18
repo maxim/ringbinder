@@ -119,7 +119,6 @@ func sweepCommandWithDatabaseFlag(t *testing.T, dbPath string) *cobra.Command {
 	t.Helper()
 
 	cmd := commandWithDatabaseFlag(t, dbPath)
-	cmd.Flags().Bool("redo", false, "")
 	cmd.Flags().StringSlice("exclude", nil, "")
 	return cmd
 }

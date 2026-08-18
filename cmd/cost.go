@@ -22,22 +22,24 @@ const (
 )
 
 func init() {
-	costCmd.Flags().Bool("redo", false, "Estimate cost for all documents, not just pending ones")
 	costCmd.Flags().String("model", "", "OCR provider: mistral or gemini")
+	costCmd.Flags().Int("limit", 0, "Maximum number of pending content items to estimate")
 	rootCmd.AddCommand(costCmd)
 }
 
 var costCmd = &cobra.Command{
 	Use:   "cost",
 	Short: "Estimate OCR cost for documents",
-	Long:  "Shows the number of pending content items and pages, and estimates the selected OCR API cost.\nUse --redo to estimate the cost of processing all content.",
+	Long:  "Shows the number of pending content items and pages, and estimates the selected OCR API cost.",
 	RunE:  runCost,
 }
 
 type costEstimate struct {
-	items int
-	pages int
-	cost  ocr.Currency
+	items      int
+	totalItems int
+	pages      int
+	cost       ocr.Currency
+	truncated  bool
 }
 
 func runCost(cmd *cobra.Command, args []string) error {
@@ -49,34 +51,31 @@ func runCost(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	limit, err := readOCRLimit(cmd)
+	if err != nil {
+		return err
+	}
 	database, err := openDatabaseWithConfig(cmd, cfg)
 	if err != nil {
 		return err
 	}
 	defer database.Close()
 
-	redo, err := cmd.Flags().GetBool("redo")
-	if err != nil {
-		return fmt.Errorf("read --redo flag: %w", err)
-	}
-	estimate, err := estimateOCRCost(database, model, redo, time.Now().UTC())
+	estimate, err := estimateOCRCost(database, model, limit, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	if estimate.items == 0 {
-		if redo {
-			fmt.Println("No documents found.")
-		} else {
-			fmt.Println("No documents pending OCR.")
-		}
+		fmt.Println("No documents pending OCR.")
 		return nil
 	}
 
-	label := "Pending OCR"
-	if redo {
-		label = "All content"
+	if estimate.truncated {
+		fmt.Printf("Pending OCR batch: %d of %d content item(s), %d pages\n",
+			estimate.items, estimate.totalItems, estimate.pages)
+	} else {
+		fmt.Printf("Pending OCR: %d content item(s), %d pages\n", estimate.items, estimate.pages)
 	}
-	fmt.Printf("%s: %d content item(s), %d pages\n", label, estimate.items, estimate.pages)
 	if model == modelGemini {
 		fmt.Printf("Estimated cost: ~%s (actual cost may vary)\n", formatApproxCurrency(estimate.cost))
 	} else {
@@ -85,21 +84,19 @@ func runCost(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func estimateOCRCost(database *db.DB, model string, redo bool, at time.Time) (costEstimate, error) {
-	var contents []db.Content
-	var err error
-	if redo {
-		contents, err = database.LiveContents()
-	} else {
-		contents, err = database.PendingContents()
-	}
+func estimateOCRCost(database *db.DB, model string, limit int, at time.Time) (costEstimate, error) {
+	batch, err := pendingContentBatch(database, limit)
 	if err != nil {
 		return costEstimate{}, fmt.Errorf("query contents: %w", err)
 	}
 
-	var estimate costEstimate
+	estimate := costEstimate{
+		items:      len(batch.contents),
+		totalItems: batch.total,
+		truncated:  batch.truncated,
+	}
 	var inputTokens, outputTokens int64
-	for _, content := range contents {
+	for _, content := range batch.contents {
 		path, err := database.GetDocumentPathForContent(content.ID)
 		if err != nil {
 			return costEstimate{}, fmt.Errorf("query document path for content %d: %w", content.ID, err)
@@ -109,7 +106,6 @@ func estimateOCRCost(database *db.DB, model string, redo bool, at time.Time) (co
 			continue
 		}
 
-		estimate.items++
 		estimate.pages += content.PageCount
 		if model != modelGemini {
 			continue

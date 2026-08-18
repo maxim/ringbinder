@@ -42,7 +42,7 @@ func TestProcessOCR_SkipsAlreadyOCRdContent(t *testing.T) {
 		},
 	}
 
-	if err := processOCR(context.Background(), database, provider, false, 4); err != nil {
+	if err := processOCR(context.Background(), database, provider, 0, 4); err != nil {
 		t.Fatalf("processOCR() error = %v", err)
 	}
 
@@ -97,7 +97,7 @@ func TestProcessOCR_ConcurrentExecution(t *testing.T) {
 		},
 	}
 
-	if err := processOCR(context.Background(), database, provider, false, 4); err != nil {
+	if err := processOCR(context.Background(), database, provider, 0, 4); err != nil {
 		t.Fatalf("processOCR() error = %v", err)
 	}
 
@@ -155,7 +155,7 @@ func TestProcessOCR_ErrorDoesNotBlockOthers(t *testing.T) {
 		},
 	}
 
-	if err := processOCR(context.Background(), database, provider, false, 4); err != nil {
+	if err := processOCR(context.Background(), database, provider, 0, 4); err != nil {
 		t.Fatalf("processOCR() error = %v", err)
 	}
 
@@ -177,6 +177,50 @@ func TestProcessOCR_ErrorDoesNotBlockOthers(t *testing.T) {
 	}
 	if pageCount != 4 {
 		t.Fatalf("stored page count = %d, want 4", pageCount)
+	}
+}
+
+func TestProcessOCR_LimitCapsAttemptsAndLeavesFailuresPending(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	now := time.Now().UTC()
+	contentIDs := make([]int64, 3)
+	for i := range contentIDs {
+		contentIDs[i], err = database.InsertContent(fmt.Sprintf("limited-%d", i), i+1)
+		if err != nil {
+			t.Fatalf("InsertContent(%d) error = %v", i, err)
+		}
+		if _, err := database.InsertDocument(fmt.Sprintf("/docs/%d.pdf", i), contentIDs[i], now, now); err != nil {
+			t.Fatalf("InsertDocument(%d) error = %v", i, err)
+		}
+	}
+
+	provider := &fakeOCRProvider{
+		pages:     []ocr.PageResult{{PageIndex: 0, Markdown: "text"}},
+		errByPath: map[string]error{"/docs/0.pdf": errors.New("boom")},
+	}
+	output := captureStdout(t, func() {
+		if err := processOCR(context.Background(), database, provider, 2, 1); err != nil {
+			t.Fatalf("processOCR() error = %v", err)
+		}
+	})
+	if !strings.Contains(output, "Processing 2 of 3 pending content item(s).\n") {
+		t.Fatalf("output = %q, want truncated batch message", output)
+	}
+	if provider.calls.Load() != 2 {
+		t.Fatalf("provider calls = %d, want 2 selected attempts", provider.calls.Load())
+	}
+
+	pending, err := database.PendingContents()
+	if err != nil {
+		t.Fatalf("PendingContents() error = %v", err)
+	}
+	if len(pending) != 2 || pending[0].ID != contentIDs[0] || pending[1].ID != contentIDs[2] {
+		t.Fatalf("pending contents = %+v, want failed first and unselected third", pending)
 	}
 }
 
@@ -209,7 +253,7 @@ func TestProcessOCR_TimeoutDoesNotCancelOthers(t *testing.T) {
 		},
 	}
 
-	if err := processOCR(context.Background(), database, provider, false, 4); err != nil {
+	if err := processOCR(context.Background(), database, provider, 0, 4); err != nil {
 		t.Fatalf("processOCR() error = %v, want nil", err)
 	}
 
@@ -269,7 +313,7 @@ func TestProcessOCR_ContextCancellation(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err = processOCR(ctx, database, provider, false, 4)
+	err = processOCR(ctx, database, provider, 0, 4)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.Canceled) {
@@ -331,61 +375,6 @@ func TestReplacePagesWhileActiveChecksCancellationAfterWaiting(t *testing.T) {
 	}
 }
 
-func TestProcessOCRFailedRedoPreservesCompletedPages(t *testing.T) {
-	t.Parallel()
-
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("db.Open() error = %v", err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-
-	contentID, err := database.InsertContent("redo-checksum", 2)
-	if err != nil {
-		t.Fatalf("InsertContent() error = %v", err)
-	}
-	path := "/docs/redo.pdf"
-	now := time.Now().UTC()
-	if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
-		t.Fatalf("InsertDocument() error = %v", err)
-	}
-	if err := database.ReplaceContentPages(contentID, []db.PageInput{
-		{PageIndex: 0, Markdown: "old zero"},
-		{PageIndex: 1, Markdown: "old one"},
-	}); err != nil {
-		t.Fatalf("ReplaceContentPages() error = %v", err)
-	}
-
-	provider := &fakeOCRProvider{errByPath: map[string]error{path: errors.New("later chunk failed")}}
-	if err := processOCR(context.Background(), database, provider, true, 1); err != nil {
-		t.Fatalf("processOCR() error = %v", err)
-	}
-
-	content, err := database.GetContentByChecksum("redo-checksum")
-	if err != nil {
-		t.Fatalf("GetContentByChecksum() error = %v", err)
-	}
-	if content == nil || content.OCRPending {
-		t.Fatalf("content = %+v, want completed", content)
-	}
-	var count int
-	var combined string
-	if err := database.QueryRow("SELECT COUNT(*), GROUP_CONCAT(markdown, '|') FROM pages WHERE content_id = ? ORDER BY page_index", contentID).Scan(&count, &combined); err != nil {
-		t.Fatalf("query pages: %v", err)
-	}
-	if count != 2 || combined != "old zero|old one" {
-		t.Fatalf("stored pages = %d %q, want preserved old pages", count, combined)
-	}
-
-	calls := provider.calls.Load()
-	if err := processOCR(context.Background(), database, provider, false, 1); err != nil {
-		t.Fatalf("normal processOCR() error = %v", err)
-	}
-	if provider.calls.Load() != calls {
-		t.Fatalf("normal retry called provider for completed failed redo")
-	}
-}
-
 func TestProcessOCRReplacesAggregatedPagesOnceAndTrimsTail(t *testing.T) {
 	t.Parallel()
 
@@ -412,13 +401,16 @@ func TestProcessOCRReplacesAggregatedPagesOnceAndTrimsTail(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed pages: %v", err)
 	}
+	if _, err := database.Exec("UPDATE contents SET ocr_pending = 1 WHERE id = ?", contentID); err != nil {
+		t.Fatalf("mark content pending: %v", err)
+	}
 
 	provider := &fakeOCRProvider{pages: []ocr.PageResult{
 		{PageIndex: 0, Markdown: "new 0"},
 		{PageIndex: 1, Markdown: "new 1"},
 		{PageIndex: 2, Markdown: "new 2"},
 	}}
-	if err := processOCR(context.Background(), database, provider, true, 1); err != nil {
+	if err := processOCR(context.Background(), database, provider, 0, 1); err != nil {
 		t.Fatalf("processOCR() error = %v", err)
 	}
 
@@ -472,7 +464,7 @@ func TestProcessOCR_PrintsOneKnownCostLineForPartialFailure(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, provider, false, 2); err != nil {
+		if err := processOCR(context.Background(), database, provider, 0, 2); err != nil {
 			t.Fatalf("processOCR() error = %v", err)
 		}
 	})
@@ -502,7 +494,7 @@ func TestProcessOCR_PrintsCompleteCostLine(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, provider, false, 1); err != nil {
+		if err := processOCR(context.Background(), database, provider, 0, 1); err != nil {
 			t.Fatalf("processOCR() error = %v", err)
 		}
 	})
@@ -540,7 +532,7 @@ func TestProcessOCR_PrintsCostWhenDatabaseWriteFails(t *testing.T) {
 	}()
 
 	output := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, provider, false, 1); err != nil {
+		if err := processOCR(context.Background(), database, provider, 0, 1); err != nil {
 			t.Fatalf("processOCR() error = %v", err)
 		}
 	})
@@ -571,12 +563,38 @@ func TestProcessOCR_NoWorkOmitsCostLine(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 
 	output := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, &fakeOCRProvider{}, false, 1); err != nil {
+		if err := processOCR(context.Background(), database, &fakeOCRProvider{}, 0, 1); err != nil {
 			t.Fatalf("processOCR() error = %v", err)
 		}
 	})
 	if !strings.Contains(output, "No documents pending OCR.") || strings.Contains(output, "OCR cost:") {
 		t.Fatalf("output = %q, want no-work message without cost", output)
+	}
+}
+
+func TestRunOCR_RejectsNonPositiveExplicitLimit(t *testing.T) {
+	for _, limit := range []string{"0", "-1"} {
+		t.Run(limit, func(t *testing.T) {
+			resetCommandState(t)
+			cmd := commandWithDatabaseFlag(t, filepath.Join(t.TempDir(), "ocr.db"))
+			cmd.Flags().String("model", "", "")
+			cmd.Flags().Int("concurrency", 0, "")
+			cmd.Flags().Int("limit", 0, "")
+			if err := cmd.Flags().Set("model", modelMistral); err != nil {
+				t.Fatalf("Set(model) error = %v", err)
+			}
+			if err := cmd.Flags().Set("concurrency", "1"); err != nil {
+				t.Fatalf("Set(concurrency) error = %v", err)
+			}
+			if err := cmd.Flags().Set("limit", limit); err != nil {
+				t.Fatalf("Set(limit) error = %v", err)
+			}
+
+			err := runOCR(cmd, nil)
+			if err == nil || err.Error() != "--limit must be >= 1" {
+				t.Fatalf("runOCR() error = %v, want --limit validation error", err)
+			}
+		})
 	}
 }
 

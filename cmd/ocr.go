@@ -17,16 +17,16 @@ import (
 )
 
 func init() {
-	ocrCmd.Flags().Bool("redo", false, "Re-OCR all documents, not just pending ones")
 	ocrCmd.Flags().String("model", "", "OCR provider: mistral or gemini")
 	ocrCmd.Flags().IntP("concurrency", "j", 0, "Number of concurrent OCR workers")
+	ocrCmd.Flags().Int("limit", 0, "Maximum number of pending content items to process")
 	rootCmd.AddCommand(ocrCmd)
 }
 
 var ocrCmd = &cobra.Command{
 	Use:   "ocr",
 	Short: "Run OCR on documents",
-	Long:  "Processes all documents marked as OCR-pending through the selected OCR API and stores extracted text.\nUse --redo to re-process all documents regardless of pending status.",
+	Long:  "Processes all documents marked as OCR-pending through the selected OCR API and stores extracted text.",
 	RunE:  runOCR,
 }
 
@@ -36,6 +36,10 @@ func runOCR(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	settings, err := resolveOCRSettings(cmd, cfg)
+	if err != nil {
+		return err
+	}
+	limit, err := readOCRLimit(cmd)
 	if err != nil {
 		return err
 	}
@@ -51,11 +55,7 @@ func runOCR(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	redo, err := cmd.Flags().GetBool("redo")
-	if err != nil {
-		return fmt.Errorf("read --redo flag: %w", err)
-	}
-	return processOCR(cmd.Context(), database, provider, redo, settings.concurrency)
+	return processOCR(cmd.Context(), database, provider, limit, settings.concurrency)
 }
 
 func newOCRProvider(model string, runAt time.Time) (ocr.Provider, error) {
@@ -69,29 +69,22 @@ func newOCRProvider(model string, runAt time.Time) (ocr.Provider, error) {
 	}
 }
 
-func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, redo bool, concurrency int) error {
+func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, limit, concurrency int) error {
 	if concurrency < 1 {
 		return fmt.Errorf("concurrency must be >= 1")
 	}
 
-	var contents []db.Content
-	var err error
-	if redo {
-		contents, err = allLiveContents(database)
-	} else {
-		contents, err = database.PendingContents()
-	}
+	batch, err := pendingContentBatch(database, limit)
 	if err != nil {
 		return fmt.Errorf("query contents: %w", err)
 	}
-
+	contents := batch.contents
 	if len(contents) == 0 {
-		if redo {
-			fmt.Println("No documents found.")
-		} else {
-			fmt.Println("No documents pending OCR.")
-		}
+		fmt.Println("No documents pending OCR.")
 		return nil
+	}
+	if batch.truncated {
+		fmt.Printf("Processing %d of %d pending content item(s).\n", len(contents), batch.total)
 	}
 
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -224,10 +217,6 @@ func replacePagesWhileActive(ctx context.Context, writeMu *sync.Mutex, replace f
 		return err
 	}
 	return replace()
-}
-
-func allLiveContents(database *db.DB) ([]db.Content, error) {
-	return database.LiveContents()
 }
 
 func classifyPath(path string) string {

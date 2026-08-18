@@ -1,10 +1,8 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +23,6 @@ import (
 
 func init() {
 	rootCmd.AddCommand(sweepCmd)
-	sweepCmd.Flags().Bool("redo", false, "Delete all data and re-sweep from scratch")
 	sweepCmd.Flags().IntP("concurrency", "j", 4, "Number of concurrent file processing workers")
 	sweepCmd.Flags().StringSlice("exclude", nil, "File path or glob patterns to exclude from sweep")
 }
@@ -115,10 +112,6 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	redo, err := cmd.Flags().GetBool("redo")
-	if err != nil {
-		return fmt.Errorf("read redo flag: %w", err)
-	}
 	concurrency := 4
 	if cmd.Flags().Lookup("concurrency") != nil {
 		concurrency, err = cmd.Flags().GetInt("concurrency")
@@ -129,31 +122,6 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	if concurrency < 1 {
 		return fmt.Errorf("--concurrency must be >= 1")
 	}
-	if redo {
-		var documentCount int
-		if err := database.QueryRow("SELECT COUNT(*) FROM documents").Scan(&documentCount); err != nil {
-			return fmt.Errorf("count documents: %w", err)
-		}
-
-		fmt.Printf("This will delete all %d documents and their OCR data. Continue? [y/N] ", documentCount)
-		reader := bufio.NewReader(cmd.InOrStdin())
-		response, err := reader.ReadString('\n')
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("read confirmation: %w", err)
-		}
-		response = strings.TrimSpace(response)
-		if response != "y" && response != "Y" {
-			fmt.Println("Aborted.")
-			return nil
-		}
-
-		deletedCount, err := database.ResetAllDocuments()
-		if err != nil {
-			return fmt.Errorf("reset documents: %w", err)
-		}
-		fmt.Printf("Deleted %d documents.\n", deletedCount)
-	}
-
 	baseCtx := cmd.Context()
 	if baseCtx == nil {
 		baseCtx = context.Background()

@@ -214,7 +214,6 @@ Useful flags:
 
 - `--exclude <pattern>` skips matching files
 - `-j, --concurrency <n>` controls scan workers
-- `--redo` deletes existing document/OCR data after confirmation and starts over
 
 ### `cost`
 
@@ -223,12 +222,12 @@ Estimates the selected provider's OCR cost for unique pending content. It is off
 ```sh
 ringbinder cost
 ringbinder cost --model gemini
-ringbinder cost --redo
+ringbinder cost --limit 100
 ```
 
-Mistral estimates are exact at the baked-in annotated-page price of `$0.0050/page` because Ringbinder requests image and graphic descriptions for search. Gemini estimates are visibly approximate: they assume about 560 medium-resolution input tokens per PDF page, 1,120 high-resolution input tokens per standalone image, 1,200 output-and-thinking tokens per page, and 250 input tokens of prompt/schema overhead per image request or planned 20-page PDF chunk. The baked-in standard paid Gemini rates are `$0.75/$3.75` per million input/output tokens through December 31, 2026 and `$1.50/$7.50` starting January 1, 2027 UTC. Actual generated length, byte-driven chunks, and retries can vary.
+`--limit <n>` estimates only the next `n` unique pending content items in stable order. When it truncates the backlog, the output shows the selected batch size and total pending count; page and price totals cover only that batch. The limit is CLI-only and must be at least 1 when supplied.
 
-`--redo` still counts each checksum-deduplicated content item once, even when several document paths share it.
+Mistral estimates are exact at the baked-in annotated-page price of `$0.0050/page` because Ringbinder requests image and graphic descriptions for search. Gemini estimates are visibly approximate: they assume about 560 medium-resolution input tokens per PDF page, 1,120 high-resolution input tokens per standalone image, 1,200 output-and-thinking tokens per page, and 250 input tokens of prompt/schema overhead per image request or planned 20-page PDF chunk. The baked-in standard paid Gemini rates are `$0.75/$3.75` per million input/output tokens through December 31, 2026 and `$1.50/$7.50` starting January 1, 2027 UTC. Actual generated length, byte-driven chunks, and retries can vary.
 
 ### `ocr`
 
@@ -237,13 +236,13 @@ Runs OCR on pending content and stores extracted Markdown locally.
 ```sh
 ringbinder ocr
 ringbinder ocr --model gemini
-ringbinder ocr --redo
+ringbinder ocr --limit 100
 ringbinder ocr --concurrency 2
 ```
 
-`--model` overrides the configured provider. OCR requires only that provider's key (`MISTRAL_API_KEY` or `GEMINI_API_KEY`) and never falls back to the other provider. `--concurrency/-j` overrides `ocr_concurrency` and the provider default. Large PDFs are chunked internally to fit API limits; Ringbinder does not split or modify your document files.
+`--model` overrides the configured provider. OCR requires only that provider's key (`MISTRAL_API_KEY` or `GEMINI_API_KEY`) and never falls back to the other provider. `--concurrency/-j` overrides `ocr_concurrency` and the provider default. `--limit <n>` attempts only the next `n` unique pending content items in stable order; failed items remain pending, and the limit caps attempts rather than successful results. The limit is CLI-only and must be at least 1 when supplied. Large PDFs are chunked internally to fit API limits; Ringbinder does not split or modify your document files.
 
-After attempting content, Ringbinder prints one actual cost total based on provider-reported usage. If usage is incomplete or a request outcome is ambiguous, it prints the known cost and warns that the actual cost may be higher. Existing OCR is unchanged when switching providers; use `ocr --redo` to replace it explicitly.
+After attempting content, Ringbinder prints one actual cost total based on provider-reported usage. If usage is incomplete or a request outcome is ambiguous, it prints the known cost and warns that the actual cost may be higher.
 
 ### `find`
 
@@ -289,6 +288,29 @@ ringbinder doc list --json
 ringbinder doc get --path "/path/to/file.pdf"
 ringbinder doc get --path "/path/to/file.pdf" --json
 ```
+
+## Rebuilding OCR with another model
+
+Build a second database instead of replacing OCR in the active database. The existing database remains searchable throughout the rebuild.
+
+```sh
+new_db="$HOME/.config/ringbinder/ringbinder-new.db"
+
+# Index the configured paths into a separate database.
+ringbinder --database "$new_db" sweep
+
+# Review and run one bounded batch with the target provider.
+ringbinder --database "$new_db" cost --model gemini --limit 100
+ringbinder --database "$new_db" ocr --model gemini --limit 100
+
+# If the sample looks good, estimate and process the remaining backlog.
+ringbinder --database "$new_db" cost --model gemini
+ringbinder --database "$new_db" ocr --model gemini
+```
+
+Check the first batch's OCR results before continuing. If they look good, the unbounded `cost` and `ocr` commands estimate and process everything still pending. Then run one final `sweep` against the new database and use the same unbounded commands to drain any newly pending items.
+
+After verifying searches against `--database "$new_db"`, update `database_path` in the config to point to the new file.
 
 ## Automation
 

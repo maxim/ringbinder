@@ -45,9 +45,9 @@ paths:
 	}
 }
 
-func TestLoad_PreservesOCRSettingPresence(t *testing.T) {
+func TestLoad_PreservesSettingPresence(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yml")
-	if err := os.WriteFile(cfgPath, []byte("model: '   '\nocr_concurrency: 0\n"), 0644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("model: '   '\nsweep_concurrency: 0\nocr_concurrency: 0\n"), 0644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
@@ -58,20 +58,29 @@ func TestLoad_PreservesOCRSettingPresence(t *testing.T) {
 	if cfg.Model == nil || *cfg.Model != "   " {
 		t.Fatalf("Model = %#v, want present whitespace value", cfg.Model)
 	}
+	if cfg.SweepConcurrency == nil || *cfg.SweepConcurrency != 0 {
+		t.Fatalf("SweepConcurrency = %#v, want present zero value", cfg.SweepConcurrency)
+	}
 	if cfg.OCRConcurrency == nil || *cfg.OCRConcurrency != 0 {
 		t.Fatalf("OCRConcurrency = %#v, want present zero value", cfg.OCRConcurrency)
 	}
 
 	blankPath := filepath.Join(t.TempDir(), "blank.yml")
-	if err := os.WriteFile(blankPath, []byte("model:\nocr_concurrency:\n"), 0644); err != nil {
+	if err := os.WriteFile(blankPath, []byte("model:\nsweep_concurrency:\nocr_concurrency:\n"), 0644); err != nil {
 		t.Fatalf("WriteFile(blank) error = %v", err)
 	}
 	blank, err := Load(blankPath)
 	if err != nil {
 		t.Fatalf("Load(blank) error = %v", err)
 	}
-	if blank.Model == nil || *blank.Model != "" || blank.OCRConcurrency == nil || *blank.OCRConcurrency != 0 {
-		t.Fatalf("blank OCR settings = (%#v, %#v), want present zero values", blank.Model, blank.OCRConcurrency)
+	if blank.Model == nil || *blank.Model != "" {
+		t.Fatalf("blank Model = %#v, want present empty value", blank.Model)
+	}
+	if blank.SweepConcurrency == nil || *blank.SweepConcurrency != 0 {
+		t.Fatalf("blank SweepConcurrency = %#v, want present zero value", blank.SweepConcurrency)
+	}
+	if blank.OCRConcurrency == nil || *blank.OCRConcurrency != 0 {
+		t.Fatalf("blank OCRConcurrency = %#v, want present zero value", blank.OCRConcurrency)
 	}
 
 	missingPath := filepath.Join(t.TempDir(), "missing.yml")
@@ -79,8 +88,13 @@ func TestLoad_PreservesOCRSettingPresence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(missing) error = %v", err)
 	}
-	if missing.Model != nil || missing.OCRConcurrency != nil {
-		t.Fatalf("missing OCR settings = (%#v, %#v), want nil", missing.Model, missing.OCRConcurrency)
+	if missing.Model != nil || missing.SweepConcurrency != nil || missing.OCRConcurrency != nil {
+		t.Fatalf(
+			"missing settings = (%#v, %#v, %#v), want nil",
+			missing.Model,
+			missing.SweepConcurrency,
+			missing.OCRConcurrency,
+		)
 	}
 }
 

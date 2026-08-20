@@ -10,10 +10,11 @@ import (
 )
 
 type Config struct {
-	Paths          []string `yaml:"paths"`
-	DatabasePath   string   `yaml:"database_path"`
-	Model          *string  `yaml:"model"`
-	OCRConcurrency *int     `yaml:"ocr_concurrency"`
+	Paths            []string `yaml:"paths"`
+	DatabasePath     string   `yaml:"database_path"`
+	Model            *string  `yaml:"model"`
+	SweepConcurrency *int     `yaml:"sweep_concurrency"`
+	OCRConcurrency   *int     `yaml:"ocr_concurrency"`
 }
 
 func (c *Config) UnmarshalYAML(node *yaml.Node) error {
@@ -33,6 +34,11 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 			if c.Model == nil {
 				empty := ""
 				c.Model = &empty
+			}
+		case "sweep_concurrency":
+			if c.SweepConcurrency == nil {
+				zero := 0
+				c.SweepConcurrency = &zero
 			}
 		case "ocr_concurrency":
 			if c.OCRConcurrency == nil {

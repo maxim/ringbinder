@@ -186,12 +186,15 @@ paths:
   - ~/Downloads/**/*.pdf
   - /Volumes/Archive/scans
 
-# Optional OCR settings:
-model: gemini
+# Optional worker settings:
+sweep_concurrency: 4
 ocr_concurrency: 20
+
+# Optional OCR provider:
+model: gemini
 ```
 
-`model` accepts exactly `mistral` or `gemini` and defaults to `mistral`. `ocr_concurrency` applies only to OCR. Its provider default is 4 for Mistral and 20 for Gemini; `ocr --concurrency` overrides it.
+`sweep_concurrency` controls file-processing workers and defaults to 4; `sweep --concurrency` overrides it. Both require an integer of at least 1. `ocr_concurrency` controls simultaneous OCR requests. Its provider default is 4 for Mistral and 20 for Gemini; `ocr --concurrency` overrides it. `model` accepts exactly `mistral` or `gemini` and defaults to `mistral`.
 
 Optionally, set a custom SQLite database file path:
 
@@ -240,7 +243,7 @@ ringbinder sweep [paths...]
 Useful flags:
 
 - `--exclude <pattern>` skips matching files
-- `-j, --concurrency <n>` controls scan workers
+- `-j, --concurrency <n>` overrides `sweep_concurrency` for scan workers
 
 ### `cost`
 

@@ -21,9 +21,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const defaultSweepConcurrency = 4
+
 func init() {
 	rootCmd.AddCommand(sweepCmd)
-	sweepCmd.Flags().IntP("concurrency", "j", 4, "Number of concurrent file processing workers")
+	sweepCmd.Flags().IntP("concurrency", "j", defaultSweepConcurrency, "Number of concurrent file processing workers")
 	sweepCmd.Flags().StringSlice("exclude", nil, "File path or glob patterns to exclude from sweep")
 }
 
@@ -43,12 +45,16 @@ type sweepResult struct {
 
 func runSweep(cmd *cobra.Command, args []string) error {
 	var cfg *config.Config
-	if len(args) == 0 || !databaseFlagProvided(cmd) {
-		var err error
+	var err error
+	if len(args) == 0 {
 		cfg, err = loadConfig()
-		if err != nil {
-			return err
-		}
+	} else {
+		// Even with explicit paths and database, load config unless concurrency is
+		// explicit so sweep_concurrency can override the command's default.
+		cfg, err = loadCommandConfig(cmd, "concurrency")
+	}
+	if err != nil {
+		return err
 	}
 
 	paths := args
@@ -106,22 +112,16 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	concurrency, err := resolveSweepConcurrency(cmd, cfg)
+	if err != nil {
+		return err
+	}
+
 	database, err := openDatabaseWithConfig(cmd, cfg)
 	if err != nil {
 		return err
 	}
 	defer database.Close()
-
-	concurrency := 4
-	if cmd.Flags().Lookup("concurrency") != nil {
-		concurrency, err = cmd.Flags().GetInt("concurrency")
-		if err != nil {
-			return fmt.Errorf("read concurrency flag: %w", err)
-		}
-	}
-	if concurrency < 1 {
-		return fmt.Errorf("--concurrency must be >= 1")
-	}
 	baseCtx := cmd.Context()
 	if baseCtx == nil {
 		baseCtx = context.Background()
@@ -346,6 +346,29 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		scanned.Load(), newCount, updatedCount, restoredCount, deletedCount, unchangedCount)
 
 	return nil
+}
+
+func resolveSweepConcurrency(cmd *cobra.Command, cfg *config.Config) (int, error) {
+	if flag := cmd.Flag("concurrency"); flag != nil && flag.Changed {
+		concurrency, err := cmd.Flags().GetInt("concurrency")
+		if err != nil {
+			return 0, fmt.Errorf("read --concurrency flag: %w", err)
+		}
+		if concurrency < 1 {
+			return 0, fmt.Errorf("--concurrency must be >= 1")
+		}
+		return concurrency, nil
+	}
+
+	if cfg != nil && cfg.SweepConcurrency != nil {
+		concurrency := *cfg.SweepConcurrency
+		if concurrency < 1 {
+			return 0, fmt.Errorf("sweep_concurrency must be >= 1")
+		}
+		return concurrency, nil
+	}
+
+	return defaultSweepConcurrency, nil
 }
 
 func containsGlobMeta(path string) bool {

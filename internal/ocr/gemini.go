@@ -28,10 +28,63 @@ const (
 	geminiMaxRequestBytes  = 95 * 1024 * 1024
 	geminiMaxDecodedBytes  = 45 * 1024 * 1024
 	geminiMaxResponseBytes = 16 * 1024 * 1024
+
+	GeminiBatchModel = geminiModel
+	// Reserve 100 MB below Gemini's 2 GB uploaded-input limit so framing and
+	// provider-side size accounting cannot turn an exactly packed job invalid.
+	GeminiBatchMaxInputBytes    = int64(1_900_000_000)
+	GeminiBatchMaxResponseBytes = geminiMaxResponseBytes
 )
 
 // GeminiClient uses the REST API directly so the OCR provider has no SDK
 // dependency and its request and billing behavior remain explicit.
+type GeminiPreparedRequest struct {
+	PageStart int
+	PageEnd   int
+	Body      []byte
+}
+
+type GeminiDecodedResult struct {
+	Pages        []PageResult
+	InputTokens  *int64
+	OutputTokens *int64
+	Billing      BillingReport
+}
+
+type GeminiPlanningError struct {
+	PageStart int
+	Cause     error
+}
+
+func (e *GeminiPlanningError) Error() string {
+	return fmt.Sprintf("cannot plan Gemini request at source page %d: %v", e.PageStart+1, e.Cause)
+}
+
+func (e *GeminiPlanningError) Unwrap() error { return e.Cause }
+
+type GeminiRangeSizeError struct {
+	PageStart int
+	PageEnd   int
+	Cause     error
+}
+
+func (e *GeminiRangeSizeError) Error() string {
+	return fmt.Sprintf("%s exceeds Gemini request limits: %v", formatPageRange(e.PageStart, e.PageEnd), e.Cause)
+}
+
+func (e *GeminiRangeSizeError) Unwrap() error { return e.Cause }
+
+func IsGeminiRangeSizeError(err error) bool {
+	var sizeError *GeminiRangeSizeError
+	return errors.As(err, &sizeError)
+}
+
+type geminiRequestSizeError struct {
+	message string
+}
+
+func (e *geminiRequestSizeError) Error() string { return e.message }
+
 type GeminiClient struct {
 	apiKey      string
 	runAt       time.Time
@@ -71,6 +124,259 @@ func NewGeminiClientFromEnv(runAt time.Time) (*GeminiClient, error) {
 		return nil, errors.New("GEMINI_API_KEY environment variable is not set")
 	}
 	return NewGeminiClient(key, runAt), nil
+}
+
+func (c *GeminiClient) PrepareFileRequests(ctx context.Context, filePath, fileType string) ([]GeminiPreparedRequest, error) {
+	var requests []GeminiPreparedRequest
+	var rejected error
+	err := c.WalkFileRequests(
+		ctx,
+		filePath,
+		fileType,
+		func(request GeminiPreparedRequest) error {
+			requests = append(requests, request)
+			return nil
+		},
+		func(sizeErr *GeminiRangeSizeError) error {
+			if rejected == nil {
+				rejected = sizeErr
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return requests, err
+	}
+	return requests, rejected
+}
+
+func (c *GeminiClient) WalkFileRequests(
+	ctx context.Context,
+	filePath, fileType string,
+	yield func(GeminiPreparedRequest) error,
+	reject func(*GeminiRangeSizeError) error,
+) error {
+	if _, err := geminiMIMEType(fileType); err != nil {
+		return err
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("stat file: %w", err)
+	}
+	if fileType != "pdf" {
+		request, err := c.prepareImageRequest(ctx, filePath, fileType, info.Size())
+		if err != nil {
+			var sizeErr *GeminiRangeSizeError
+			if reject != nil && errors.As(err, &sizeErr) {
+				return reject(sizeErr)
+			}
+			return err
+		}
+		return yield(request)
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+	pageCount := c.pageCount
+	if pageCount == nil {
+		pageCount = pdfutil.PageCountContext
+	}
+	pages, err := pageCount(ctx, f)
+	if err != nil {
+		return fmt.Errorf("%s: read PDF page count: %w", filePath, err)
+	}
+	if pages < 1 {
+		return fmt.Errorf("%s: PDF contains no pages", filePath)
+	}
+
+	for start := 0; start < pages; {
+		chunk, err := c.planPDFChunk(ctx, f, info.Size(), pages, start, pages)
+		if err != nil {
+			var sizeErr *GeminiRangeSizeError
+			if reject != nil && errors.As(err, &sizeErr) {
+				if rejectErr := reject(sizeErr); rejectErr != nil {
+					return rejectErr
+				}
+				start = sizeErr.PageEnd
+				continue
+			}
+			cause := fmt.Errorf("%s, %s: %w", filePath, formatPageRange(start, min(pages, start+c.pageLimitValue())), err)
+			return &GeminiPlanningError{PageStart: start, Cause: cause}
+		}
+		body, err := c.buildRequestBody(chunk.data, "pdf", chunk.end-chunk.start)
+		if err != nil {
+			cause := fmt.Errorf("%s, %s: %w", filePath, formatPageRange(chunk.start, chunk.end), err)
+			return &GeminiPlanningError{PageStart: chunk.start, Cause: cause}
+		}
+		if err := yield(GeminiPreparedRequest{PageStart: chunk.start, PageEnd: chunk.end, Body: body}); err != nil {
+			return err
+		}
+		start = chunk.end
+	}
+	return nil
+}
+
+func (c *GeminiClient) PrepareRangeRequest(
+	ctx context.Context,
+	filePath, fileType string,
+	start, end int,
+) (GeminiPreparedRequest, error) {
+	if start < 0 || end <= start {
+		return GeminiPreparedRequest{}, errors.New("invalid Gemini page range")
+	}
+	if fileType != "pdf" {
+		if start != 0 || end != 1 {
+			return GeminiPreparedRequest{}, errors.New("image OCR range must be page 1")
+		}
+		info, err := os.Stat(filePath)
+		if err != nil {
+			return GeminiPreparedRequest{}, fmt.Errorf("stat file: %w", err)
+		}
+		return c.prepareImageRequest(ctx, filePath, fileType, info.Size())
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+	pages, err := c.pageCount(ctx, f)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("%s: read PDF page count: %w", filePath, err)
+	}
+	if end > pages {
+		return GeminiPreparedRequest{}, fmt.Errorf("planned page range exceeds current PDF page count %d", pages)
+	}
+	limit, err := c.effectiveDecodedLimit("pdf")
+	if err != nil {
+		var sizeErr *geminiRequestSizeError
+		if errors.As(err, &sizeErr) {
+			return GeminiPreparedRequest{}, &GeminiRangeSizeError{PageStart: start, PageEnd: end, Cause: err}
+		}
+		return GeminiPreparedRequest{}, err
+	}
+	extract := c.extractRange
+	if extract == nil {
+		extract = pdfutil.ExtractRange
+	}
+	data, err := extract(ctx, f, start, end, limit)
+	if err != nil {
+		if errors.Is(err, pdfutil.ErrRangeTooLarge) {
+			return GeminiPreparedRequest{}, &GeminiRangeSizeError{PageStart: start, PageEnd: end, Cause: err}
+		}
+		return GeminiPreparedRequest{}, err
+	}
+	body, err := c.buildRequestBody(data, "pdf", end-start)
+	if err != nil {
+		var sizeErr *geminiRequestSizeError
+		if errors.As(err, &sizeErr) {
+			return GeminiPreparedRequest{}, &GeminiRangeSizeError{PageStart: start, PageEnd: end, Cause: err}
+		}
+		return GeminiPreparedRequest{}, err
+	}
+	return GeminiPreparedRequest{PageStart: start, PageEnd: end, Body: body}, nil
+}
+
+func (c *GeminiClient) prepareImageRequest(
+	ctx context.Context,
+	filePath, fileType string,
+	sourceSize int64,
+) (GeminiPreparedRequest, error) {
+	limit, err := c.effectiveDecodedLimit(fileType)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("%s: %w", filePath, err)
+	}
+	if sourceSize > int64(limit) {
+		return GeminiPreparedRequest{}, &GeminiRangeSizeError{
+			PageStart: 0,
+			PageEnd:   1,
+			Cause:     fmt.Errorf("oversized %s image cannot be transformed", fileType),
+		}
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+	data, tooLarge, err := readLimited(ctx, f, limit)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("%s: read file: %w", filePath, err)
+	}
+	if tooLarge {
+		return GeminiPreparedRequest{}, &GeminiRangeSizeError{
+			PageStart: 0,
+			PageEnd:   1,
+			Cause:     fmt.Errorf("oversized %s image cannot be transformed", fileType),
+		}
+	}
+	body, err := c.buildRequestBody(data, fileType, 1)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("%s: %w", filePath, err)
+	}
+	return GeminiPreparedRequest{PageStart: 0, PageEnd: 1, Body: body}, nil
+}
+
+func (c *GeminiClient) OCRRange(
+	ctx context.Context,
+	filePath, fileType string,
+	start, end int,
+) ([]PageResult, BillingReport, error) {
+	if start < 0 || end <= start {
+		return nil, BillingReport{}, errors.New("invalid Gemini page range")
+	}
+	if fileType != "pdf" {
+		if start != 0 || end != 1 {
+			return nil, BillingReport{}, errors.New("image OCR range must be page 1")
+		}
+		return c.OCRFile(ctx, filePath, fileType)
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, BillingReport{}, fmt.Errorf("stat file: %w", err)
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, BillingReport{}, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+	pages, err := c.pageCount(ctx, f)
+	if err != nil {
+		return nil, BillingReport{}, fmt.Errorf("%s: read PDF page count: %w", filePath, err)
+	}
+	if end > pages {
+		return nil, BillingReport{}, fmt.Errorf("planned page range exceeds current PDF page count %d", pages)
+	}
+	var results []PageResult
+	var report BillingReport
+	if err := c.ocrPDFInterval(ctx, f, filePath, info.Size(), pages, start, end, &results, &report); err != nil {
+		return nil, report, err
+	}
+	return results, report, nil
+}
+
+func DecodeGeminiBatchResult(
+	body []byte,
+	expectedPages int,
+	prices GeminiTokenPrices,
+) (GeminiDecodedResult, error) {
+	pages, err := decodeGeminiResults(body, expectedPages)
+	usage := geminiUsageFromBody(body)
+	result := GeminiDecodedResult{Pages: pages, Billing: BillingReport{Indeterminate: usage == nil}}
+	if usage != nil {
+		input := *usage.PromptTokenCount
+		output := *usage.CandidatesTokenCount + *usage.ThoughtsTokenCount
+		result.InputTokens = &input
+		result.OutputTokens = &output
+		result.Billing.KnownCost = GeminiCostWithPrices(prices, input, output)
+	}
+	return result, err
+}
+
+func IsGeminiMaxTokensError(err error) bool {
+	return isGeminiMaxTokens(err)
 }
 
 func (c *GeminiClient) OCRFile(ctx context.Context, filePath string, fileType string) ([]PageResult, BillingReport, error) {
@@ -223,7 +529,10 @@ func (c *GeminiClient) planPDFChunk(ctx context.Context, source io.ReadSeeker, s
 		if err != nil {
 			return pdfChunk{}, false, err
 		}
-		return pdfChunk{start: start, end: candidateEnd, data: data}, size <= c.requestLimit(), nil
+		if size > c.requestLimit() {
+			return pdfChunk{}, false, nil
+		}
+		return pdfChunk{start: start, end: candidateEnd, data: data}, true, nil
 	}
 	best, fits, err := measure(start + seed)
 	if err != nil {
@@ -247,7 +556,8 @@ func (c *GeminiClient) planPDFChunk(ctx context.Context, source io.ReadSeeker, s
 		}
 	}
 	if best.end == 0 {
-		return pdfChunk{}, fmt.Errorf("source page %d exceeds the decoded or serialized OCR request limit", start+1)
+		cause := fmt.Errorf("source page %d exceeds the decoded or serialized OCR request limit", start+1)
+		return pdfChunk{}, &GeminiRangeSizeError{PageStart: start, PageEnd: start + 1, Cause: cause}
 	}
 	return best, nil
 }
@@ -321,7 +631,7 @@ func (c *GeminiClient) doWithRetry(ctx context.Context, body []byte) ([]byte, Bi
 			if attempt == maxAttempts {
 				return nil, report, fmt.Errorf("http request failed after %d attempts: %w", maxAttempts, err)
 			}
-			backoff = geminiNextBackoff(backoff, randFloat)
+			backoff = geminiNextBackoff(backoff, "", time.Now(), randFloat)
 			continue
 		}
 		response, overflow, readErr := readGeminiResponse(resp.Body, c.responseLimit())
@@ -334,7 +644,7 @@ func (c *GeminiClient) doWithRetry(ctx context.Context, body []byte) ([]byte, Bi
 			if attempt == maxAttempts {
 				return nil, report, fmt.Errorf("read response after %d attempts: %w", maxAttempts, readErr)
 			}
-			backoff = geminiNextBackoff(backoff, randFloat)
+			backoff = geminiNextBackoff(backoff, "", time.Now(), randFloat)
 			continue
 		}
 		if overflow {
@@ -356,14 +666,44 @@ func (c *GeminiClient) doWithRetry(ctx context.Context, body []byte) ([]byte, Bi
 		if !retryable || attempt == maxAttempts {
 			return nil, report, &apiError{StatusCode: resp.StatusCode, Body: response, Attempts: attempt}
 		}
-		backoff = geminiNextBackoff(backoff, randFloat)
+		backoff = geminiNextBackoff(
+			backoff, resp.Header.Get("Retry-After"), time.Now(), randFloat,
+		)
 	}
 	panic("unreachable")
 }
 
-func geminiNextBackoff(backoff time.Duration, random func() float64) time.Duration {
+// Keep provider-requested delays as a floor after jittering local backoff.
+// Both are capped so one response cannot make this bounded command wait indefinitely.
+func geminiNextBackoff(
+	backoff time.Duration,
+	retryAfter string,
+	now time.Time,
+	random func() float64,
+) time.Duration {
 	next := time.Duration(math.Min(float64(backoff*2), float64(time.Minute)))
-	return time.Duration(math.Min(float64(next)*(0.5+random()), float64(time.Minute)))
+	delay := time.Duration(math.Min(float64(next)*(0.5+random()), float64(time.Minute)))
+	retryDelay, ok := geminiRetryAfterDelay(retryAfter, now)
+	if ok && retryDelay > delay {
+		return retryDelay
+	}
+	return delay
+}
+
+func geminiRetryAfterDelay(value string, now time.Time) (time.Duration, bool) {
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		date, dateErr := http.ParseTime(value)
+		if dateErr != nil {
+			return 0, false
+		}
+		seconds = date.Sub(now).Seconds()
+	}
+	if math.IsNaN(seconds) {
+		return 0, false
+	}
+	seconds = math.Max(0, math.Min(seconds, 60))
+	return time.Duration(seconds * float64(time.Second)), true
 }
 
 func readGeminiResponse(body io.Reader, limit int) ([]byte, bool, error) {
@@ -431,7 +771,7 @@ func (c *GeminiClient) requestBodySize(decoded int, fileType string, expectedPag
 	}
 	encoded := base64.StdEncoding.EncodedLen(decoded)
 	if encoded > int(^uint(0)>>1)-len(body) {
-		return 0, errors.New("OCR request size overflows int")
+		return 0, &geminiRequestSizeError{message: "OCR request size overflows int"}
 	}
 	return len(body) + encoded, nil
 }
@@ -449,7 +789,9 @@ func (c *GeminiClient) buildRequestBody(data []byte, fileType string, expectedPa
 		return nil, fmt.Errorf("internal request sizing mismatch: calculated %d bytes, built %d", expected, len(body))
 	}
 	if len(body) > c.requestLimit() {
-		return nil, fmt.Errorf("serialized OCR request is %d bytes, limit %d", len(body), c.requestLimit())
+		return nil, &geminiRequestSizeError{message: fmt.Sprintf(
+			"serialized OCR request is %d bytes, limit %d", len(body), c.requestLimit(),
+		)}
 	}
 	return body, nil
 }
@@ -687,18 +1029,33 @@ func geminiBilling(body []byte, runAt time.Time) BillingReport {
 	return BillingReport{Indeterminate: true}
 }
 func geminiBillingIfPresent(body []byte, runAt time.Time) *BillingReport {
+	usage := geminiUsageFromBody(body)
+	if usage == nil {
+		return nil
+	}
+	report := BillingReport{KnownCost: GeminiCost(runAt, *usage.PromptTokenCount, *usage.CandidatesTokenCount+*usage.ThoughtsTokenCount)}
+	return &report
+}
+
+func geminiUsageFromBody(body []byte) *geminiUsage {
 	// Decode usage independently so malformed candidate output cannot hide an
 	// otherwise authoritative charge from the same response.
 	var envelope struct {
 		UsageMetadata *geminiUsage `json:"usageMetadata"`
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope.UsageMetadata == nil || envelope.UsageMetadata.PromptTokenCount == nil || envelope.UsageMetadata.CandidatesTokenCount == nil || envelope.UsageMetadata.ThoughtsTokenCount == nil {
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope.UsageMetadata == nil || envelope.UsageMetadata.PromptTokenCount == nil {
 		return nil
 	}
 	usage := envelope.UsageMetadata
+	zero := int64(0)
+	if usage.CandidatesTokenCount == nil {
+		usage.CandidatesTokenCount = &zero
+	}
+	if usage.ThoughtsTokenCount == nil {
+		usage.ThoughtsTokenCount = &zero
+	}
 	if *usage.PromptTokenCount < 0 || *usage.CandidatesTokenCount < 0 || *usage.ThoughtsTokenCount < 0 {
 		return nil
 	}
-	report := BillingReport{KnownCost: GeminiCost(runAt, *usage.PromptTokenCount, *usage.CandidatesTokenCount+*usage.ThoughtsTokenCount)}
-	return &report
+	return usage
 }

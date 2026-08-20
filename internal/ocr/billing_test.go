@@ -55,6 +55,43 @@ func TestBillingExtraction_IgnoresMalformedOutputFields(t *testing.T) {
 	}
 }
 
+func TestGeminiBillingTreatsOmittedOutputCountsAsZero(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name string
+		body string
+		want Currency
+	}{
+		{
+			name: "thoughts",
+			body: `{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3}}`,
+			want: GeminiCost(at, 2, 3),
+		},
+		{
+			name: "candidates",
+			body: `{"usageMetadata":{"promptTokenCount":2,"thoughtsTokenCount":4}}`,
+			want: GeminiCost(at, 2, 4),
+		},
+		{
+			name: "both output counts",
+			body: `{"usageMetadata":{"promptTokenCount":2}}`,
+			want: GeminiCost(at, 2, 0),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			report := geminiBillingIfPresent([]byte(test.body), at)
+			if report == nil || report.KnownCost != test.want || report.Indeterminate {
+				t.Fatalf("report = %#v, want known cost %d", report, test.want)
+			}
+		})
+	}
+	if report := geminiBillingIfPresent([]byte(`{"usageMetadata":{"candidatesTokenCount":3}}`), at); report != nil {
+		t.Fatalf("report = %#v, want missing prompt usage rejected", report)
+	}
+}
+
 func TestMistralBilling_SurvivesValidationFailure(t *testing.T) {
 	t.Parallel()
 

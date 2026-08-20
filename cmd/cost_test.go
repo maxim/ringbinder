@@ -93,7 +93,8 @@ func TestRunCost_LimitedBatchPrintsSelectedAndTotal(t *testing.T) {
 			t.Fatalf("runCost() error = %v", err)
 		}
 	})
-	want := "Pending OCR batch: 2 of 3 content item(s), 5 pages\nEstimated cost: $0.0250 (at $0.0050/page)\n"
+	want := "Pending OCR batch: 2 of 3 content item(s), 5 pages\nEstimated cost: $0.0250 (at " +
+		ocr.FormatCurrency(ocr.MistralPageCost()) + "/page)\n"
 	if output != want {
 		t.Fatalf("output = %q, want %q", output, want)
 	}

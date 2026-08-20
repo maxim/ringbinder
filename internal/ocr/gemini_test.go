@@ -146,6 +146,111 @@ func TestGeminiRetriesTransientResponses(t *testing.T) {
 	}
 }
 
+func TestGeminiRetryHonorsRetryAfter(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(geminiResponseJSON("STOP", `{"pages":[{"page_index":0,"transcription":"","page_description":"Page","visual_elements":[]}]}`, 1, 1, 0)))
+	}))
+	defer server.Close()
+
+	client := NewGeminiClient("key", time.Now())
+	client.endpoint = server.URL
+	client.randFloat64 = func() float64 { return 0 }
+	var sleeps []time.Duration
+	client.sleep = func(_ context.Context, delay time.Duration) error {
+		sleeps = append(sleeps, delay)
+		return nil
+	}
+	body, err := client.buildRequestBody([]byte("x"), "png", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.doWithRetry(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	if len(sleeps) != 1 || sleeps[0] != 30*time.Second {
+		t.Fatalf("sleeps = %v, want [30s]", sleeps)
+	}
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	header := now.Add(45 * time.Second).Format(http.TimeFormat)
+	if got := geminiNextBackoff(time.Second, header, now, func() float64 { return 0 }); got != 45*time.Second {
+		t.Fatalf("HTTP-date backoff = %v, want 45s", got)
+	}
+}
+
+func TestGeminiRangeEntryPoints(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "scan.pdf")
+	if err := os.WriteFile(input, []byte("pdf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(geminiResponseJSON("STOP", geminiPagesPayload(2), 2, 2, 0)))
+	}))
+	defer server.Close()
+
+	client := NewGeminiClient("key", time.Now())
+	client.endpoint = server.URL
+	client.pageCount = func(context.Context, io.ReadSeeker) (int, error) { return 3, nil }
+	client.extractRange = func(_ context.Context, _ io.ReadSeeker, start, end, _ int) ([]byte, error) {
+		if start != 1 || end != 3 {
+			t.Fatalf("extract range = %d-%d, want 1-3", start, end)
+		}
+		return []byte("range-data"), nil
+	}
+
+	prepared, err := client.PrepareRangeRequest(context.Background(), input, "pdf", 1, 3)
+	if err != nil {
+		t.Fatalf("PrepareRangeRequest() error = %v", err)
+	}
+	if prepared.PageStart != 1 || prepared.PageEnd != 3 {
+		t.Fatalf("prepared range = %d-%d, want 1-3", prepared.PageStart, prepared.PageEnd)
+	}
+	var request geminiRequest
+	if err := json.Unmarshal(prepared.Body, &request); err != nil {
+		t.Fatalf("decode prepared body: %v", err)
+	}
+	data, err := base64.StdEncoding.DecodeString(request.Contents[0].Parts[0].InlineData.Data)
+	if err != nil || string(data) != "range-data" {
+		t.Fatalf("prepared data = %q, %v", data, err)
+	}
+
+	pages, _, err := client.OCRRange(context.Background(), input, "pdf", 1, 3)
+	if err != nil {
+		t.Fatalf("OCRRange() error = %v", err)
+	}
+	if len(pages) != 2 || pages[0].PageIndex != 1 || pages[1].PageIndex != 2 {
+		t.Fatalf("OCRRange() pages = %+v, want absolute indexes 1 and 2", pages)
+	}
+}
+
+func TestGeminiPrepareRangeClassifiesSerializedSizeError(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "scan.pdf")
+	if err := os.WriteFile(input, []byte("pdf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := NewGeminiClient("", time.Now())
+	limit, err := client.requestBodySize(1, "pdf", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.requestByteLimit = limit
+	client.decodedByteLimit = 1
+	client.pageCount = func(context.Context, io.ReadSeeker) (int, error) { return 10, nil }
+	client.extractRange = func(context.Context, io.ReadSeeker, int, int, int) ([]byte, error) {
+		return []byte("x"), nil
+	}
+
+	_, err = client.PrepareRangeRequest(context.Background(), input, "pdf", 0, 10)
+	if !IsGeminiRangeSizeError(err) {
+		t.Fatalf("PrepareRangeRequest() error = %v, want GeminiRangeSizeError", err)
+	}
+}
+
 func TestGeminiPDFChunksUseRelativeIndexesAndAbsoluteOffsets(t *testing.T) {
 	input := filepath.Join(t.TempDir(), "scan.pdf")
 	if err := os.WriteFile(input, []byte("pdf"), 0o600); err != nil {

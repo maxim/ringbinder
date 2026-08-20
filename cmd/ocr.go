@@ -43,17 +43,25 @@ func runOCR(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	database, err := openDatabaseWithConfig(cmd, cfg)
-	if err != nil {
-		return err
-	}
-	defer database.Close()
-
 	runAt := time.Now().UTC()
 	provider, err := newOCRProvider(settings.model, runAt)
 	if err != nil {
 		return err
 	}
+	dbPath, err := resolveDatabasePath(cmd, cfg)
+	if err != nil {
+		return err
+	}
+	coordinator, err := acquireOCRCoordinator(dbPath)
+	if err != nil {
+		return err
+	}
+	defer coordinator.Close()
+	database, err := db.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer database.Close()
 
 	return processOCR(cmd.Context(), database, provider, limit, settings.concurrency)
 }
@@ -79,6 +87,9 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, lim
 		return fmt.Errorf("query contents: %w", err)
 	}
 	contents := batch.contents
+	if batch.excluded > 0 {
+		fmt.Printf("Skipped %d content item(s) already managed by batch OCR.\n", batch.excluded)
+	}
 	if len(contents) == 0 {
 		fmt.Println("No documents pending OCR.")
 		return nil
@@ -178,7 +189,7 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, lim
 			}
 
 			err = replacePagesWhileActive(ctx, &writeMu, func() error {
-				return database.ReplaceContentPages(job.content.ID, pageInputs)
+				return database.ReplaceContentPagesDirect(job.content.ID, pageInputs)
 			})
 			if err != nil {
 				tracker.WorkerError(slotID, err)

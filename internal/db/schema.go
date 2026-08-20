@@ -1,6 +1,6 @@
 package db
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS contents (
@@ -67,6 +67,166 @@ CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages BEGIN
     INSERT INTO pages_fts_trigram(pages_fts_trigram, rowid, search_text) VALUES('delete', old.id, old.search_text);
     INSERT INTO pages_fts_trigram(rowid, search_text) VALUES (new.id, new.search_text);
 END;
+
+CREATE TABLE IF NOT EXISTS gemini_batches (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_name      TEXT    NOT NULL UNIQUE,
+    model             TEXT    NOT NULL,
+    request_keys      TEXT    NOT NULL CHECK (json_valid(request_keys)),
+    state             TEXT    NOT NULL CHECK (state IN (
+        'prepared', 'upload_unknown', 'uploaded', 'submission_unknown',
+        'pending', 'running', 'cancelling', 'succeeded', 'failed',
+        'cancelled', 'expired'
+    )),
+    input_file_name   TEXT,
+    output_file_name  TEXT,
+    remote_name       TEXT    UNIQUE,
+    input_price       INTEGER NOT NULL CHECK (input_price >= 0),
+    output_price      INTEGER NOT NULL CHECK (output_price >= 0),
+    replacement_of    INTEGER,
+    last_error        TEXT    NOT NULL DEFAULT '',
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL,
+    CHECK (state NOT IN ('uploaded', 'submission_unknown') OR input_file_name IS NOT NULL),
+    CHECK (state NOT IN ('pending', 'running', 'cancelling', 'succeeded',
+                         'failed', 'cancelled', 'expired') OR remote_name IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gemini_batches_state
+    ON gemini_batches(state);
+
+CREATE TABLE IF NOT EXISTS gemini_batch_requests (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id         INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+    batch_id           INTEGER REFERENCES gemini_batches(id),
+    request_key        TEXT    NOT NULL UNIQUE,
+    file_type          TEXT    NOT NULL CHECK (file_type IN ('pdf', 'jpeg', 'png')),
+    page_start         INTEGER NOT NULL CHECK (page_start >= 0),
+    page_end           INTEGER NOT NULL CHECK (page_end > page_start),
+    state              TEXT    NOT NULL CHECK (state IN ('assigned', 'staged', 'retryable', 'blocked')),
+    attempt_count      INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 1),
+    replacement_count  INTEGER NOT NULL DEFAULT 0 CHECK (replacement_count BETWEEN 0 AND 1),
+    previous_batch_id  INTEGER,
+    split_depth        INTEGER NOT NULL DEFAULT 0 CHECK (split_depth >= 0),
+    input_tokens       INTEGER CHECK (input_tokens >= 0),
+    output_tokens      INTEGER CHECK (output_tokens >= 0),
+    known_cost         INTEGER NOT NULL DEFAULT 0 CHECK (known_cost >= 0),
+    cost_indeterminate INTEGER NOT NULL DEFAULT 0 CHECK (cost_indeterminate IN (0, 1)),
+    last_error         TEXT    NOT NULL DEFAULT '',
+    created_at         TEXT    NOT NULL,
+    updated_at         TEXT    NOT NULL,
+    UNIQUE(content_id, page_start, page_end),
+    CHECK ((state = 'assigned' AND batch_id IS NOT NULL) OR
+           (state != 'assigned' AND batch_id IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_gemini_requests_batch
+    ON gemini_batch_requests(batch_id);
+CREATE INDEX IF NOT EXISTS idx_gemini_requests_content
+    ON gemini_batch_requests(content_id);
+CREATE INDEX IF NOT EXISTS idx_gemini_requests_state
+    ON gemini_batch_requests(state);
+
+CREATE TABLE IF NOT EXISTS gemini_batch_pages (
+    request_id  INTEGER NOT NULL REFERENCES gemini_batch_requests(id) ON DELETE CASCADE,
+    content_id  INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+    page_index  INTEGER NOT NULL CHECK (page_index >= 0),
+    markdown    TEXT    NOT NULL,
+    PRIMARY KEY(request_id, page_index),
+    UNIQUE(content_id, page_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gemini_batch_pages_content
+    ON gemini_batch_pages(content_id, page_index);
+
+CREATE TABLE IF NOT EXISTS gemini_batch_cleanup (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_kind  TEXT    NOT NULL CHECK (resource_kind IN ('file', 'batch')),
+    resource_name  TEXT    NOT NULL,
+    last_error     TEXT    NOT NULL DEFAULT '',
+    created_at     TEXT    NOT NULL,
+    updated_at     TEXT    NOT NULL,
+    UNIQUE(resource_kind, resource_name)
+);
+`
+
+const schemaV2ToV3SQL = `
+CREATE TABLE gemini_batches (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_name      TEXT    NOT NULL UNIQUE,
+    model             TEXT    NOT NULL,
+    request_keys      TEXT    NOT NULL CHECK (json_valid(request_keys)),
+    state             TEXT    NOT NULL CHECK (state IN (
+        'prepared', 'upload_unknown', 'uploaded', 'submission_unknown',
+        'pending', 'running', 'cancelling', 'succeeded', 'failed',
+        'cancelled', 'expired'
+    )),
+    input_file_name   TEXT,
+    output_file_name  TEXT,
+    remote_name       TEXT    UNIQUE,
+    input_price       INTEGER NOT NULL CHECK (input_price >= 0),
+    output_price      INTEGER NOT NULL CHECK (output_price >= 0),
+    replacement_of    INTEGER,
+    last_error        TEXT    NOT NULL DEFAULT '',
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL,
+    CHECK (state NOT IN ('uploaded', 'submission_unknown') OR input_file_name IS NOT NULL),
+    CHECK (state NOT IN ('pending', 'running', 'cancelling', 'succeeded',
+                         'failed', 'cancelled', 'expired') OR remote_name IS NOT NULL)
+);
+
+CREATE INDEX idx_gemini_batches_state ON gemini_batches(state);
+
+CREATE TABLE gemini_batch_requests (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id         INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+    batch_id           INTEGER REFERENCES gemini_batches(id),
+    request_key        TEXT    NOT NULL UNIQUE,
+    file_type          TEXT    NOT NULL CHECK (file_type IN ('pdf', 'jpeg', 'png')),
+    page_start         INTEGER NOT NULL CHECK (page_start >= 0),
+    page_end           INTEGER NOT NULL CHECK (page_end > page_start),
+    state              TEXT    NOT NULL CHECK (state IN ('assigned', 'staged', 'retryable', 'blocked')),
+    attempt_count      INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 1),
+    replacement_count  INTEGER NOT NULL DEFAULT 0 CHECK (replacement_count BETWEEN 0 AND 1),
+    previous_batch_id  INTEGER,
+    split_depth        INTEGER NOT NULL DEFAULT 0 CHECK (split_depth >= 0),
+    input_tokens       INTEGER CHECK (input_tokens >= 0),
+    output_tokens      INTEGER CHECK (output_tokens >= 0),
+    known_cost         INTEGER NOT NULL DEFAULT 0 CHECK (known_cost >= 0),
+    cost_indeterminate INTEGER NOT NULL DEFAULT 0 CHECK (cost_indeterminate IN (0, 1)),
+    last_error         TEXT    NOT NULL DEFAULT '',
+    created_at         TEXT    NOT NULL,
+    updated_at         TEXT    NOT NULL,
+    UNIQUE(content_id, page_start, page_end),
+    CHECK ((state = 'assigned' AND batch_id IS NOT NULL) OR
+           (state != 'assigned' AND batch_id IS NULL))
+);
+
+CREATE INDEX idx_gemini_requests_batch ON gemini_batch_requests(batch_id);
+CREATE INDEX idx_gemini_requests_content ON gemini_batch_requests(content_id);
+CREATE INDEX idx_gemini_requests_state ON gemini_batch_requests(state);
+
+CREATE TABLE gemini_batch_pages (
+    request_id  INTEGER NOT NULL REFERENCES gemini_batch_requests(id) ON DELETE CASCADE,
+    content_id  INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+    page_index  INTEGER NOT NULL CHECK (page_index >= 0),
+    markdown    TEXT    NOT NULL,
+    PRIMARY KEY(request_id, page_index),
+    UNIQUE(content_id, page_index)
+);
+
+CREATE INDEX idx_gemini_batch_pages_content
+    ON gemini_batch_pages(content_id, page_index);
+
+CREATE TABLE gemini_batch_cleanup (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_kind  TEXT    NOT NULL CHECK (resource_kind IN ('file', 'batch')),
+    resource_name  TEXT    NOT NULL,
+    last_error     TEXT    NOT NULL DEFAULT '',
+    created_at     TEXT    NOT NULL,
+    updated_at     TEXT    NOT NULL,
+    UNIQUE(resource_kind, resource_name)
+);
 `
 
 const schemaV1ToV2SQL = `

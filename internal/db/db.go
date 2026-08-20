@@ -85,25 +85,19 @@ func (db *DB) migrate() error {
 
 	switch ver {
 	case 0:
-		// Fresh database — apply full schema.
-		if _, err := db.Exec(schemaSQL); err != nil {
+		// Fresh database — apply full schema and version as one restart-safe unit.
+		if err := db.applySchemaVersion(schemaSQL, schemaVersion); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
-		}
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-			return fmt.Errorf("set schema version: %w", err)
 		}
 		return nil
 	case 1:
-		if _, err := db.Exec(schemaV1ToV2SQL); err != nil {
-			return fmt.Errorf("migrate schema v1->v2: %w", err)
+		if err := db.migrateV1ToCurrent(); err != nil {
+			return fmt.Errorf("migrate schema v1->v%d: %w", schemaVersion, err)
 		}
-		// Recompute normalized search text using the same path as write-time updates,
-		// so historical pages benefit from the new retrieval behavior immediately.
-		if err := db.backfillPageSearchText(); err != nil {
-			return fmt.Errorf("backfill search text: %w", err)
-		}
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-			return fmt.Errorf("set schema version: %w", err)
+		return nil
+	case 2:
+		if err := db.applySchemaVersion(schemaV2ToV3SQL, schemaVersion); err != nil {
+			return fmt.Errorf("migrate schema v2->v3: %w", err)
 		}
 		return nil
 	case schemaVersion:
@@ -111,4 +105,50 @@ func (db *DB) migrate() error {
 	default:
 		return fmt.Errorf("unsupported schema version: %d", ver)
 	}
+}
+
+func (db *DB) migrateV1ToCurrent() (err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err = tx.Exec(schemaV1ToV2SQL); err != nil {
+		return err
+	}
+	// Recompute normalized search text in the same transaction as both schema
+	// steps so interruption cannot leave v2 columns stamped as schema v1.
+	if err = backfillPageSearchTextTx(tx); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(schemaV2ToV3SQL); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (db *DB) applySchemaVersion(schema string, version int) (err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err = tx.Exec(schema); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

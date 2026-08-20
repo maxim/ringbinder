@@ -38,6 +38,7 @@ type costEstimate struct {
 	items      int
 	totalItems int
 	pages      int
+	excluded   int
 	cost       ocr.Currency
 	truncated  bool
 }
@@ -65,6 +66,9 @@ func runCost(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if estimate.excluded > 0 {
+		fmt.Printf("Excluded from estimate: %d content item(s) already managed by batch OCR\n", estimate.excluded)
+	}
 	if estimate.items == 0 {
 		fmt.Println("No documents pending OCR.")
 		return nil
@@ -79,7 +83,10 @@ func runCost(cmd *cobra.Command, args []string) error {
 	if model == modelGemini {
 		fmt.Printf("Estimated cost: ~%s (actual cost may vary)\n", formatApproxCurrency(estimate.cost))
 	} else {
-		fmt.Printf("Estimated cost: %s (at $0.0050/page)\n", ocr.FormatCurrency(estimate.cost))
+		fmt.Printf(
+			"Estimated cost: %s (at %s/page)\n",
+			ocr.FormatCurrency(estimate.cost), ocr.FormatCurrency(ocr.MistralPageCost()),
+		)
 	}
 	return nil
 }
@@ -93,6 +100,7 @@ func estimateOCRCost(database *db.DB, model string, limit int, at time.Time) (co
 	estimate := costEstimate{
 		items:      len(batch.contents),
 		totalItems: batch.total,
+		excluded:   batch.excluded,
 		truncated:  batch.truncated,
 	}
 	var inputTokens, outputTokens int64

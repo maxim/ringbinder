@@ -10,6 +10,7 @@ import (
 type contentBatch struct {
 	contents  []db.Content
 	total     int
+	excluded  int
 	truncated bool
 }
 
@@ -32,12 +33,12 @@ func readOCRLimit(cmd *cobra.Command) (int, error) {
 }
 
 func pendingContentBatch(database *db.DB, limit int) (contentBatch, error) {
-	contents, err := database.PendingContents()
+	contents, excluded, err := database.PendingContentsForDirect()
 	if err != nil {
 		return contentBatch{}, err
 	}
 
-	batch := contentBatch{contents: contents, total: len(contents)}
+	batch := contentBatch{contents: contents, total: len(contents), excluded: excluded}
 	if limit > 0 && limit < batch.total {
 		batch.contents = contents[:limit]
 		batch.truncated = true

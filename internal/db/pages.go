@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -441,57 +442,43 @@ func (db *DB) GetPagesMarkdownByPathAndRange(path string, startInclusive, endInc
 	return pageRecords, nil
 }
 
-func (db *DB) backfillPageSearchText() error {
+func backfillPageSearchTextTx(tx *sql.Tx) error {
 	type pageText struct {
 		ID       int64
 		Markdown string
 	}
 
-	rows, err := db.Query(`SELECT id, markdown FROM pages ORDER BY id`)
+	rows, err := tx.Query(`SELECT id, markdown FROM pages ORDER BY id`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
 	allPages := make([]pageText, 0)
 	for rows.Next() {
 		var row pageText
 		if err := rows.Scan(&row.ID, &row.Markdown); err != nil {
+			_ = rows.Close()
 			return err
 		}
 		allPages = append(allPages, row)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
 	}
-
-	tx, err := db.Begin()
-	if err != nil {
+	if err := rows.Close(); err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
 
 	stmt, err := tx.Prepare(`UPDATE pages SET search_text = ? WHERE id = ?`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-
 	for _, page := range allPages {
-		normalizedSearchText := normalizeSearchText(page.Markdown)
-		if _, err = stmt.Exec(normalizedSearchText, page.ID); err != nil {
+		if _, err := stmt.Exec(normalizeSearchText(page.Markdown), page.ID); err != nil {
 			return err
 		}
 	}
-
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-
 	return nil
 }
 

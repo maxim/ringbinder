@@ -60,6 +60,21 @@ func GeminiPrices(at time.Time) GeminiTokenPrices {
 }
 
 func GeminiCost(at time.Time, inputTokens, outputTokens int64) Currency {
+	return GeminiCostWithPrices(GeminiPrices(at), inputTokens, outputTokens)
+}
+
+func GeminiBatchPrices(at time.Time) GeminiTokenPrices {
 	prices := GeminiPrices(at)
+	return GeminiTokenPrices{
+		Input:  prices.Input / 2,
+		Output: prices.Output / 2,
+	}
+}
+
+func GeminiBatchCost(at time.Time, inputTokens, outputTokens int64) Currency {
+	return GeminiCostWithPrices(GeminiBatchPrices(at), inputTokens, outputTokens)
+}
+
+func GeminiCostWithPrices(prices GeminiTokenPrices, inputTokens, outputTokens int64) Currency {
 	return Currency(inputTokens)*prices.Input + Currency(outputTokens)*prices.Output
 }

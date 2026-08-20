@@ -42,12 +42,7 @@ func openDatabase(cmd *cobra.Command) (*db.DB, error) {
 }
 
 func openDatabaseWithConfig(cmd *cobra.Command, cfg *config.Config) (*db.DB, error) {
-	cfgPath := ""
-	if cfg != nil {
-		cfgPath = cfg.DatabasePath
-	}
-
-	dbPath, err := config.ResolveDatabasePath(databaseFile, databaseFlagProvided(cmd), cfgPath)
+	dbPath, err := resolveDatabasePath(cmd, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -57,4 +52,12 @@ func openDatabaseWithConfig(cmd *cobra.Command, cfg *config.Config) (*db.DB, err
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	return database, nil
+}
+
+func resolveDatabasePath(cmd *cobra.Command, cfg *config.Config) (string, error) {
+	cfgPath := ""
+	if cfg != nil {
+		cfgPath = cfg.DatabasePath
+	}
+	return config.ResolveDatabasePath(databaseFile, databaseFlagProvided(cmd), cfgPath)
 }

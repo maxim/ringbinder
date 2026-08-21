@@ -23,6 +23,13 @@ type batchContinueTotals struct {
 	accounted bool
 }
 
+type batchAdvanceDisposition int
+
+const (
+	batchAdvanceDidWork batchAdvanceDisposition = iota
+	batchAdvancePollOnly
+)
+
 type incompleteGeminiOutputError struct {
 	Err error
 }
@@ -66,12 +73,21 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 	var totals batchContinueTotals
 	var commandErrors []error
 	globalFailure := false
+	didWork := false
+	pollOnlyBatches := 0
 	// List order is newest-first for users; lifecycle advancement is oldest-first
 	// so long-running work is reconciled before newer submissions.
 	for i := len(batches) - 1; i >= 0; i-- {
 		batch := batches[i]
-		advanceErr := advanceGeminiBatch(cmd, command.database, transport, planner, batch, &totals)
+		disposition, advanceErr := advanceGeminiBatch(
+			cmd, command.database, transport, planner, batch, &totals,
+		)
 		if advanceErr == nil {
+			if disposition == batchAdvancePollOnly {
+				pollOnlyBatches++
+			} else {
+				didWork = true
+			}
 			continue
 		}
 		commandErrors = append(commandErrors, fmt.Errorf("Gemini batch %d: %w", batch.ID, advanceErr))
@@ -87,10 +103,16 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 	}
 
 	if !globalFailure {
-		if _, promoteErr := command.database.PromoteReadyGeminiContents(); promoteErr != nil {
+		promoted, promoteErr := command.database.PromoteReadyGeminiContents()
+		if promoteErr != nil {
 			commandErrors = append(commandErrors, fmt.Errorf("promote completed Gemini content: %w", promoteErr))
+		} else if promoted > 0 {
+			didWork = true
 		}
-		retryErrors := submitRetryableGeminiRequests(cmd, command.database, transport, planner)
+		retryFound, retryErrors := submitRetryableGeminiRequests(cmd, command.database, transport, planner)
+		if retryFound {
+			didWork = true
+		}
 		commandErrors = append(commandErrors, retryErrors...)
 		if contextErr := cmd.Context().Err(); contextErr != nil {
 			if !errors.Is(errors.Join(retryErrors...), contextErr) {
@@ -107,7 +129,11 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !globalFailure {
-		commandErrors = append(commandErrors, retryGeminiCleanup(cmd, command.database, transport)...)
+		cleanupFound, cleanupErrors := retryGeminiCleanup(cmd, command.database, transport)
+		if cleanupFound {
+			didWork = true
+		}
+		commandErrors = append(commandErrors, cleanupErrors...)
 	}
 
 	if totals.accounted {
@@ -117,10 +143,15 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Batch OCR cost: %s\n", ocr.FormatCurrency(totals.billing.KnownCost))
 		}
 	}
-	if len(batches) == 0 {
-		cleanup, countErr := command.database.CountGeminiCleanup()
-		if countErr == nil && cleanup == 0 {
+	if len(commandErrors) == 0 && !didWork {
+		if len(batches) == 0 {
 			fmt.Println("No tracked Gemini batch work to continue.")
+		} else if pollOnlyBatches == len(batches) {
+			batchLabel := "batches"
+			if len(batches) == 1 {
+				batchLabel = "batch"
+			}
+			fmt.Printf("Checked %d Gemini %s; nothing ready to process.\n", len(batches), batchLabel)
 		}
 	}
 	if len(commandErrors) > 0 {
@@ -136,35 +167,35 @@ func advanceGeminiBatch(
 	planner *ocr.GeminiClient,
 	batch db.GeminiBatch,
 	totals *batchContinueTotals,
-) error {
+) (batchAdvanceDisposition, error) {
 	switch batch.State {
 	case db.GeminiBatchPrepared:
-		return resumePreparedGeminiBatch(cmd, database, transport, planner, batch)
+		return batchAdvanceDidWork, resumePreparedGeminiBatch(cmd, database, transport, planner, batch)
 	case db.GeminiBatchUploadUnknown:
-		return adoptUnknownGeminiUpload(cmd, database, transport, batch)
+		return batchAdvanceDidWork, adoptUnknownGeminiUpload(cmd, database, transport, batch)
 	case db.GeminiBatchUploaded:
-		return submitUploadedGeminiBatch(cmd, database, transport, batch.ID)
+		return batchAdvanceDidWork, submitUploadedGeminiBatch(cmd, database, transport, batch.ID)
 	case db.GeminiBatchSubmissionUnknown:
-		return adoptUnknownGeminiSubmission(cmd, database, transport, batch)
+		return batchAdvanceDidWork, adoptUnknownGeminiSubmission(cmd, database, transport, batch)
 	case db.GeminiBatchSucceeded:
-		return accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+		return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
 	case db.GeminiBatchFailed, db.GeminiBatchExpired:
 		if batch.OutputFileName != "" {
-			return accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+			return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
 		}
-		return replaceOutputlessGeminiBatch(database, batch, totals)
+		return batchAdvanceDidWork, replaceOutputlessGeminiBatch(database, batch, totals)
 	case db.GeminiBatchCancelled:
 		totals.accounted = true
 		totals.billing.Indeterminate = true
 		if err := database.BlockGeminiBatchRequests(batch.ID, "remote Gemini batch was cancelled without output", time.Now().UTC()); err != nil {
-			return err
+			return batchAdvanceDidWork, err
 		}
 		_, err := database.FinalizeGeminiBatch(batch.ID, time.Now().UTC())
-		return err
+		return batchAdvanceDidWork, err
 	case db.GeminiBatchPending, db.GeminiBatchRunning, db.GeminiBatchCancelling:
 		return refreshAndHandleGeminiBatch(cmd, database, transport, batch, totals)
 	default:
-		return fmt.Errorf("unsupported local Gemini batch state %q", batch.State)
+		return batchAdvanceDidWork, fmt.Errorf("unsupported local Gemini batch state %q", batch.State)
 	}
 }
 
@@ -290,21 +321,23 @@ func refreshAndHandleGeminiBatch(
 	transport geminiBatchAPI,
 	batch db.GeminiBatch,
 	totals *batchContinueTotals,
-) error {
+) (batchAdvanceDisposition, error) {
 	remote, err := transport.GetBatch(cmd.Context(), batch.RemoteName)
 	if err != nil {
 		if ocr.IsGeminiBatchNotFound(err) {
 			batch.LastError = "remote Gemini batch resource is no longer available"
 			if batch.State == db.GeminiBatchCancelling {
-				return finalizeUnavailableGeminiOutput(database, batch, totals, batch.LastError)
+				return batchAdvanceDidWork, finalizeUnavailableGeminiOutput(
+					database, batch, totals, batch.LastError,
+				)
 			}
-			return replaceOutputlessGeminiBatch(database, batch, totals)
+			return batchAdvanceDidWork, replaceOutputlessGeminiBatch(database, batch, totals)
 		}
-		return err
+		return batchAdvanceDidWork, err
 	}
 	state, err := ocr.NormalizeGeminiBatchState(remote.State)
 	if err != nil {
-		return err
+		return batchAdvanceDidWork, err
 	}
 	if batch.State == db.GeminiBatchCancelling &&
 		(state == db.GeminiBatchPending || state == db.GeminiBatchRunning || state == db.GeminiBatchCancelling) {
@@ -313,7 +346,7 @@ func refreshAndHandleGeminiBatch(
 	if err := database.SetGeminiBatchState(
 		batch.ID, state, remote.OutputFileName, remote.ErrorMessage, time.Now().UTC(),
 	); err != nil {
-		return err
+		return batchAdvanceDidWork, err
 	}
 	batch.State = state
 	batch.LastError = remote.ErrorMessage
@@ -321,23 +354,25 @@ func refreshAndHandleGeminiBatch(
 		batch.OutputFileName = remote.OutputFileName
 	}
 	switch state {
+	case db.GeminiBatchPending, db.GeminiBatchRunning, db.GeminiBatchCancelling:
+		return batchAdvancePollOnly, nil
 	case db.GeminiBatchSucceeded:
-		return accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+		return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
 	case db.GeminiBatchFailed, db.GeminiBatchExpired:
 		if batch.OutputFileName != "" {
-			return accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+			return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
 		}
-		return replaceOutputlessGeminiBatch(database, batch, totals)
+		return batchAdvanceDidWork, replaceOutputlessGeminiBatch(database, batch, totals)
 	case db.GeminiBatchCancelled:
 		totals.accounted = true
 		totals.billing.Indeterminate = true
 		if err := database.BlockGeminiBatchRequests(batch.ID, "remote Gemini batch was cancelled without output", time.Now().UTC()); err != nil {
-			return err
+			return batchAdvanceDidWork, err
 		}
 		_, err := database.FinalizeGeminiBatch(batch.ID, time.Now().UTC())
-		return err
+		return batchAdvanceDidWork, err
 	default:
-		return nil
+		return batchAdvanceDidWork, fmt.Errorf("unsupported remote Gemini batch state %q", state)
 	}
 }
 
@@ -654,17 +689,20 @@ func submitRetryableGeminiRequests(
 	database *db.DB,
 	transport geminiBatchAPI,
 	planner *ocr.GeminiClient,
-) []error {
+) (bool, []error) {
 	requests, err := database.RetryableGeminiRequests()
 	if err != nil {
-		return []error{err}
+		return false, []error{err}
+	}
+	if len(requests) == 0 {
+		return false, nil
 	}
 	if len(requests) > maxAutomaticRequestsPerContinue {
 		requests = requests[:maxAutomaticRequestsPerContinue]
 	}
 	group, err := newRetryBatchGroup()
 	if err != nil {
-		return []error{err}
+		return true, []error{err}
 	}
 	defer func() { _ = group.Close() }()
 	var commandErrors []error
@@ -759,7 +797,7 @@ func submitRetryableGeminiRequests(
 	if err == nil && !stopped {
 		flush()
 	}
-	return commandErrors
+	return true, commandErrors
 }
 
 func sameBatchLineage(left, right *int64) bool {
@@ -810,10 +848,13 @@ func retryGeminiCleanup(
 	cmd *cobra.Command,
 	database *db.DB,
 	transport geminiBatchAPI,
-) []error {
+) (bool, []error) {
 	cleanup, err := database.ListGeminiCleanup()
 	if err != nil {
-		return []error{err}
+		return false, []error{err}
+	}
+	if len(cleanup) == 0 {
+		return false, nil
 	}
 	var commandErrors []error
 	for _, item := range cleanup {
@@ -849,5 +890,5 @@ func retryGeminiCleanup(
 			break
 		}
 	}
-	return commandErrors
+	return true, commandErrors
 }

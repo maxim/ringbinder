@@ -131,6 +131,9 @@ func TestGeminiBatchUploadUsesResumableProtocol(t *testing.T) {
 			if got := r.Header.Get("X-Goog-Upload-Command"); got != "upload, finalize" {
 				t.Errorf("upload command = %q", got)
 			}
+			if got, want := r.ContentLength, int64(len("{\"key\":1}\n")); got != want {
+				t.Errorf("upload ContentLength = %d, want %d", got, want)
+			}
 			body, _ := io.ReadAll(r.Body)
 			if got, want := string(body), "{\"key\":1}\n"; got != want {
 				t.Errorf("uploaded body = %q, want %q", got, want)

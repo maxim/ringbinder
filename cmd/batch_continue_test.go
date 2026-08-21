@@ -231,9 +231,13 @@ func TestGeminiCleanupSeparatesTerminalAndRetryableFailures(t *testing.T) {
 	cmd.SetContext(context.Background())
 
 	var cleanupErrors []error
+	var cleanupFound bool
 	warning := captureStderr(t, func() {
-		cleanupErrors = retryGeminiCleanup(cmd, database, api)
+		cleanupFound, cleanupErrors = retryGeminiCleanup(cmd, database, api)
 	})
+	if !cleanupFound {
+		t.Fatal("retryGeminiCleanup() found no work, want cleanup attempts")
+	}
 	if len(cleanupErrors) != 1 {
 		t.Fatalf("retryGeminiCleanup() errors = %v, want one retryable failure", cleanupErrors)
 	}
@@ -255,9 +259,9 @@ func TestGeminiCleanupSeparatesTerminalAndRetryableFailures(t *testing.T) {
 	}
 
 	warning = captureStderr(t, func() {
-		cleanupErrors = retryGeminiCleanup(cmd, database, api)
+		cleanupFound, cleanupErrors = retryGeminiCleanup(cmd, database, api)
 	})
-	if len(cleanupErrors) != 1 || warning != "" {
+	if !cleanupFound || len(cleanupErrors) != 1 || warning != "" {
 		t.Fatalf("second cleanup errors = %v, warning = %q; want only retryable failure", cleanupErrors, warning)
 	}
 	if got := strings.Join(api.deleted, ","); got != firstPass+","+retryName {
@@ -292,10 +296,10 @@ func TestRetryPreparationCancellationPreservesRetryableRequest(t *testing.T) {
 	cancel()
 	cmd := &cobra.Command{}
 	cmd.SetContext(ctx)
-	errs := submitRetryableGeminiRequests(
+	found, errs := submitRetryableGeminiRequests(
 		cmd, database, &fakeGeminiBatchAPI{}, ocr.NewGeminiClient("", time.Now().UTC()),
 	)
-	if len(errs) != 1 || !errors.Is(errs[0], context.Canceled) {
+	if !found || len(errs) != 1 || !errors.Is(errs[0], context.Canceled) {
 		t.Fatalf("submitRetryableGeminiRequests() errors = %v, want context cancellation", errs)
 	}
 	stored, err := database.GeminiRequestByID(request.ID)
@@ -319,8 +323,8 @@ func TestRetrySubmissionStopsAfterGlobalFailure(t *testing.T) {
 	}}
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
-	errs := submitRetryableGeminiRequests(cmd, database, api, ocr.NewGeminiClient("", time.Now().UTC()))
-	if len(errs) != 1 || !ocr.IsGeminiGlobalFailure(errs[0]) {
+	found, errs := submitRetryableGeminiRequests(cmd, database, api, ocr.NewGeminiClient("", time.Now().UTC()))
+	if !found || len(errs) != 1 || !ocr.IsGeminiGlobalFailure(errs[0]) {
 		t.Fatalf("submitRetryableGeminiRequests() errors = %v, want one global failure", errs)
 	}
 	if api.uploadCalls != 1 {
@@ -411,8 +415,12 @@ func TestMissingRunningBatchReleasesOwnershipForOneReplacement(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
 	var totals batchContinueTotals
-	if err := refreshAndHandleGeminiBatch(cmd, database, api, batch, &totals); err != nil {
+	disposition, err := refreshAndHandleGeminiBatch(cmd, database, api, batch, &totals)
+	if err != nil {
 		t.Fatalf("refreshAndHandleGeminiBatch() error = %v", err)
+	}
+	if disposition != batchAdvanceDidWork {
+		t.Fatalf("refresh disposition = %v, want handled", disposition)
 	}
 	retryable, err := database.GeminiRequestByID(request.ID)
 	if err != nil {
@@ -462,8 +470,12 @@ func TestConfirmedCancellationBlocksWithoutDownloadingOutput(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
 	var totals batchContinueTotals
-	if err := refreshAndHandleGeminiBatch(cmd, database, api, batch, &totals); err != nil {
+	disposition, err := refreshAndHandleGeminiBatch(cmd, database, api, batch, &totals)
+	if err != nil {
 		t.Fatalf("refreshAndHandleGeminiBatch() error = %v", err)
+	}
+	if disposition != batchAdvanceDidWork {
+		t.Fatalf("refresh disposition = %v, want handled", disposition)
 	}
 	blocked, err := database.GeminiRequestByID(request.ID)
 	if err != nil {
@@ -493,8 +505,12 @@ func TestFreshDeterministicRemoteFailureBlocksWithoutReplacement(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
 	var totals batchContinueTotals
-	if err := refreshAndHandleGeminiBatch(cmd, database, api, batch, &totals); err != nil {
+	disposition, err := refreshAndHandleGeminiBatch(cmd, database, api, batch, &totals)
+	if err != nil {
 		t.Fatalf("refreshAndHandleGeminiBatch() error = %v", err)
+	}
+	if disposition != batchAdvanceDidWork {
+		t.Fatalf("refresh disposition = %v, want handled", disposition)
 	}
 	blocked, err := database.GeminiRequestByID(request.ID)
 	if err != nil {

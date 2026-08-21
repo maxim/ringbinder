@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,31 +17,35 @@ import (
 )
 
 type fakeGeminiBatchAPI struct {
-	requestKey      string
-	state           string
-	output          []byte
-	deleted         []string
-	cancelRequested bool
-	uploadCalls     int
-	uploadError     error
-	createCalls     int
-	createError     error
-	remoteError     string
-	deleteErrors    map[string]error
-	downloadCalls   int
-	downloadError   error
-	getError        error
-	files           []ocr.GeminiRemoteFile
-	batches         []ocr.GeminiRemoteBatch
+	requestKey            string
+	state                 string
+	output                []byte
+	deleted               []string
+	cancelRequested       bool
+	uploadCalls           int
+	uploadError           error
+	uploadReadBeforeError int64
+	createCalls           int
+	createError           error
+	remoteError           string
+	deleteErrors          map[string]error
+	downloadCalls         int
+	downloadError         error
+	getError              error
+	files                 []ocr.GeminiRemoteFile
+	batches               []ocr.GeminiRemoteBatch
 }
 
 func (api *fakeGeminiBatchAPI) UploadJSONL(_ context.Context, _ string, source io.ReadSeeker, _ int64) (ocr.GeminiRemoteFile, error) {
 	api.uploadCalls++
-	if api.uploadError != nil {
-		return ocr.GeminiRemoteFile{}, api.uploadError
-	}
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return ocr.GeminiRemoteFile{}, err
+	}
+	if api.uploadError != nil {
+		if api.uploadReadBeforeError > 0 {
+			_, _ = io.CopyN(io.Discard, source, api.uploadReadBeforeError)
+		}
+		return ocr.GeminiRemoteFile{}, api.uploadError
 	}
 	body, err := io.ReadAll(source)
 	if err != nil {
@@ -61,7 +66,9 @@ func (api *fakeGeminiBatchAPI) CreateBatch(context.Context, string, string, stri
 	if api.createError != nil {
 		return ocr.GeminiRemoteBatch{}, api.createError
 	}
-	return ocr.GeminiRemoteBatch{Name: "batches/1", State: "JOB_STATE_PENDING"}, nil
+	return ocr.GeminiRemoteBatch{
+		Name: fmt.Sprintf("batches/%d", api.createCalls), State: "JOB_STATE_PENDING",
+	}, nil
 }
 
 func (api *fakeGeminiBatchAPI) GetBatch(context.Context, string) (ocr.GeminiRemoteBatch, error) {
@@ -147,9 +154,19 @@ func TestBatchStartAndContinueFakeEndToEnd(t *testing.T) {
 	if err := startCmd.Flags().Set("model", modelGemini); err != nil {
 		t.Fatalf("set start model: %v", err)
 	}
-	if err := runBatchStart(startCmd, nil); err != nil {
-		t.Fatalf("runBatchStart() error = %v", err)
+	var startErr error
+	startOutput := captureStdout(t, func() {
+		startErr = runBatchStart(startCmd, nil)
+	})
+	if startErr != nil {
+		t.Fatalf("runBatchStart() error = %v", startErr)
 	}
+	assertInOrder(t, startOutput,
+		"Gemini batch 1 prepared with 1 request(s).",
+		"Uploading Gemini batch 1:",
+		"Gemini batch 1 upload complete:",
+		"Gemini batch 1 submitted.",
+	)
 	if api.requestKey == "" {
 		t.Fatal("batch input did not include a request key")
 	}

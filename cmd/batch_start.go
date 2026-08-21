@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,8 +11,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
+	"github.com/maxim/ringbinder/internal/progress"
 	"github.com/spf13/cobra"
 )
 
@@ -26,6 +29,27 @@ type retryBatchGroup struct {
 	size          int64
 	requestIDs    []int64
 	replacementOf *int64
+}
+
+type countingReadSeeker struct {
+	source io.ReadSeeker
+	onRead func(int)
+}
+
+var batchStdoutIsTerminal = func() bool {
+	return isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+}
+
+func (reader *countingReadSeeker) Read(buffer []byte) (int, error) {
+	count, err := reader.source.Read(buffer)
+	if count > 0 && reader.onRead != nil {
+		reader.onRead(count)
+	}
+	return count, err
+}
+
+func (reader *countingReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return reader.source.Seek(offset, whence)
 }
 
 func runBatchStart(cmd *cobra.Command, args []string) error {
@@ -202,6 +226,10 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Gemini batch %d prepared with %d request(s).\n", batchID, len(groups[i].plans))
 	}
 	for i, batchID := range batchIDs {
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			commandErrors = append(commandErrors, contextErr)
+			break
+		}
 		uploadErr := uploadAndSubmitGeminiBatch(
 			cmd, command.database, transport, batchID, groups[i].file, groups[i].size,
 		)
@@ -210,7 +238,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		commandErrors = append(commandErrors, fmt.Errorf("Gemini batch %d: %w", batchID, uploadErr))
-		if ocr.IsGeminiGlobalFailure(uploadErr) {
+		if cmd.Context().Err() != nil || ocr.IsGeminiGlobalFailure(uploadErr) {
 			break
 		}
 	}
@@ -222,7 +250,7 @@ func uploadAndSubmitGeminiBatch(
 	database *db.DB,
 	transport geminiBatchAPI,
 	batchID int64,
-	input *os.File,
+	input io.ReadSeeker,
 	size int64,
 ) error {
 	batch, err := database.GetGeminiBatch(batchID)
@@ -232,18 +260,30 @@ func uploadAndSubmitGeminiBatch(
 	if batch == nil {
 		return fmt.Errorf("Gemini batch %d disappeared", batchID)
 	}
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		return contextErr
+	}
 	if err := database.SetGeminiBatchUploadUnknown(batchID, time.Now().UTC()); err != nil {
 		return err
 	}
-	remoteFile, err := transport.UploadJSONL(cmd.Context(), batch.DisplayName, input, size)
+	tracker := progress.NewUpload(os.Stdout, batchStdoutIsTerminal(), batchID, size)
+	defer tracker.Close()
+	trackedInput := &countingReadSeeker{source: input, onRead: tracker.AddBytes}
+	remoteFile, err := transport.UploadJSONL(cmd.Context(), batch.DisplayName, trackedInput, size)
 	if err != nil {
-		if !ocr.IsGeminiAmbiguousOperation(err) {
-			_ = database.SetGeminiBatchPrepared(batchID, err.Error(), time.Now().UTC())
-		} else {
+		tracker.Stopped()
+		// Once upload starts, cancellation can race with remote finalization even
+		// when a transport forgets to classify that uncertainty explicitly.
+		ambiguous := ocr.IsGeminiAmbiguousOperation(err) ||
+			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		if ambiguous {
 			_ = database.SetGeminiBatchError(batchID, err.Error(), time.Now().UTC())
+		} else {
+			_ = database.SetGeminiBatchPrepared(batchID, err.Error(), time.Now().UTC())
 		}
 		return err
 	}
+	tracker.Complete()
 	if err := database.SetGeminiBatchUploaded(batchID, remoteFile.Name, time.Now().UTC()); err != nil {
 		return err
 	}
@@ -281,6 +321,9 @@ func submitUploadedGeminiBatch(
 	prices := ocr.GeminiBatchPrices(now)
 	if err := database.SetGeminiBatchPrices(batchID, int64(prices.Input), int64(prices.Output), now); err != nil {
 		return err
+	}
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		return contextErr
 	}
 	if err := database.SetGeminiBatchSubmissionUnknown(batchID, now); err != nil {
 		return err

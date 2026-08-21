@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -25,7 +28,15 @@ func newRootCommand() *cobra.Command {
 }
 
 func Execute() error {
-	return rootCmd.Execute()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// Restore default handling after graceful cancellation so a second signal
+	// can force termination if command cleanup gets stuck.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return rootCmd.ExecuteContext(ctx)
 }
 
 func init() {

@@ -1183,11 +1183,13 @@ func (db *DB) FinalizeGeminiBatch(batchID int64, now time.Time) (cleanup []Gemin
 		return nil, fmt.Errorf("Gemini batch %d still owns %d request(s)", batchID, assigned)
 	}
 
+	// Batch outputs are generated artifacts, not uploaded Files API resources.
+	// Gemini permits downloading their names but can reject those same names
+	// for deletion, so Gemini's retention policy owns their cleanup.
 	resources := []struct {
 		kind, name string
 	}{
 		{"batch", batch.RemoteName},
-		{"file", batch.OutputFileName},
 		{"file", batch.InputFileName},
 	}
 	stamp := now.UTC().Format(time.RFC3339Nano)

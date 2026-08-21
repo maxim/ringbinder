@@ -26,6 +26,7 @@ type fakeGeminiBatchAPI struct {
 	createCalls     int
 	createError     error
 	remoteError     string
+	deleteErrors    map[string]error
 	downloadCalls   int
 	downloadError   error
 	getError        error
@@ -93,12 +94,12 @@ func (api *fakeGeminiBatchAPI) CancelBatch(context.Context, string) error {
 
 func (api *fakeGeminiBatchAPI) DeleteBatch(_ context.Context, name string) error {
 	api.deleted = append(api.deleted, name)
-	return nil
+	return api.deleteErrors[name]
 }
 
 func (api *fakeGeminiBatchAPI) DeleteFile(_ context.Context, name string) error {
 	api.deleted = append(api.deleted, name)
-	return nil
+	return api.deleteErrors[name]
 }
 
 func (api *fakeGeminiBatchAPI) DownloadFile(context.Context, string) (io.ReadCloser, error) {
@@ -201,7 +202,7 @@ func TestBatchStartAndContinueFakeEndToEnd(t *testing.T) {
 	if batches != 0 || cleanup != 0 {
 		t.Fatalf("batches = %d cleanup = %d, want handled and cleaned", batches, cleanup)
 	}
-	if len(api.deleted) != 3 {
-		t.Fatalf("deleted resources = %v, want batch, output, and input", api.deleted)
+	if got := strings.Join(api.deleted, ","); got != "batches/1,files/input" {
+		t.Fatalf("deleted resources = %v, want batch and uploaded input", api.deleted)
 	}
 }

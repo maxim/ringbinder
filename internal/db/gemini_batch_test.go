@@ -197,6 +197,53 @@ func TestForgetGeminiBatchBlocksAndReleasesDirectOwnership(t *testing.T) {
 	}
 }
 
+func TestFinalizeGeminiBatchQueuesDeletableRemoteResources(t *testing.T) {
+	database := openGeminiBatchTestDB(t)
+	contentID := insertGeminiBatchTestContent(t, database, "cleanup-checksum", 1, "/docs/cleanup.png")
+	now := time.Now().UTC()
+	batchID, err := database.CreateGeminiBatch(
+		"cleanup-batch", "gemini", 375, 1875, nil,
+		[]GeminiRequestPlan{{
+			ContentID: contentID, RequestKey: "cleanup-key", FileType: "png", PageStart: 0, PageEnd: 1,
+		}},
+		now,
+	)
+	if err != nil {
+		t.Fatalf("CreateGeminiBatch() error = %v", err)
+	}
+	if err := database.SetGeminiBatchUploaded(batchID, "files/input", now); err != nil {
+		t.Fatalf("SetGeminiBatchUploaded() error = %v", err)
+	}
+	if err := database.SetGeminiBatchRemote(
+		batchID, "batches/remote", GeminiBatchSucceeded, "files/batch-output", "", now,
+	); err != nil {
+		t.Fatalf("SetGeminiBatchRemote() error = %v", err)
+	}
+	requests, err := database.GeminiRequestsForBatch(batchID)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("GeminiRequestsForBatch() = %+v, %v", requests, err)
+	}
+	if err := database.StageGeminiRequest(
+		requests[0].ID, []GeminiStagedPage{{PageIndex: 0, Markdown: "page"}}, nil, nil, 0, false, now,
+	); err != nil {
+		t.Fatalf("StageGeminiRequest() error = %v", err)
+	}
+
+	cleanup, err := database.FinalizeGeminiBatch(batchID, now)
+	if err != nil {
+		t.Fatalf("FinalizeGeminiBatch() error = %v", err)
+	}
+	if len(cleanup) != 2 {
+		t.Fatalf("cleanup = %+v, want remote batch and uploaded input", cleanup)
+	}
+	if cleanup[0].ResourceKind != "batch" || cleanup[0].ResourceName != "batches/remote" {
+		t.Fatalf("first cleanup = %+v, want remote batch", cleanup[0])
+	}
+	if cleanup[1].ResourceKind != "file" || cleanup[1].ResourceName != "files/input" {
+		t.Fatalf("second cleanup = %+v, want uploaded input", cleanup[1])
+	}
+}
+
 func TestGeminiBatchStateChecksRejectInvalidRows(t *testing.T) {
 	database := openGeminiBatchTestDB(t)
 	now := time.Now().UTC().Format(time.RFC3339Nano)

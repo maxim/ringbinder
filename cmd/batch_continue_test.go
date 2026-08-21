@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +138,130 @@ func TestBatchContinueCanceledWithoutRetryableWorkReturnsError(t *testing.T) {
 	defer database.Close()
 	if cleanup, err := database.CountGeminiCleanup(); err != nil || cleanup != 1 {
 		t.Fatalf("cleanup count = %d, error = %v; want retained cleanup", cleanup, err)
+	}
+}
+
+func TestBatchContinueRetiresUndeletableLegacyOutput(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	dbPath := filepath.Join(t.TempDir(), "cleanup.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputName := "files/batch-123456789012345678901234567890123456"
+	inputName := "files/input"
+	insertGeminiCleanup(t, database, "file", outputName)
+	insertGeminiCleanup(t, database, "file", inputName)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeGeminiBatchAPI{deleteErrors: map[string]error{
+		outputName: geminiDeleteInvalidArgumentError("generated output name is too long"),
+	}}
+	oldFactory := newGeminiBatchAPI
+	newGeminiBatchAPI = func(string) geminiBatchAPI { return api }
+	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
+	run := func() error {
+		cmd := commandWithDatabaseFlag(t, dbPath)
+		cmd.SetContext(context.Background())
+		cmd.Flags().String("model", "", "")
+		if err := cmd.Flags().Set("model", modelGemini); err != nil {
+			t.Fatal(err)
+		}
+		return runBatchContinue(cmd, nil)
+	}
+
+	var continueErr error
+	warning := captureStderr(t, func() { continueErr = run() })
+	if continueErr != nil {
+		t.Fatalf("runBatchContinue() error = %v, want terminal cleanup success", continueErr)
+	}
+	wantWarning := fmt.Sprintf(
+		"warning: Gemini permanently rejected cleanup of file %s; Ringbinder will not retry it\n",
+		outputName,
+	)
+	if warning != wantWarning {
+		t.Fatalf("warning = %q, want %q", warning, wantWarning)
+	}
+	if got := strings.Join(api.deleted, ","); got != outputName+","+inputName {
+		t.Fatalf("deleted resources = %v, want legacy output attempt followed by input cleanup", api.deleted)
+	}
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := database.CountGeminiCleanup(); err != nil || count != 0 {
+		t.Fatalf("cleanup count = %d, error = %v; want none", count, err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	warning = captureStderr(t, func() { continueErr = run() })
+	if continueErr != nil || warning != "" || len(api.deleted) != 2 {
+		t.Fatalf("second continue error = %v, warning = %q, deletes = %v; want no repeated work", continueErr, warning, api.deleted)
+	}
+}
+
+func TestGeminiCleanupSeparatesTerminalAndRetryableFailures(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	outputName := "files/batch-123456789012345678901234567890123456"
+	inputName := "files/input"
+	batchName := "batches/remote"
+	retryName := "files/rate-limited"
+	insertGeminiCleanup(t, database, "file", outputName)
+	insertGeminiCleanup(t, database, "file", inputName)
+	insertGeminiCleanup(t, database, "batch", batchName)
+	insertGeminiCleanup(t, database, "file", retryName)
+	api := &fakeGeminiBatchAPI{deleteErrors: map[string]error{
+		outputName: geminiDeleteInvalidArgumentError("generated output name is too long"),
+		inputName:  geminiDeleteInvalidArgumentError("file resource is invalid"),
+		batchName:  geminiDeleteInvalidArgumentError("batch resource is invalid"),
+		retryName: &ocr.GeminiBatchAPIError{
+			StatusCode: 429,
+			Body:       []byte(`{"error":{"code":429,"message":"try later","status":"RESOURCE_EXHAUSTED"}}`),
+		},
+	}}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+
+	var cleanupErrors []error
+	warning := captureStderr(t, func() {
+		cleanupErrors = retryGeminiCleanup(cmd, database, api)
+	})
+	if len(cleanupErrors) != 1 {
+		t.Fatalf("retryGeminiCleanup() errors = %v, want one retryable failure", cleanupErrors)
+	}
+	if strings.Count(warning, "\n") != 3 || !strings.Contains(warning, outputName) ||
+		!strings.Contains(warning, inputName) || !strings.Contains(warning, batchName) ||
+		strings.Contains(warning, retryName) {
+		t.Fatalf("warning = %q, want exactly the three permanent failures", warning)
+	}
+	cleanup, err := database.ListGeminiCleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cleanup) != 1 || cleanup[0].ResourceName != retryName || cleanup[0].LastError == "" {
+		t.Fatalf("cleanup = %+v, want only retryable row retained with error", cleanup)
+	}
+	firstPass := strings.Join([]string{outputName, inputName, batchName, retryName}, ",")
+	if got := strings.Join(api.deleted, ","); got != firstPass {
+		t.Fatalf("deleted resources = %v, want all first-pass attempts", api.deleted)
+	}
+
+	warning = captureStderr(t, func() {
+		cleanupErrors = retryGeminiCleanup(cmd, database, api)
+	})
+	if len(cleanupErrors) != 1 || warning != "" {
+		t.Fatalf("second cleanup errors = %v, warning = %q; want only retryable failure", cleanupErrors, warning)
+	}
+	if got := strings.Join(api.deleted, ","); got != firstPass+","+retryName {
+		t.Fatalf("deleted resources = %v, want only retryable row reattempted", api.deleted)
 	}
 }
 
@@ -479,6 +604,51 @@ func TestOutputlessGeminiBatchReplacementIsCapped(t *testing.T) {
 	if blocked == nil || blocked.State != db.GeminiRequestBlocked || blocked.ReplacementCount != 1 {
 		t.Fatalf("second replacement request = %+v, want blocked", blocked)
 	}
+}
+
+func insertGeminiCleanup(t *testing.T, database *db.DB, kind, name string) {
+	t.Helper()
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := database.Exec(
+		`INSERT INTO gemini_batch_cleanup
+		 (resource_kind, resource_name, created_at, updated_at)
+		 VALUES (?, ?, ?, ?)`,
+		kind, name, stamp, stamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func geminiDeleteInvalidArgumentError(message string) error {
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code": 400, "message": message, "status": "INVALID_ARGUMENT",
+		},
+	})
+	return &ocr.GeminiBatchAPIError{StatusCode: 400, Body: body}
+}
+
+// captureStderr replaces a process global and must not be used by parallel tests.
+func captureStderr(t *testing.T, run func()) string {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "stderr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = file
+	func() {
+		defer func() { os.Stderr = original }()
+		run()
+	}()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
 
 func createPreparedImageTestBatch(

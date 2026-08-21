@@ -251,6 +251,70 @@ func TestGeminiBatchCancelDeleteAndDownloadEndpoints(t *testing.T) {
 	}
 }
 
+func TestIsGeminiDeleteInvalidArgument(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "observed file name limit",
+			err: fmt.Errorf("clean up output: %w", &GeminiBatchAPIError{
+				StatusCode: http.StatusBadRequest,
+				Body:       []byte(`{"error":{"code":400,"message":"DeleteFileRequest.name exceeds 40 characters","status":"INVALID_ARGUMENT"}}`),
+			}),
+		},
+		{
+			name: "reworded file validation",
+			err: &GeminiBatchAPIError{
+				StatusCode: http.StatusBadRequest,
+				Body:       []byte(`{"error":{"code":400,"message":"file resource cannot be deleted","status":"INVALID_ARGUMENT"}}`),
+			},
+		},
+		{
+			name: "batch validation",
+			err: &GeminiBatchAPIError{
+				StatusCode: http.StatusBadRequest,
+				Body:       []byte(`{"error":{"code":3,"message":"invalid batch resource","status":"INVALID_ARGUMENT"}}`),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !IsGeminiDeleteInvalidArgument(test.err) {
+				t.Fatalf("IsGeminiDeleteInvalidArgument(%v) = false, want true", test.err)
+			}
+		})
+	}
+
+	invalidBody := []byte(`{"error":{"code":400,"message":"bad state","status":"FAILED_PRECONDITION"}}`)
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "different body status",
+			err:  &GeminiBatchAPIError{StatusCode: http.StatusBadRequest, Body: invalidBody},
+		},
+		{
+			name: "different HTTP status",
+			err: &GeminiBatchAPIError{
+				StatusCode: http.StatusInternalServerError,
+				Body:       []byte(`{"error":{"code":500,"status":"INVALID_ARGUMENT"}}`),
+			},
+		},
+		{
+			name: "malformed body",
+			err:  &GeminiBatchAPIError{StatusCode: http.StatusBadRequest, Body: []byte("not json")},
+		},
+		{name: "non-API error", err: errors.New("offline")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if IsGeminiDeleteInvalidArgument(test.err) {
+				t.Fatalf("IsGeminiDeleteInvalidArgument(%v) = true, want false", test.err)
+			}
+		})
+	}
+}
+
 func TestGeminiBatchNonIdempotentServerErrorsAreAmbiguous(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "accepted before failure", http.StatusInternalServerError)

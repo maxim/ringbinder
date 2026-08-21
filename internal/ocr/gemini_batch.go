@@ -74,6 +74,22 @@ func IsGeminiBatchNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
+func IsGeminiDeleteInvalidArgument(err error) bool {
+	var apiErr *GeminiBatchAPIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	var envelope struct {
+		Error struct {
+			Status string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(apiErr.Body, &envelope); err != nil {
+		return false
+	}
+	return envelope.Error.Status == "INVALID_ARGUMENT"
+}
+
 func IsGeminiGlobalFailure(err error) bool {
 	var apiErr *GeminiBatchAPIError
 	if errors.As(err, &apiErr) {

@@ -826,9 +826,20 @@ func retryGeminiCleanup(
 		default:
 			deleteErr = fmt.Errorf("unknown cleanup resource kind %q", item.ResourceKind)
 		}
-		if deleteErr == nil || ocr.IsGeminiBatchNotFound(deleteErr) {
+		invalidDelete := ocr.IsGeminiDeleteInvalidArgument(deleteErr)
+		if deleteErr == nil || ocr.IsGeminiBatchNotFound(deleteErr) || invalidDelete {
 			if err := database.DeleteGeminiCleanup(item.ID); err != nil {
 				commandErrors = append(commandErrors, err)
+				continue
+			}
+			// Retrying an identical delete cannot fix an invalid argument. Retire
+			// the detached cleanup row so it cannot poison every later continue.
+			if invalidDelete {
+				fmt.Fprintf(
+					os.Stderr,
+					"warning: Gemini permanently rejected cleanup of %s %s; Ringbinder will not retry it\n",
+					item.ResourceKind, item.ResourceName,
+				)
 			}
 			continue
 		}

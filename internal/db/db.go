@@ -96,8 +96,13 @@ func (db *DB) migrate() error {
 		}
 		return nil
 	case 2:
-		if err := db.applySchemaVersion(schemaV2ToV3SQL, schemaVersion); err != nil {
-			return fmt.Errorf("migrate schema v2->v3: %w", err)
+		if err := db.applySchemaVersion(schemaV2ToV3SQL+schemaV3ToV4SQL, schemaVersion); err != nil {
+			return fmt.Errorf("migrate schema v2->v%d: %w", schemaVersion, err)
+		}
+		return nil
+	case 3:
+		if err := db.applySchemaVersion(schemaV3ToV4SQL, schemaVersion); err != nil {
+			return fmt.Errorf("migrate schema v3->v%d: %w", schemaVersion, err)
 		}
 		return nil
 	case schemaVersion:
@@ -126,6 +131,9 @@ func (db *DB) migrateV1ToCurrent() (err error) {
 		return err
 	}
 	if _, err = tx.Exec(schemaV2ToV3SQL); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(schemaV3ToV4SQL); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {

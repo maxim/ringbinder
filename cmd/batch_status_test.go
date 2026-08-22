@@ -3,12 +3,163 @@ package cmd
 import (
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
 )
+
+func TestBatchForgetErasesLocalWorkWithoutAPIActivityOrWarning(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "")
+	dbPath := filepath.Join(t.TempDir(), "forget.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentID := addCostContent(t, database, "forget-command", 1, true, "/docs/forget.png")
+	batchID, err := database.CreateGeminiBatch(
+		"forget-command", ocr.GeminiBatchModel, 375, 1875, nil,
+		[]db.GeminiRequestPlan{{
+			ContentID: contentID, RequestKey: "forget-command-key",
+			FileType: "png", PageStart: 0, PageEnd: 1,
+		}},
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := database.SetGeminiBatchUploaded(batchID, "files/forget-command", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetGeminiBatchRemote(
+		batchID, "batches/forget-command", db.GeminiBatchRunning, "", "", now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldFactory := newGeminiBatchAPI
+	newGeminiBatchAPI = func(string) geminiBatchAPI {
+		t.Fatal("batch forget constructed a Gemini API transport")
+		return nil
+	}
+	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
+	cmd := commandWithDatabaseFlag(t, dbPath)
+	cmd.Flags().String("model", "", "")
+	if err := cmd.Flags().Set("model", modelGemini); err != nil {
+		t.Fatal(err)
+	}
+	var output string
+	var runErr error
+	stderr := captureStderr(t, func() {
+		output = captureStdout(t, func() {
+			runErr = runBatchForget(cmd, []string{strconv.FormatInt(batchID, 10)})
+		})
+	})
+	if runErr != nil {
+		t.Fatalf("runBatchForget() error = %v", runErr)
+	}
+	wantOutput := "Forgot Gemini batch " + strconv.FormatInt(batchID, 10) + " and erased saved OCR progress for its affected documents.\n"
+	if output != wantOutput || stderr != "" {
+		t.Fatalf("stdout = %q, stderr = %q; want %q and no warning", output, stderr, wantOutput)
+	}
+
+	output = ""
+	stderr = captureStderr(t, func() {
+		output = captureStdout(t, func() {
+			runErr = runBatchForget(cmd, []string{strconv.FormatInt(batchID, 10)})
+		})
+	})
+	wantError := "Gemini batch " + strconv.FormatInt(batchID, 10) + " not found"
+	if runErr == nil || runErr.Error() != wantError || output != "" || stderr != "" {
+		t.Fatalf(
+			"second forget error = %v, stdout = %q, stderr = %q; want %q and no output",
+			runErr, output, stderr, wantError,
+		)
+	}
+
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	batches, err := database.CountTrackedGeminiBatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := database.PendingContentsForGeminiBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches != 0 || len(pending) != 1 || pending[0].ID != contentID {
+		t.Fatalf("batches = %d, pending = %+v; want forgotten batch and fresh pending content", batches, pending)
+	}
+}
+
+func TestBatchListJSONReportsBlockedWorkWithoutBatchHistory(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	dbPath := filepath.Join(t.TempDir(), "blocked-list.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	firstID := addCostContent(t, database, "first-blocked", 2, true, "/docs/first.pdf")
+	secondID := addCostContent(t, database, "second-blocked", 1, true, "/docs/second.png")
+	plans := []db.GeminiRequestPlan{
+		{ContentID: firstID, RequestKey: "first-a", FileType: "pdf", PageStart: 0, PageEnd: 1},
+		{ContentID: firstID, RequestKey: "first-b", FileType: "pdf", PageStart: 1, PageEnd: 2},
+		{ContentID: secondID, RequestKey: "second", FileType: "png", PageStart: 0, PageEnd: 1},
+	}
+	for _, plan := range plans {
+		if _, err := database.CreateBlockedGeminiRequest(plan, "blocked", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := commandWithDatabaseFlag(t, dbPath)
+	cmd.Flags().String("model", "", "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("model", modelGemini); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("json", "true"); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	output := captureStdout(t, func() { runErr = runBatchList(cmd, nil) })
+	if runErr != nil {
+		t.Fatalf("runBatchList() error = %v", runErr)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &fields); err != nil {
+		t.Fatalf("decode output %q: %v", output, err)
+	}
+	for _, key := range []string{
+		"batches", "blocked_requests", "blocked_contents", "cleanup_pending", "refresh_errors",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("fields = %v, missing %q", fields, key)
+		}
+	}
+	if len(fields) != 5 {
+		t.Fatalf("fields = %v, want exactly five documented keys", fields)
+	}
+	if string(fields["batches"]) != "[]" || string(fields["refresh_errors"]) != "[]" ||
+		string(fields["blocked_requests"]) != "3" || string(fields["blocked_contents"]) != "2" {
+		t.Fatalf("fields = %v, want empty history and blocked counts 3/2", fields)
+	}
+}
 
 func TestBatchListJSONEmitsCachedStaleEnvelopeOnGlobalRefreshFailure(t *testing.T) {
 	resetCommandState(t)
@@ -30,6 +181,17 @@ func TestBatchListJSONEmitsCachedStaleEnvelopeOnGlobalRefreshFailure(t *testing.
 	}
 	if err := database.SetGeminiBatchRemote(batchID, "batches/1", db.GeminiBatchPending, "", "", now); err != nil {
 		t.Fatalf("SetGeminiBatchRemote() error = %v", err)
+	}
+	blockedContentID := addCostContent(t, database, "blocked-content", 1, true, "/docs/blocked.png")
+	if _, err := database.CreateBlockedGeminiRequest(
+		db.GeminiRequestPlan{
+			ContentID: blockedContentID, RequestKey: "blocked-key",
+			FileType: "png", PageStart: 0, PageEnd: 1,
+		},
+		"blocked",
+		now,
+	); err != nil {
+		t.Fatalf("CreateBlockedGeminiRequest() error = %v", err)
 	}
 	_ = database.Close()
 
@@ -59,9 +221,10 @@ func TestBatchListJSONEmitsCachedStaleEnvelopeOnGlobalRefreshFailure(t *testing.
 		envelope.Batches[0].State != db.GeminiBatchPending || !envelope.Batches[0].Stale {
 		t.Fatalf("batches = %+v, want one cached stale row", envelope.Batches)
 	}
-	if envelope.CleanupPending != 0 || len(envelope.RefreshErrors) != 1 ||
+	if envelope.BlockedRequests != 1 || envelope.BlockedContents != 1 ||
+		envelope.CleanupPending != 0 || len(envelope.RefreshErrors) != 1 ||
 		envelope.RefreshErrors[0].BatchID != nil {
-		t.Fatalf("envelope = %+v, want nullable global refresh error", envelope)
+		t.Fatalf("envelope = %+v, want blocked counts and nullable global refresh error", envelope)
 	}
 	if api.downloadCalls != 0 || len(api.deleted) != 0 {
 		t.Fatalf("list performed lifecycle side effects: downloads=%d deletes=%v", api.downloadCalls, api.deleted)

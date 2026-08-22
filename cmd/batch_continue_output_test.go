@@ -31,6 +31,38 @@ func TestBatchContinueReportsNoTrackedWork(t *testing.T) {
 	}
 }
 
+func TestBatchContinueReportsBlockedWorkWhenNoBatchesRemain(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "blocked.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentID := addCostContent(t, database, "blocked-content", 1, true, "/docs/blocked.png")
+	if _, err := database.CreateBlockedGeminiRequest(
+		db.GeminiRequestPlan{
+			ContentID: contentID, RequestKey: "blocked-key",
+			FileType: "png", PageStart: 0, PageEnd: 1,
+		},
+		"failed",
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := runBatchContinueWithFake(t, dbPath, &fakeGeminiBatchAPI{})
+	if err != nil {
+		t.Fatalf("runBatchContinue() error = %v", err)
+	}
+	want := "1 blocked Gemini batch OCR page range across 1 content item requires attention.\n" +
+		"Run `ringbinder batch failures` for details and recovery commands.\n"
+	if output != want {
+		t.Fatalf("output = %q, want %q", output, want)
+	}
+}
+
 func TestBatchContinueReportsPollOnlyWork(t *testing.T) {
 	tests := []struct {
 		name        string

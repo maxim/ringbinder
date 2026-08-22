@@ -98,7 +98,9 @@ title: Ringbinder SQLite schema
 erDiagram
     CONTENTS ||--o{ DOCUMENTS : "has file paths"
     CONTENTS ||--o{ PAGES : "has OCR pages"
+    CONTENTS ||--o{ GEMINI_BATCH_CONTENTS : "was included in jobs"
     CONTENTS ||--o{ GEMINI_BATCH_REQUESTS : "has batch page ranges"
+    GEMINI_BATCHES ||--o{ GEMINI_BATCH_CONTENTS : "records included content"
     GEMINI_BATCHES ||--o{ GEMINI_BATCH_REQUESTS : "includes while active"
     GEMINI_BATCH_REQUESTS ||--o{ GEMINI_BATCH_PAGES : "holds completed pages"
     PAGES ||..|| PAGES_FTS : "mirrors rowid"
@@ -144,6 +146,11 @@ erDiagram
         string remote_name
     }
 
+    GEMINI_BATCH_CONTENTS {
+        int batch_id FK
+        int content_id FK
+    }
+
     GEMINI_BATCH_REQUESTS {
         int id PK
         int content_id FK
@@ -168,6 +175,7 @@ A few details:
 - `pages_fts` and `pages_fts_trigram` are external-content FTS5 indexes over `pages.search_text`, maintained by the `pages_ai`, `pages_ad`, and `pages_au` triggers.
 - Most reads, searches, and listings filter out rows where `documents.deleted = 1`; those soft-deleted paths let future sweeps restore the same row if the file comes back.
 - Ringbinder keeps unfinished Gemini batch results separate from searchable pages. A document becomes searchable only after OCR has finished for every page.
+- `gemini_batch_contents` remembers which content a job touched until that job is removed, even after its request rows have been promoted into searchable pages.
 - If no indexed paths point to a file anymore, its unfinished batch work is removed. Job records remain only as long as Ringbinder needs them to check status and clean up uploaded input files and remote job resources.
 
 ## Configuration
@@ -314,13 +322,15 @@ ringbinder batch retry 83 --mode direct --model gemini
 
 `batch continue` checks every saved job once, handles any available work, and exits. It can resume an interrupted submission, download finished results, retry failed page ranges, and clean up uploaded input files and remote job resources. It does not add newly pending documents; run `batch start` for those. If Ringbinder hits an error while handling one job, it continues with the others but exits with a nonzero status. Invalid credentials or a network outage can stop the remaining online work early. For scheduled OCR after `sweep`, run `batch continue` followed by `batch start`.
 
-A document becomes searchable only after every page has finished. When a page range fails, Ringbinder may retry it, split it into smaller ranges, or report it immediately when retrying would not help. `batch failures` lists every range that needs manual attention, including any individual request that was too large to submit. `batch retry <request-id> --mode direct` processes that range immediately at the regular Gemini price. The flag is named `--mode direct` to distinguish this immediate retry from discounted batch processing. You can also rerun the whole document with `ringbinder ocr` after it is no longer attached to a batch job.
+A document becomes searchable only after every page has finished. When a page range fails, Ringbinder may retry it, split it into smaller ranges, or report it immediately when retrying would not help. `batch start`, `batch continue`, and `batch list` report how many blocked ranges and content items need attention; `batch failures` lists each range, its error, and recovery commands. Its `attempt_count` JSON field counts automatic batch retries, not the original attempt.
+
+`batch retry <request-id> --mode direct` processes one blocked range immediately at the regular Gemini price. The flag is named `--mode direct` to distinguish this immediate retry from discounted batch processing. Once a document is no longer attached to an active job, ordinary `ringbinder ocr` can instead replace the whole document, including any partially staged batch result. This also allows `ringbinder ocr --model mistral` to handle a document that Gemini repeatedly refuses, but `ocr` processes every pending content item unless you limit the run.
 
 Batch estimates are approximate for the same reasons as regular Gemini estimates. `batch continue` prints the known cost for results handled during that run. Ringbinder removes completed job history, so save this output if you need a spending record.
 
 `batch cancel` asks Gemini to stop a job. Cancellation may take time; keep running `batch continue` until it confirms the final status. Until then, `ringbinder ocr` continues to skip the documents in that job.
 
-`batch forget` removes a job from Ringbinder without contacting Gemini. Use it only as an escape hatch for a job that cannot be recovered. Gemini may keep processing and charging, and Ringbinder will no longer be able to download the results or clean up its uploaded input and remote job resource. Any unfinished page ranges then appear under `batch failures`.
+`batch forget` permanently removes a job and all saved batch OCR progress for its affected documents from Ringbinder. The documents remain pending and can be selected again by `batch start` or `ocr`.
 
 Only one command that changes OCR or batch state can run against a database at a time. A second command exits with `another OCR or batch operation is already running for this database`. Searches, reads, estimates, and failure listings remain available.
 
@@ -416,9 +426,9 @@ ringbinder batch list --model gemini --json
 ringbinder batch failures --model gemini --json
 ```
 
-`find`, `doc list`, and `batch failures` emit one NDJSON object per line. Each batch failure includes `request_id`, `paths`, one-based `page_start` and `page_end`, `attempt_count`, and `error`. `read` and `doc get` emit one JSON object.
+`find`, `doc list`, and `batch failures` emit one NDJSON object per line. Each batch failure includes `request_id`, `paths`, one-based `page_start` and `page_end`, `attempt_count`, and `error`; `attempt_count` is the number of automatic batch retries. `read` and `doc get` emit one JSON object.
 
-`batch list --json` emits one object with three fields: `batches`, `cleanup_pending`, and `refresh_errors`. If Gemini could not refresh a job's status, that job has `stale: true` and the problem appears in `refresh_errors` with `batch_id` and `message`. `batch_id` is the local job ID, or `null` when the whole refresh failed; one overall error can leave several jobs marked stale. The command prints the JSON and exits with a nonzero status when any refresh fails.
+`batch list --json` emits one object with five fields: `batches`, `blocked_requests`, `blocked_contents`, `cleanup_pending`, and `refresh_errors`. The blocked counts remain visible after completed job history has been removed. If Gemini could not refresh a job's status, that job has `stale: true` and the problem appears in `refresh_errors` with `batch_id` and `message`. `batch_id` is the local job ID, or `null` when the whole refresh failed; one overall error can leave several jobs marked stale. The command prints the JSON and exits with a nonzero status when any refresh fails.
 
 The included `SKILL.md` is an example agent skill that explains how to use Ringbinder for cited document retrieval.
 
@@ -428,7 +438,7 @@ Ringbinder keeps its index and OCR text in a local SQLite database. By default i
 
 `ringbinder ocr` sends each selected document or image to Mistral or Gemini. `batch start` uploads documents to Gemini, and `batch continue`, `list`, `cancel`, and `retry` may also contact Gemini while managing those jobs. Cost estimates stay local and offline, as do `batch failures` and `batch forget`.
 
-For batch jobs, Ringbinder creates private temporary upload files. It never copies the original document bytes into the SQLite batch-tracking tables, although completed OCR text is kept there until the whole document is ready. After processing a job, Ringbinder asks Gemini to delete the uploaded JSONL input and remote job resource. Gemini manages generated batch output under its own retention policy; its Files API only promises deletion for uploaded files. `batch continue` retries temporary cleanup failures. If Gemini permanently rejects deletion as invalid, Ringbinder warns once and stops retrying it. Ringbinder cannot clean up a job after `batch forget` because that command deliberately removes its remote details.
+For batch jobs, Ringbinder creates private temporary upload files. It never copies the original document bytes into the SQLite batch-tracking tables, although completed OCR text is kept there until the whole document is ready. After processing a job, Ringbinder asks Gemini to delete the uploaded JSONL input and remote job resource. Gemini manages generated batch output under its own retention policy; its Files API only promises deletion for uploaded files. `batch continue` retries temporary cleanup failures. If Gemini permanently rejects deletion as invalid, Ringbinder warns once and stops retrying it.
 
 If uploading a folder's documents to an OCR service is not acceptable, do not include that folder in your config.
 

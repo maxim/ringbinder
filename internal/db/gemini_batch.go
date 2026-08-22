@@ -259,8 +259,10 @@ func (db *DB) CreateGeminiBatchWork(
 			return nil, errors.New("Gemini batch must contain at least one request")
 		}
 		requestKeys := make([]string, len(creation.Requests))
+		contentIDs := make([]int64, len(creation.Requests))
 		for i, plan := range creation.Requests {
 			requestKeys[i] = plan.RequestKey
+			contentIDs[i] = plan.ContentID
 		}
 		batchID, insertErr := insertGeminiBatch(
 			tx, creation.DisplayName, creation.Model, requestKeys,
@@ -268,6 +270,9 @@ func (db *DB) CreateGeminiBatchWork(
 		)
 		if insertErr != nil {
 			return nil, insertErr
+		}
+		if err = insertGeminiBatchContents(tx, batchID, contentIDs); err != nil {
+			return nil, err
 		}
 		batchIDs = append(batchIDs, batchID)
 		for _, plan := range creation.Requests {
@@ -340,19 +345,25 @@ func (db *DB) CreateGeminiBatchForRequests(
 	defer rollbackOnError(tx, &err)
 
 	requestKeys := make([]string, 0, len(requestIDs))
+	contentIDs := make([]int64, 0, len(requestIDs))
 	for _, requestID := range requestIDs {
 		var key string
+		var contentID int64
 		if err = tx.QueryRow(
-			`SELECT request_key FROM gemini_batch_requests
+			`SELECT request_key, content_id FROM gemini_batch_requests
 			 WHERE id = ? AND state = 'retryable' AND batch_id IS NULL`,
 			requestID,
-		).Scan(&key); err != nil {
+		).Scan(&key, &contentID); err != nil {
 			return 0, fmt.Errorf("load retryable Gemini request %d: %w", requestID, err)
 		}
 		requestKeys = append(requestKeys, key)
+		contentIDs = append(contentIDs, contentID)
 	}
 	batchID, err = insertGeminiBatch(tx, displayName, model, requestKeys, inputPrice, outputPrice, replacementOf, now)
 	if err != nil {
+		return 0, err
+	}
+	if err = insertGeminiBatchContents(tx, batchID, contentIDs); err != nil {
 		return 0, err
 	}
 	stamp := now.UTC().Format(time.RFC3339Nano)
@@ -378,6 +389,23 @@ func (db *DB) CreateGeminiBatchForRequests(
 		return 0, err
 	}
 	return batchID, nil
+}
+
+func insertGeminiBatchContents(tx *sql.Tx, batchID int64, contentIDs []int64) error {
+	seen := make(map[int64]bool, len(contentIDs))
+	for _, contentID := range contentIDs {
+		if seen[contentID] {
+			continue
+		}
+		seen[contentID] = true
+		if _, err := tx.Exec(
+			`INSERT INTO gemini_batch_contents (batch_id, content_id) VALUES (?, ?)`,
+			batchID, contentID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func insertGeminiBatch(
@@ -1078,7 +1106,7 @@ func (db *DB) PromoteReadyGeminiContents() (promoted int, err error) {
 	return promoted, nil
 }
 
-func (db *DB) ReplaceContentPagesDirect(contentID int64, pages []PageInput) (err error) {
+func (db *DB) ReplaceContentPagesDirect(contentID int64, pages []PageInput, now time.Time) (err error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -1096,11 +1124,22 @@ func (db *DB) ReplaceContentPagesDirect(contentID int64, pages []PageInput) (err
 	if owned != 0 {
 		return fmt.Errorf("content %d is owned by Gemini batch OCR", contentID)
 	}
+	prepared, err := preparedGeminiBatchesForContentsTx(tx, []int64{contentID}, 0)
+	if err != nil {
+		return err
+	}
 	if err = replaceContentPagesTx(tx, contentID, pages); err != nil {
 		return err
 	}
-	// Successful whole-file direct OCR supersedes partial, unowned batch staging.
+	// Successful whole-file direct OCR supersedes partial, unowned batch staging
+	// and provenance so forgetting an older batch cannot erase the newer result.
 	if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE content_id = ?`, contentID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM gemini_batch_contents WHERE content_id = ?`, contentID); err != nil {
+		return err
+	}
+	if err = reconcilePreparedGeminiBatchesTx(tx, prepared, now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1129,24 +1168,178 @@ func replaceContentPagesTx(tx *sql.Tx, contentID int64, pages []PageInput) error
 	return err
 }
 
+func preparedGeminiBatchesForContentsTx(
+	tx *sql.Tx,
+	contentIDs []int64,
+	excludedBatchID int64,
+) (map[int64]bool, error) {
+	// Prepared manifests are still local and can be rewritten. Submitted batch
+	// manifests remain immutable so late remote output keys stay recognizable.
+	prepared := make(map[int64]bool)
+	for _, contentID := range contentIDs {
+		rows, err := tx.Query(
+			`SELECT bc.batch_id
+			 FROM gemini_batch_contents bc
+			 JOIN gemini_batches b ON b.id = bc.batch_id
+			 WHERE bc.content_id = ? AND bc.batch_id != ? AND b.state = 'prepared'`,
+			contentID, excludedBatchID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var batchID int64
+			if err = rows.Scan(&batchID); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			prepared[batchID] = true
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err = rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return prepared, nil
+}
+
+func reconcilePreparedGeminiBatchesTx(tx *sql.Tx, prepared map[int64]bool, now time.Time) error {
+	batchIDs := make([]int64, 0, len(prepared))
+	for batchID := range prepared {
+		batchIDs = append(batchIDs, batchID)
+	}
+	sort.Slice(batchIDs, func(i, j int) bool { return batchIDs[i] < batchIDs[j] })
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	for _, batchID := range batchIDs {
+		rows, err := tx.Query(
+			`SELECT request_key FROM gemini_batch_requests WHERE batch_id = ? ORDER BY id`,
+			batchID,
+		)
+		if err != nil {
+			return err
+		}
+		var keys []string
+		for rows.Next() {
+			var key string
+			if err = rows.Scan(&key); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			keys = append(keys, key)
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		if len(keys) == 0 {
+			if _, err = tx.Exec(`DELETE FROM gemini_batches WHERE id = ?`, batchID); err != nil {
+				return err
+			}
+			continue
+		}
+		manifest, err := json.Marshal(keys)
+		if err != nil {
+			return fmt.Errorf("encode remaining Gemini request manifest: %w", err)
+		}
+		if _, err = tx.Exec(
+			`UPDATE gemini_batches SET request_keys = ?, updated_at = ? WHERE id = ?`,
+			string(manifest), stamp, batchID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (db *DB) ForgetGeminiBatch(batchID int64, now time.Time) (batch *GeminiBatch, err error) {
 	batch, err = db.GetGeminiBatch(batchID)
 	if err != nil || batch == nil {
 		return batch, err
 	}
-
 	tx, err := db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer rollbackOnError(tx, &err)
-	stamp := now.UTC().Format(time.RFC3339Nano)
+
+	var provenanceComplete int
+	if err = tx.QueryRow(
+		`SELECT content_provenance_complete FROM gemini_batches WHERE id = ?`, batchID,
+	).Scan(&provenanceComplete); err != nil {
+		return nil, err
+	}
+	if provenanceComplete == 0 {
+		return nil, fmt.Errorf(
+			"Gemini batch %d predates reliable content tracking and cannot be safely forgotten",
+			batchID,
+		)
+	}
+
+	// Request rows disappear after promotion, so batch-to-content provenance
+	// remains separate until the batch itself is finalized or forgotten.
+	rows, err := tx.Query(
+		`SELECT content_id FROM gemini_batch_contents
+		 WHERE batch_id = ? ORDER BY content_id`,
+		batchID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var contentIDs []int64
+	for rows.Next() {
+		var contentID int64
+		if err = rows.Scan(&contentID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		contentIDs = append(contentIDs, contentID)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+
+	prepared, err := preparedGeminiBatchesForContentsTx(tx, contentIDs, batchID)
+	if err != nil {
+		return nil, err
+	}
+	for _, contentID := range contentIDs {
+		// Forgetting is content-wide so partial ranges cannot strand a document
+		// or keep it out of a future fresh batch. Request deletion cascades staged
+		// pages; canonical pages cover the promotion-before-finalization window.
+		if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE content_id = ?`, contentID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(`DELETE FROM pages WHERE content_id = ?`, contentID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(`DELETE FROM gemini_batch_contents WHERE content_id = ?`, contentID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(`UPDATE contents SET ocr_pending = 1 WHERE id = ?`, contentID); err != nil {
+			return nil, err
+		}
+	}
+	if err = reconcilePreparedGeminiBatchesTx(tx, prepared, now); err != nil {
+		return nil, err
+	}
+
+	// Forget intentionally abandons remote artifacts, including any queued
+	// cleanup, so later commands cannot act on resources no longer tracked.
 	if _, err = tx.Exec(
-		`UPDATE gemini_batch_requests
-		 SET previous_batch_id = batch_id, batch_id = NULL, state = 'blocked',
-		     last_error = 'batch forgotten locally', updated_at = ?
-		 WHERE batch_id = ? AND state = 'assigned'`,
-		stamp, batchID,
+		`DELETE FROM gemini_batch_cleanup
+		 WHERE (resource_kind = 'batch' AND resource_name = ?)
+		    OR (resource_kind = 'file' AND resource_name = ?)`,
+		batch.RemoteName, batch.InputFileName,
 	); err != nil {
 		return nil, err
 	}

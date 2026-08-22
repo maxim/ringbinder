@@ -97,7 +97,7 @@ var batchCancelCmd = &cobra.Command{
 
 var batchForgetCmd = &cobra.Command{
 	Use:   "forget <local-id>",
-	Short: "Forget one Gemini batch locally without remote cleanup",
+	Short: "Forget one batch and erase affected documents' progress",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runBatchForget,
 }

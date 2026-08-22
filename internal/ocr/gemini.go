@@ -917,7 +917,10 @@ type geminiVisual struct {
 type geminiFinishError struct{ reason string }
 
 func (e *geminiFinishError) Error() string {
-	return fmt.Sprintf("invalid Gemini finish reason: %s", e.reason)
+	if e.reason == "RECITATION" {
+		return "Gemini stopped generation for potential recitation (RECITATION)"
+	}
+	return fmt.Sprintf("Gemini stopped generation with finish reason %s", e.reason)
 }
 func isGeminiMaxTokens(err error) bool {
 	var finish *geminiFinishError

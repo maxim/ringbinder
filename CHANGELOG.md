@@ -9,7 +9,7 @@ Notable changes to Ringbinder are documented here.
 - Opt-in Gemini OCR with structured searchable page and visual descriptions, provider-specific concurrency, retries, PDF chunking, and actual usage-based run cost reporting.
 - Provider selection through `--model mistral|gemini` or config, plus offline provider-specific cost estimates.
 - Bounded `cost --limit N` estimates and matching `ocr --limit N` batches for reviewing spend incrementally.
-- Explicit discounted Gemini batch OCR under `ringbinder batch`, with durable restart recovery, status/cancel/forget commands, partial-range staging and direct-only blocked-range retry, frozen usage billing, remote cleanup, machine-readable status/failures, and fail-fast per-database OCR coordination.
+- Explicit discounted Gemini batch OCR under `ringbinder batch`, with durable restart recovery, status/cancel/forget commands, visible blocked-work summaries, partial-range staging and direct-only blocked-range retry, frozen usage billing, remote cleanup, machine-readable status/failures, and fail-fast per-database OCR coordination.
 - Configurable sweep concurrency through `sweep_concurrency`; `sweep --concurrency` still takes precedence.
 
 ### Changed

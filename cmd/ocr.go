@@ -189,7 +189,7 @@ func processOCR(ctx context.Context, database *db.DB, provider ocr.Provider, lim
 			}
 
 			err = replacePagesWhileActive(ctx, &writeMu, func() error {
-				return database.ReplaceContentPagesDirect(job.content.ID, pageInputs)
+				return database.ReplaceContentPagesDirect(job.content.ID, pageInputs, time.Now().UTC())
 			})
 			if err != nil {
 				tracker.WorkerError(slotID, err)

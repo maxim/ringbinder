@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/maxim/ringbinder/internal/db"
 	"github.com/spf13/cobra"
 )
 
@@ -16,6 +17,59 @@ type batchFailureOutput struct {
 	PageEnd      int      `json:"page_end"`
 	AttemptCount int      `json:"attempt_count"`
 	Error        string   `json:"error"`
+}
+
+type batchBlockedSummary struct {
+	Requests int
+	Contents int
+}
+
+func loadBatchBlockedSummary(database *db.DB) (batchBlockedSummary, error) {
+	requests, err := database.BlockedGeminiRequests()
+	if err != nil {
+		return batchBlockedSummary{}, err
+	}
+	contents := make(map[int64]struct{}, len(requests))
+	for _, request := range requests {
+		contents[request.ContentID] = struct{}{}
+	}
+	return batchBlockedSummary{Requests: len(requests), Contents: len(contents)}, nil
+}
+
+func reportBatchBlockedSummary(database *db.DB) error {
+	summary, err := loadBatchBlockedSummary(database)
+	if err != nil {
+		return fmt.Errorf("summarize blocked Gemini requests: %w", err)
+	}
+	printBatchBlockedSummary(summary)
+	return nil
+}
+
+func printBatchBlockedSummary(summary batchBlockedSummary) {
+	if summary.Requests == 0 {
+		return
+	}
+	rangeLabel := "ranges"
+	if summary.Requests == 1 {
+		rangeLabel = "range"
+	}
+	contentLabel := "content items"
+	if summary.Contents == 1 {
+		contentLabel = "content item"
+	}
+	verb := "require"
+	if summary.Requests == 1 {
+		verb = "requires"
+	}
+	fmt.Printf(
+		"%d blocked Gemini batch OCR page %s across %d %s %s attention.\n",
+		summary.Requests,
+		rangeLabel,
+		summary.Contents,
+		contentLabel,
+		verb,
+	)
+	fmt.Println("Run `ringbinder batch failures` for details and recovery commands.")
 }
 
 func runBatchFailures(cmd *cobra.Command, args []string) error {
@@ -52,7 +106,7 @@ func runBatchFailures(cmd *cobra.Command, args []string) error {
 			PageStart:    request.PageStart + 1,
 			PageEnd:      request.PageEnd,
 			AttemptCount: request.AttemptCount,
-			Error:        request.LastError,
+			Error:        explainGeminiFailure(request.LastError),
 		}
 		if jsonOutput {
 			if err := encoder.Encode(output); err != nil {
@@ -61,7 +115,7 @@ func runBatchFailures(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		fmt.Printf(
-			"Request %d\t%s\tpages %s\tattempts %d\t%s\n",
+			"Request %d\t%s\tpages %s\tautomatic retries %d\t%s\n",
 			output.RequestID,
 			strings.Join(output.Paths, ", "),
 			formatAbsolutePageRange(output.PageStart, output.PageEnd),
@@ -69,7 +123,22 @@ func runBatchFailures(cmd *cobra.Command, args []string) error {
 			output.Error,
 		)
 	}
+	if !jsonOutput {
+		fmt.Println()
+		fmt.Println("Recovery commands:")
+		fmt.Println("  Retry one range at direct Gemini pricing: ringbinder batch retry <request-id> --mode direct --model gemini")
+		fmt.Println("  Retry all pending documents with Mistral: ringbinder ocr --model mistral")
+	}
 	return nil
+}
+
+func explainGeminiFailure(message string) string {
+	// Earlier builds persisted this terse decoder error, so clarify existing
+	// database rows as well as failures recorded with the current wording.
+	if message == "invalid Gemini finish reason: RECITATION" {
+		return "Gemini stopped generation for potential recitation (RECITATION)"
+	}
+	return message
 }
 
 func formatAbsolutePageRange(start, end int) string {

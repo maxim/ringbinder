@@ -393,6 +393,15 @@ func TestGeminiDecodeRejectsCandidateFinishAndVisuals(t *testing.T) {
 	}
 }
 
+func TestGeminiDecodeExplainsRecitationFinishReason(t *testing.T) {
+	response := geminiResponseJSON("RECITATION", `{"pages":[]}`, 1, 0, 0)
+	_, err := decodeGeminiResults([]byte(response), 1)
+	want := "Gemini stopped generation for potential recitation (RECITATION)"
+	if err == nil || err.Error() != want {
+		t.Fatalf("decodeGeminiResults() error = %v, want %q", err, want)
+	}
+}
+
 func geminiPagesPayload(count int) string {
 	pages := make([]map[string]any, count)
 	for index := range pages {

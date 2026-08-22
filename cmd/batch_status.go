@@ -33,9 +33,11 @@ type batchRefreshError struct {
 }
 
 type batchListEnvelope struct {
-	Batches        []batchListItem     `json:"batches"`
-	CleanupPending int                 `json:"cleanup_pending"`
-	RefreshErrors  []batchRefreshError `json:"refresh_errors"`
+	Batches         []batchListItem     `json:"batches"`
+	BlockedRequests int                 `json:"blocked_requests"`
+	BlockedContents int                 `json:"blocked_contents"`
+	CleanupPending  int                 `json:"cleanup_pending"`
+	RefreshErrors   []batchRefreshError `json:"refresh_errors"`
 }
 
 func runBatchList(cmd *cobra.Command, args []string) error {
@@ -107,10 +109,16 @@ func runBatchList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("count Gemini cleanup: %w", err)
 	}
+	blockedSummary, err := loadBatchBlockedSummary(command.database)
+	if err != nil {
+		return fmt.Errorf("summarize blocked Gemini requests: %w", err)
+	}
 	envelope := batchListEnvelope{
-		Batches:        make([]batchListItem, 0, len(batches)),
-		CleanupPending: cleanup,
-		RefreshErrors:  refreshErrors,
+		Batches:         make([]batchListItem, 0, len(batches)),
+		BlockedRequests: blockedSummary.Requests,
+		BlockedContents: blockedSummary.Contents,
+		CleanupPending:  cleanup,
+		RefreshErrors:   refreshErrors,
 	}
 	for _, batch := range batches {
 		requests, queryErr := command.database.GeminiRequestsForBatch(batch.ID)
@@ -143,7 +151,7 @@ func runBatchList(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	} else {
-		if len(envelope.Batches) == 0 {
+		if len(envelope.Batches) == 0 && blockedSummary.Requests == 0 {
 			fmt.Println("No tracked Gemini batches.")
 		}
 		for _, batch := range envelope.Batches {
@@ -159,6 +167,7 @@ func runBatchList(cmd *cobra.Command, args []string) error {
 		if cleanup > 0 {
 			fmt.Printf("%d remote cleanup pending\n", cleanup)
 		}
+		printBatchBlockedSummary(blockedSummary)
 	}
 	if len(refreshErrors) > 0 {
 		return errors.New("one or more Gemini batch refreshes failed")
@@ -221,8 +230,7 @@ func runBatchForget(cmd *cobra.Command, args []string) error {
 	if batch == nil {
 		return fmt.Errorf("Gemini batch %d not found", batchID)
 	}
-	fmt.Printf("Forgot Gemini batch %d locally. Its unfinished ranges are blocked and available for explicit direct retry.\n", batchID)
-	fmt.Fprintln(os.Stderr, "warning: Gemini may continue processing and charging; Ringbinder will never import or clean this batch's remote artifacts, which remain until Gemini expires them")
+	fmt.Printf("Forgot Gemini batch %d and erased saved OCR progress for its affected documents.\n", batchID)
 	return nil
 }
 

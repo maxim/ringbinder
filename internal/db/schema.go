@@ -1,6 +1,6 @@
 package db
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS contents (
@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS gemini_batches (
     last_error        TEXT    NOT NULL DEFAULT '',
     created_at        TEXT    NOT NULL,
     updated_at        TEXT    NOT NULL,
+    content_provenance_complete INTEGER NOT NULL DEFAULT 1
+        CHECK (content_provenance_complete IN (0, 1)),
     CHECK (state NOT IN ('uploaded', 'submission_unknown') OR input_file_name IS NOT NULL),
     CHECK (state NOT IN ('pending', 'running', 'cancelling', 'succeeded',
                          'failed', 'cancelled', 'expired') OR remote_name IS NOT NULL)
@@ -94,6 +96,15 @@ CREATE TABLE IF NOT EXISTS gemini_batches (
 
 CREATE INDEX IF NOT EXISTS idx_gemini_batches_state
     ON gemini_batches(state);
+
+CREATE TABLE IF NOT EXISTS gemini_batch_contents (
+    batch_id   INTEGER NOT NULL REFERENCES gemini_batches(id) ON DELETE CASCADE,
+    content_id INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+    PRIMARY KEY(batch_id, content_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gemini_batch_contents_content
+    ON gemini_batch_contents(content_id);
 
 CREATE TABLE IF NOT EXISTS gemini_batch_requests (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,6 +237,50 @@ CREATE TABLE gemini_batch_cleanup (
     created_at     TEXT    NOT NULL,
     updated_at     TEXT    NOT NULL,
     UNIQUE(resource_kind, resource_name)
+);
+`
+
+const schemaV3ToV4SQL = `
+ALTER TABLE gemini_batches ADD COLUMN content_provenance_complete INTEGER NOT NULL DEFAULT 1
+    CHECK (content_provenance_complete IN (0, 1));
+
+CREATE TABLE gemini_batch_contents (
+    batch_id   INTEGER NOT NULL REFERENCES gemini_batches(id) ON DELETE CASCADE,
+    content_id INTEGER NOT NULL REFERENCES contents(id) ON DELETE CASCADE,
+    PRIMARY KEY(batch_id, content_id)
+);
+
+CREATE INDEX idx_gemini_batch_contents_content
+    ON gemini_batch_contents(content_id);
+
+INSERT OR IGNORE INTO gemini_batch_contents (batch_id, content_id)
+-- Requests still assigned to their current batch.
+SELECT b.id, r.content_id
+FROM gemini_batches b
+JOIN gemini_batch_requests r ON r.batch_id = b.id
+UNION
+-- Retryable, blocked, or split requests detached from their previous batch.
+SELECT b.id, r.content_id
+FROM gemini_batches b
+JOIN gemini_batch_requests r ON r.previous_batch_id = b.id
+UNION
+-- Staged requests detach without recording previous_batch_id, but retain keys.
+SELECT b.id, r.content_id
+FROM gemini_batches b
+CROSS JOIN json_each(b.request_keys) k
+JOIN gemini_batch_requests r ON r.request_key = k.value;
+
+-- A missing original key may represent promoted or orphaned content whose
+-- identity v3 no longer retains. Split descendants are also conservative: an
+-- incomplete flag is safer than erasing content that cannot be reconstructed.
+UPDATE gemini_batches
+SET content_provenance_complete = 0
+WHERE EXISTS (
+    SELECT 1
+    FROM json_each(gemini_batches.request_keys) k
+    WHERE NOT EXISTS (
+        SELECT 1 FROM gemini_batch_requests r WHERE r.request_key = k.value
+    )
 );
 `
 

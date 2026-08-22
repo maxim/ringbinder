@@ -72,7 +72,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 	}
 	if len(contents) == 0 {
 		fmt.Println("No untouched documents pending Gemini batch OCR.")
-		return nil
+		return reportBatchBlockedSummary(command.database)
 	}
 
 	planner := ocr.NewGeminiClient("", time.Now().UTC())
@@ -204,6 +204,9 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		if len(commandErrors) == 0 {
 			fmt.Println("No valid untouched documents could be prepared for Gemini batch OCR.")
 		}
+		if summaryErr := reportBatchBlockedSummary(command.database); summaryErr != nil {
+			commandErrors = append(commandErrors, summaryErr)
+		}
 		return errors.Join(commandErrors...)
 	}
 
@@ -241,6 +244,9 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		if cmd.Context().Err() != nil || ocr.IsGeminiGlobalFailure(uploadErr) {
 			break
 		}
+	}
+	if summaryErr := reportBatchBlockedSummary(command.database); summaryErr != nil {
+		commandErrors = append(commandErrors, summaryErr)
 	}
 	return errors.Join(commandErrors...)
 }

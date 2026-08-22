@@ -135,6 +135,10 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 		}
 		commandErrors = append(commandErrors, cleanupErrors...)
 	}
+	blockedSummary, summaryErr := loadBatchBlockedSummary(command.database)
+	if summaryErr != nil {
+		commandErrors = append(commandErrors, fmt.Errorf("summarize blocked Gemini requests: %w", summaryErr))
+	}
 
 	if totals.accounted {
 		if totals.billing.Indeterminate {
@@ -144,9 +148,9 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if len(commandErrors) == 0 && !didWork {
-		if len(batches) == 0 {
+		if len(batches) == 0 && blockedSummary.Requests == 0 {
 			fmt.Println("No tracked Gemini batch work to continue.")
-		} else if pollOnlyBatches == len(batches) {
+		} else if pollOnlyBatches == len(batches) && len(batches) > 0 {
 			batchLabel := "batches"
 			if len(batches) == 1 {
 				batchLabel = "batch"
@@ -154,6 +158,7 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Checked %d Gemini %s; nothing ready to process.\n", len(batches), batchLabel)
 		}
 	}
+	printBatchBlockedSummary(blockedSummary)
 	if len(commandErrors) > 0 {
 		fmt.Fprintf(os.Stderr, "warning: batch continue completed with %d error(s)\n", len(commandErrors))
 	}

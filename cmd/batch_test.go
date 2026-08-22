@@ -412,6 +412,55 @@ func TestBatchStartCancellationDoesNotPersistPreparedWork(t *testing.T) {
 	}
 }
 
+func TestBatchStartReportsExistingBlockedWorkWhenUntouchedFilesCannotBePrepared(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	dbPath := filepath.Join(t.TempDir(), "start-blocked.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedID := addCostContent(t, database, "blocked", 1, true, "/docs/blocked.png")
+	if _, err := database.CreateBlockedGeminiRequest(
+		db.GeminiRequestPlan{
+			ContentID: blockedID, RequestKey: "blocked-key",
+			FileType: "png", PageStart: 0, PageEnd: 1,
+		},
+		"failed",
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	addCostContent(t, database, "missing", 1, true, "/docs/missing.png")
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := commandWithDatabaseFlag(t, dbPath)
+	cmd.Flags().String("model", "", "")
+	cmd.Flags().Int("limit", 0, "")
+	if err := cmd.Flags().Set("model", modelGemini); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	var output string
+	_ = captureStderr(t, func() {
+		output = captureStdout(t, func() { runErr = runBatchStart(cmd, nil) })
+	})
+	if runErr != nil {
+		t.Fatalf("runBatchStart() error = %v", runErr)
+	}
+	for _, want := range []string{
+		"No valid untouched documents could be prepared for Gemini batch OCR.",
+		"1 blocked Gemini batch OCR page range across 1 content item requires attention.",
+		"ringbinder batch failures",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, want %q", output, want)
+		}
+	}
+}
+
 func TestBatchFailuresIsLocalOnlyNDJSON(t *testing.T) {
 	resetCommandState(t)
 	t.Setenv("GEMINI_API_KEY", "")
@@ -423,10 +472,15 @@ func TestBatchFailuresIsLocalOnlyNDJSON(t *testing.T) {
 	contentID := addCostContent(t, database, "failure", 2, true, "/docs/failure.pdf")
 	requestID, err := database.CreateBlockedGeminiRequest(
 		db.GeminiRequestPlan{ContentID: contentID, RequestKey: "failure-key", FileType: "pdf", PageStart: 0, PageEnd: 2},
-		"invalid output", time.Now().UTC(),
+		"invalid Gemini finish reason: RECITATION", time.Now().UTC(),
 	)
 	if err != nil {
 		t.Fatalf("CreateBlockedGeminiRequest() error = %v", err)
+	}
+	if _, err := database.Exec(
+		`UPDATE gemini_batch_requests SET attempt_count = 1 WHERE id = ?`, requestID,
+	); err != nil {
+		t.Fatalf("set automatic retry count: %v", err)
 	}
 	_ = database.Close()
 
@@ -446,7 +500,9 @@ func TestBatchFailuresIsLocalOnlyNDJSON(t *testing.T) {
 	})
 	if !strings.Contains(output, `"request_id":`+strconv.FormatInt(requestID, 10)) ||
 		!strings.Contains(output, `"paths":["/docs/failure.pdf"]`) ||
-		!strings.Contains(output, `"page_start":1`) || !strings.Contains(output, `"page_end":2`) {
+		!strings.Contains(output, `"page_start":1`) || !strings.Contains(output, `"page_end":2`) ||
+		!strings.Contains(output, `"attempt_count":1`) ||
+		!strings.Contains(output, `"error":"Gemini stopped generation for potential recitation (RECITATION)"`) {
 		t.Fatalf("NDJSON output = %q", output)
 	}
 
@@ -467,6 +523,27 @@ func TestBatchFailuresIsLocalOnlyNDJSON(t *testing.T) {
 	})
 	if !strings.Contains(output, `"paths":[]`) {
 		t.Fatalf("NDJSON output = %q, want empty paths array", output)
+	}
+
+	if err := cmd.Flags().Set("json", "false"); err != nil {
+		t.Fatalf("unset json: %v", err)
+	}
+	output = captureStdout(t, func() {
+		if err := runBatchFailures(cmd, nil); err != nil {
+			t.Fatalf("runBatchFailures() error = %v", err)
+		}
+	})
+	for _, want := range []string{
+		"automatic retries 1",
+		"ringbinder batch retry <request-id> --mode direct",
+		"ringbinder ocr --model mistral",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("human output = %q, want %q", output, want)
+		}
+	}
+	if strings.Contains(output, "batch discard") {
+		t.Fatalf("human output still recommends removed discard command: %q", output)
 	}
 }
 

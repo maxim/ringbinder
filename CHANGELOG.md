@@ -14,6 +14,8 @@ Notable changes to Ringbinder are documented here.
 
 ### Changed
 
+- Eligible complete Gemini PDFs are now uploaded byte-for-byte unchanged, avoiding unnecessary local extraction and reducing exposure to parser failures. Larger documents and partial ranges still require extraction, so the fast path does not bypass parser failures in those cases.
+- A rejected original Gemini PDF switches to extracted bytes only when a multi-page HTTP 413 or `MAX_TOKENS` response can be split. One-page adaptive failures and all non-adaptive failures, including `INVALID_ARGUMENT`, do not retry a normalized representation; the existing batch retry policy may resubmit the same raw body once.
 - `sweep` now reads config when paths and `--database` are explicit unless `--concurrency` is also explicit, allowing `sweep_concurrency` to override the default.
 - Removed `--redo` from `sweep`, `cost`, and `ocr`; full OCR rebuilds now use a separate database so the active index remains available for rollback.
 

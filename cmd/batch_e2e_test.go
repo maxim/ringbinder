@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 type fakeGeminiBatchAPI struct {
 	requestKey            string
+	uploadBodies          [][]byte
 	state                 string
 	output                []byte
 	deleted               []string
@@ -51,10 +53,15 @@ func (api *fakeGeminiBatchAPI) UploadJSONL(_ context.Context, _ string, source i
 	if err != nil {
 		return ocr.GeminiRemoteFile{}, err
 	}
+	api.uploadBodies = append(api.uploadBodies, bytes.Clone(body))
+	firstLine := body
+	if newline := bytes.IndexByte(body, '\n'); newline >= 0 {
+		firstLine = body[:newline]
+	}
 	var line struct {
 		Key string `json:"key"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(string(body))), &line); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(firstLine), &line); err != nil {
 		return ocr.GeminiRemoteFile{}, err
 	}
 	api.requestKey = line.Key

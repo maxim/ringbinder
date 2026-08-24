@@ -238,6 +238,10 @@ func (c *GeminiClient) PrepareRangeRequest(
 		return c.prepareImageRequest(ctx, filePath, fileType, info.Size())
 	}
 
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return GeminiPreparedRequest{}, fmt.Errorf("stat file: %w", err)
+	}
 	f, err := os.Open(filePath)
 	if err != nil {
 		return GeminiPreparedRequest{}, fmt.Errorf("open file: %w", err)
@@ -249,6 +253,17 @@ func (c *GeminiClient) PrepareRangeRequest(
 	}
 	if end > pages {
 		return GeminiPreparedRequest{}, fmt.Errorf("planned page range exceeds current PDF page count %d", pages)
+	}
+	chunk, original, err := c.originalPDFChunk(ctx, f, info.Size(), pages, start, end)
+	if err != nil {
+		return GeminiPreparedRequest{}, err
+	}
+	if original {
+		body, err := c.buildRequestBody(chunk.data, "pdf", end-start)
+		if err != nil {
+			return GeminiPreparedRequest{}, err
+		}
+		return GeminiPreparedRequest{PageStart: start, PageEnd: end, Body: body}, nil
 	}
 	limit, err := c.effectiveDecodedLimit("pdf")
 	if err != nil {
@@ -497,7 +512,54 @@ func (c *GeminiClient) shouldSplitPDF(err error, pageCount int) bool {
 	return isPayloadTooLarge(err) || isGeminiMaxTokens(err)
 }
 
+func (c *GeminiClient) originalPDFChunk(
+	ctx context.Context,
+	source io.ReadSeeker,
+	sourceSize int64,
+	totalPages, start, end int,
+) (pdfChunk, bool, error) {
+	if totalPages < 1 || totalPages > c.pageLimitValue() || start != 0 || end != totalPages {
+		return pdfChunk{}, false, nil
+	}
+	limit, err := c.effectiveDecodedLimit("pdf")
+	if err != nil {
+		return pdfChunk{}, false, err
+	}
+	if sourceSize > int64(limit) {
+		return pdfChunk{}, false, nil
+	}
+	data, tooLarge, err := readLimited(ctx, source, limit)
+	if err != nil {
+		return pdfChunk{}, false, err
+	}
+	// readLimited leaves successful reads at EOF. Later adaptive extraction is
+	// safe because internal/pdf.readContext rewinds; post-read misses rewind here
+	// defensively before returning to the extraction planner.
+	rewindMiss := func() (pdfChunk, bool, error) {
+		if _, err := source.Seek(0, io.SeekStart); err != nil {
+			return pdfChunk{}, false, err
+		}
+		return pdfChunk{}, false, nil
+	}
+	if tooLarge {
+		return rewindMiss()
+	}
+	size, err := c.requestBodySize(len(data), "pdf", totalPages)
+	if err != nil {
+		return pdfChunk{}, false, err
+	}
+	if size > c.requestLimit() {
+		return rewindMiss()
+	}
+	return pdfChunk{start: 0, end: totalPages, data: data}, true, nil
+}
+
 func (c *GeminiClient) planPDFChunk(ctx context.Context, source io.ReadSeeker, sourceSize int64, totalPages, start, intervalEnd int) (pdfChunk, error) {
+	if chunk, original, err := c.originalPDFChunk(ctx, source, sourceSize, totalPages, start, intervalEnd); err != nil {
+		return pdfChunk{}, err
+	} else if original {
+		return chunk, nil
+	}
 	maxEnd := min(intervalEnd, start+c.pageLimitValue())
 	limit, err := c.effectiveDecodedLimit("pdf")
 	if err != nil {

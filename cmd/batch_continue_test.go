@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"github.com/maxim/ringbinder/internal/checksum"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
+	pdfutil "github.com/maxim/ringbinder/internal/pdf"
 	"github.com/spf13/cobra"
 )
 
@@ -379,26 +381,300 @@ func TestAccountGeminiOutputRejectsDuplicateAndRetriesOnce(t *testing.T) {
 	}
 }
 
-func TestAccountGeminiOutputSplitsOnlyFailedRange(t *testing.T) {
-	database, batch, request := createOutputTestBatch(t, 0, 4)
+func TestAccountGeminiOutputSplitsAdaptiveRequestErrors(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		code    int
+		status  string
+		message string
+	}{
+		{name: "HTTP 413", code: 413, status: "INVALID_ARGUMENT", message: "payload too large"},
+		{name: "MAX_TOKENS", code: 400, status: "INVALID_ARGUMENT", message: "MAX_TOKENS"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, batch, request := createOutputTestBatch(t, 0, 4)
+			line := []byte(fmt.Sprintf(
+				`{"key":%q,"error":{"code":%d,"status":%q,"message":%q}}`+"\n",
+				request.RequestKey, test.code, test.status, test.message,
+			))
+			var totals batchContinueTotals
+			if err := accountGeminiOutput(bytes.NewReader(line), database, batch, &totals); err != nil {
+				t.Fatalf("accountGeminiOutput() error = %v", err)
+			}
+			if got, err := database.GeminiRequestByID(request.ID); err != nil || got != nil {
+				t.Fatalf("parent request = %+v, err %v, want deleted", got, err)
+			}
+			retryable, err := database.RetryableGeminiRequests()
+			if err != nil {
+				t.Fatalf("RetryableGeminiRequests() error = %v", err)
+			}
+			if len(retryable) != 2 || retryable[0].PageStart != 0 || retryable[0].PageEnd != 2 ||
+				retryable[1].PageStart != 2 || retryable[1].PageEnd != 4 || retryable[0].AttemptCount != 0 {
+				t.Fatalf("split requests = %+v", retryable)
+			}
+			if !totals.accounted || !totals.billing.Indeterminate {
+				t.Fatalf("totals = %+v, want indeterminate failed request", totals)
+			}
+		})
+	}
+}
+
+func TestGeminiAdaptiveBatchFailureRegeneratesExtractedChildren(t *testing.T) {
+	ctx := context.Background()
+	labels := []string{"one", "two", "three", "four"}
+	original := commandTestPDF(labels...)
+	path := filepath.Join(t.TempDir(), "four-pages.pdf")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := checksum.SHA256File(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(filepath.Join(t.TempDir(), "adaptive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	contentID, err := database.InsertContent(digest, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	const inputPrice, outputPrice = int64(3), int64(7)
+	batchID, err := database.CreateGeminiBatch(
+		"original-backed", ocr.GeminiBatchModel, inputPrice, outputPrice, nil,
+		[]db.GeminiRequestPlan{{
+			ContentID: contentID, RequestKey: "original-key", FileType: "pdf", PageStart: 0, PageEnd: 4,
+		}},
+		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := database.GetGeminiBatch(batchID)
+	if err != nil || batch == nil {
+		t.Fatalf("GetGeminiBatch() = %+v, %v", batch, err)
+	}
+	requests, err := database.GeminiRequestsForBatch(batchID)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("GeminiRequestsForBatch() = %+v, %v", requests, err)
+	}
+
+	planner := ocr.NewGeminiClient("", now)
+	prepared, err := planner.PrepareRangeRequest(ctx, path, "pdf", 0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialLine, err := marshalGeminiBatchLine(requests[0].RequestKey, prepared.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := decodeUploadedGeminiInputs(t, initialLine)[requests[0].RequestKey]
+	if !bytes.Equal(initial.data, original) || initial.pages != 4 {
+		t.Fatalf("initial input = %d bytes/%d pages, want unchanged %d-byte four-page PDF", len(initial.data), initial.pages, len(original))
+	}
+
+	output := geminiMaxTokensOutputLine(t, requests[0].RequestKey, 10, 20, 5)
+	var totals batchContinueTotals
+	if err := accountGeminiOutput(bytes.NewReader(output), database, *batch, &totals); err != nil {
+		t.Fatal(err)
+	}
+	wantCost := ocr.Currency(10*inputPrice + 25*outputPrice)
+	if !totals.accounted || totals.billing.Indeterminate || totals.billing.KnownCost != wantCost {
+		t.Fatalf("failed-attempt billing = %+v, want frozen known cost %d", totals, wantCost)
+	}
+	retryable, err := database.RetryableGeminiRequests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retryable) != 2 || retryable[0].PageStart != 0 || retryable[0].PageEnd != 2 ||
+		retryable[1].PageStart != 2 || retryable[1].PageEnd != 4 {
+		t.Fatalf("durable split ranges = %+v, want [0,2) and [2,4)", retryable)
+	}
+	if _, err := database.FinalizeGeminiBatch(batchID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &fakeGeminiBatchAPI{}
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	var found bool
+	var submitErrors []error
+	_ = captureStdout(t, func() {
+		found, submitErrors = submitRetryableGeminiRequests(cmd, database, api, planner)
+	})
+	if !found || len(submitErrors) != 0 {
+		t.Fatalf("submitRetryableGeminiRequests() = (%t, %v)", found, submitErrors)
+	}
+	if len(api.uploadBodies) != 1 {
+		t.Fatalf("uploads = %d, want one replacement input", len(api.uploadBodies))
+	}
+	batches, err := database.ListGeminiBatches()
+	if err != nil || len(batches) != 1 {
+		t.Fatalf("ListGeminiBatches() = %+v, %v", batches, err)
+	}
+	children, err := database.GeminiRequestsForBatch(batches[0].ID)
+	if err != nil || len(children) != 2 {
+		t.Fatalf("replacement requests = %+v, %v", children, err)
+	}
+	uploaded := decodeUploadedGeminiInputs(t, api.uploadBodies[0])
+	for _, child := range children {
+		if child.ContentID != contentID || child.Checksum != digest || child.Path != path || child.PageCount != 4 {
+			t.Fatalf("child identity = %+v, want original content, checksum, path, and page count", child)
+		}
+		if child.AttemptCount != 0 || child.InputTokens != nil || child.OutputTokens != nil ||
+			child.KnownCost != 0 || child.CostIndeterminate {
+			t.Fatalf("child billing/retry state = %+v, want fresh split child", child)
+		}
+		got, exists := uploaded[child.RequestKey]
+		if !exists || got.pages != child.PageEnd-child.PageStart {
+			t.Fatalf("uploaded child %q = %+v, want matching schema", child.RequestKey, got)
+		}
+		pageCount, err := pdfutil.PageCountContext(ctx, bytes.NewReader(got.data))
+		if err != nil || pageCount != child.PageEnd-child.PageStart || bytes.Equal(got.data, original) {
+			t.Fatalf("uploaded child %d-%d is not a valid extracted subset: pages %d, error %v", child.PageStart, child.PageEnd, pageCount, err)
+		}
+		for index, label := range labels {
+			present := bytes.Contains(got.data, []byte("("+label+") Tj"))
+			wantPresent := index >= child.PageStart && index < child.PageEnd
+			if present != wantPresent {
+				t.Fatalf("uploaded child %d-%d label %q present = %t, want %t", child.PageStart, child.PageEnd, label, present, wantPresent)
+			}
+		}
+	}
+
+	if _, err := database.DetachGeminiBatchForReplacement(batches[0].ID, "checksum check", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.FinalizeGeminiBatch(batches[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(bytes.Clone(original), 'x'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = captureStdout(t, func() {
+		found, submitErrors = submitRetryableGeminiRequests(cmd, database, api, planner)
+	})
+	if !found || len(submitErrors) != 0 || len(api.uploadBodies) != 1 {
+		t.Fatalf("checksum-mismatch submission = (%t, %v), uploads %d; want blocked without upload", found, submitErrors, len(api.uploadBodies))
+	}
+	for _, child := range children {
+		stored, err := database.GeminiRequestByID(child.ID)
+		if err != nil || stored == nil || stored.State != db.GeminiRequestBlocked {
+			t.Fatalf("checksum-mismatched child = %+v, %v; want blocked", stored, err)
+		}
+	}
+}
+
+func TestGeminiOnePageBatchMaxTokensRetriesSameOriginalThenBlocks(t *testing.T) {
+	ctx := context.Background()
+	original := commandTestPDF("only")
+	path := filepath.Join(t.TempDir(), "one-page.pdf")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := checksum.SHA256File(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(filepath.Join(t.TempDir(), "one-page.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	contentID, err := database.InsertContent(digest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	batchID, err := database.CreateGeminiBatch(
+		"one-page", ocr.GeminiBatchModel, 3, 7, nil,
+		[]db.GeminiRequestPlan{{
+			ContentID: contentID, RequestKey: "one-page-key", FileType: "pdf", PageStart: 0, PageEnd: 1,
+		}},
+		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := database.GetGeminiBatch(batchID)
+	if err != nil || batch == nil {
+		t.Fatalf("GetGeminiBatch() = %+v, %v", batch, err)
+	}
+	requests, err := database.GeminiRequestsForBatch(batchID)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("GeminiRequestsForBatch() = %+v, %v", requests, err)
+	}
+	firstOutput := geminiMaxTokensOutputLine(t, requests[0].RequestKey, 2, 1, 1)
+	var totals batchContinueTotals
+	if err := accountGeminiOutput(bytes.NewReader(firstOutput), database, *batch, &totals); err != nil {
+		t.Fatal(err)
+	}
+	retryable, err := database.GeminiRequestByID(requests[0].ID)
+	if err != nil || retryable == nil || retryable.State != db.GeminiRequestRetryable || retryable.AttemptCount != 1 {
+		t.Fatalf("first MAX_TOKENS request = %+v, %v; want one retry", retryable, err)
+	}
+	if _, err := database.FinalizeGeminiBatch(batchID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &fakeGeminiBatchAPI{}
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	planner := ocr.NewGeminiClient("", now)
+	var found bool
+	var submitErrors []error
+	_ = captureStdout(t, func() {
+		found, submitErrors = submitRetryableGeminiRequests(cmd, database, api, planner)
+	})
+	if !found || len(submitErrors) != 0 || len(api.uploadBodies) != 1 {
+		t.Fatalf("retry submission = (%t, %v), uploads %d", found, submitErrors, len(api.uploadBodies))
+	}
+	uploaded := decodeUploadedGeminiInputs(t, api.uploadBodies[0])[requests[0].RequestKey]
+	if !bytes.Equal(uploaded.data, original) || uploaded.pages != 1 {
+		t.Fatalf("retry input = %d bytes/%d pages, want unchanged one-page original", len(uploaded.data), uploaded.pages)
+	}
+	batches, err := database.ListGeminiBatches()
+	if err != nil || len(batches) != 1 {
+		t.Fatalf("ListGeminiBatches() = %+v, %v", batches, err)
+	}
+	assigned, err := database.GeminiRequestsForBatch(batches[0].ID)
+	if err != nil || len(assigned) != 1 || assigned[0].AttemptCount != 1 {
+		t.Fatalf("replacement request = %+v, %v", assigned, err)
+	}
+	secondOutput := geminiMaxTokensOutputLine(t, assigned[0].RequestKey, 2, 1, 1)
+	if err := accountGeminiOutput(bytes.NewReader(secondOutput), database, batches[0], &totals); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := database.GeminiRequestByID(assigned[0].ID)
+	if err != nil || blocked == nil || blocked.State != db.GeminiRequestBlocked || blocked.BatchID != nil {
+		t.Fatalf("second MAX_TOKENS request = %+v, %v; want detached block", blocked, err)
+	}
+}
+
+func TestGeminiOnePageBatch413BlocksWithoutRetry(t *testing.T) {
+	database, batch, request := createOutputTestBatch(t, 0, 1)
 	line := []byte(fmt.Sprintf(
-		`{"key":%q,"error":{"code":400,"status":"INVALID_ARGUMENT","message":"MAX_TOKENS"}}`+"\n",
+		`{"key":%q,"error":{"code":413,"status":"INVALID_ARGUMENT","message":"payload too large"}}`+"\n",
 		request.RequestKey,
 	))
 	var totals batchContinueTotals
 	if err := accountGeminiOutput(bytes.NewReader(line), database, batch, &totals); err != nil {
-		t.Fatalf("accountGeminiOutput() error = %v", err)
+		t.Fatal(err)
 	}
-	if got, err := database.GeminiRequestByID(request.ID); err != nil || got != nil {
-		t.Fatalf("parent request = %+v, err %v, want deleted", got, err)
+	blocked, err := database.GeminiRequestByID(request.ID)
+	if err != nil || blocked == nil || blocked.State != db.GeminiRequestBlocked || blocked.BatchID != nil {
+		t.Fatalf("one-page 413 request = %+v, %v; want detached block", blocked, err)
 	}
-	retryable, err := database.RetryableGeminiRequests()
-	if err != nil {
-		t.Fatalf("RetryableGeminiRequests() error = %v", err)
-	}
-	if len(retryable) != 2 || retryable[0].PageStart != 0 || retryable[0].PageEnd != 2 ||
-		retryable[1].PageStart != 2 || retryable[1].PageEnd != 4 || retryable[0].AttemptCount != 0 {
-		t.Fatalf("split requests = %+v", retryable)
+	if !totals.accounted || !totals.billing.Indeterminate {
+		t.Fatalf("totals = %+v, want indeterminate failed request", totals)
 	}
 }
 
@@ -758,6 +1034,116 @@ func createOutputTestBatch(t *testing.T, start, end int) (*db.DB, db.GeminiBatch
 		t.Fatalf("GeminiRequestsForBatch() error = %v", err)
 	}
 	return database, *batch, requests[0]
+}
+
+type uploadedGeminiInput struct {
+	data  []byte
+	pages int
+}
+
+func decodeUploadedGeminiInputs(t *testing.T, body []byte) map[string]uploadedGeminiInput {
+	t.Helper()
+	inputs := make(map[string]uploadedGeminiInput)
+	for _, raw := range bytes.Split(bytes.TrimSpace(body), []byte{'\n'}) {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var line struct {
+			Key     string `json:"key"`
+			Request struct {
+				Contents []struct {
+					Parts []struct {
+						InlineData *struct {
+							Data string `json:"data"`
+						} `json:"inlineData"`
+					} `json:"parts"`
+				} `json:"contents"`
+				GenerationConfig struct {
+					ResponseJSONSchema struct {
+						Properties map[string]struct {
+							MaxItems *int `json:"maxItems"`
+						} `json:"properties"`
+					} `json:"responseJsonSchema"`
+				} `json:"generationConfig"`
+			} `json:"request"`
+		}
+		if err := json.Unmarshal(raw, &line); err != nil {
+			t.Fatalf("decode uploaded Gemini line: %v", err)
+		}
+		var encoded string
+		for _, content := range line.Request.Contents {
+			for _, part := range content.Parts {
+				if part.InlineData != nil {
+					encoded = part.InlineData.Data
+				}
+			}
+		}
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatalf("decode uploaded Gemini data: %v", err)
+		}
+		pageSchema, ok := line.Request.GenerationConfig.ResponseJSONSchema.Properties["pages"]
+		if line.Key == "" || encoded == "" || !ok || pageSchema.MaxItems == nil {
+			t.Fatalf("incomplete uploaded Gemini line: %s", raw)
+		}
+		inputs[line.Key] = uploadedGeminiInput{data: data, pages: *pageSchema.MaxItems}
+	}
+	return inputs
+}
+
+// commandTestPDF keeps labeled page streams uncompressed so the adaptive batch
+// test can prove each regenerated body contains the requested page subset.
+func commandTestPDF(labels ...string) []byte {
+	var out bytes.Buffer
+	out.WriteString("%PDF-1.4\n")
+	offsets := []int{0}
+	writeObject := func(number int, body string) {
+		offsets = append(offsets, out.Len())
+		fmt.Fprintf(&out, "%d 0 obj\n%s\nendobj\n", number, body)
+	}
+	kids := make([]string, len(labels))
+	for i := range labels {
+		kids[i] = fmt.Sprintf("%d 0 R", 4+i*2)
+	}
+	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	writeObject(2, fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", strings.Join(kids, " "), len(labels)))
+	writeObject(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+	for i, label := range labels {
+		pageObject := 4 + i*2
+		contentObject := pageObject + 1
+		writeObject(pageObject, fmt.Sprintf(
+			"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>",
+			contentObject,
+		))
+		stream := fmt.Sprintf("BT /F1 12 Tf 72 720 Td (%s) Tj ET", label)
+		writeObject(contentObject, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(stream), stream))
+	}
+	xref := out.Len()
+	fmt.Fprintf(&out, "xref\n0 %d\n", len(offsets))
+	out.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets[1:] {
+		fmt.Fprintf(&out, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&out, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets), xref)
+	return out.Bytes()
+}
+
+func geminiMaxTokensOutputLine(t *testing.T, key string, input, candidate, thinking int64) []byte {
+	t.Helper()
+	response := map[string]any{
+		"candidates": []any{map[string]any{
+			"finishReason": "MAX_TOKENS",
+			"content":      map[string]any{"parts": []any{map[string]any{"text": "{}"}}},
+		}},
+		"usageMetadata": map[string]any{
+			"promptTokenCount": input, "candidatesTokenCount": candidate, "thoughtsTokenCount": thinking,
+		},
+	}
+	line, err := json.Marshal(map[string]any{"key": key, "response": response})
+	if err != nil {
+		t.Fatalf("marshal MAX_TOKENS output line: %v", err)
+	}
+	return append(line, '\n')
 }
 
 func successfulGeminiOutputLine(t *testing.T, key string, pageIndex int, input, candidate, thinking int64) []byte {

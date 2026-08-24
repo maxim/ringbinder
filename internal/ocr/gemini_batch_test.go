@@ -18,6 +18,41 @@ import (
 	pdfutil "github.com/maxim/ringbinder/internal/pdf"
 )
 
+func TestWalkGeminiFileRequestsUsesOriginalCompletePDF(t *testing.T) {
+	original := []byte("original batch PDF bytes")
+	path := filepath.Join(t.TempDir(), "twenty-pages.pdf")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := NewGeminiClient("", time.Now().UTC())
+	client.pageCount = func(context.Context, io.ReadSeeker) (int, error) { return geminiMaxPDFPages, nil }
+	client.extractRange = func(context.Context, io.ReadSeeker, int, int, int) ([]byte, error) {
+		t.Fatal("eligible fresh batch PDF was extracted")
+		return nil, nil
+	}
+	var requests []GeminiPreparedRequest
+	err := client.WalkFileRequests(
+		context.Background(), path, "pdf",
+		func(request GeminiPreparedRequest) error {
+			requests = append(requests, request)
+			return nil
+		},
+		func(sizeErr *GeminiRangeSizeError) error {
+			t.Fatalf("eligible PDF rejected: %v", sizeErr)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 1 || requests[0].PageStart != 0 || requests[0].PageEnd != geminiMaxPDFPages {
+		t.Fatalf("requests = %+v, want one complete-document range", requests)
+	}
+	if got := geminiRequestData(t, requests[0].Body); !bytes.Equal(got, original) {
+		t.Fatalf("inline PDF = %q, want original bytes %q", got, original)
+	}
+}
+
 func TestWalkGeminiFileRequestsContinuesAfterOversizedMiddlePage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "three-pages.pdf")
 	if err := os.WriteFile(path, []byte("pdf source"), 0o600); err != nil {

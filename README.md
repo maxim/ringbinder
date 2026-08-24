@@ -280,7 +280,7 @@ ringbinder ocr --limit 100
 ringbinder ocr --concurrency 2
 ```
 
-`--model` overrides the configured provider. OCR requires only that provider's key (`MISTRAL_API_KEY` or `GEMINI_API_KEY`) and never falls back to the other provider. `--concurrency/-j` overrides `ocr_concurrency` and the provider default. `--limit <n>` attempts only the next `n` unique pending content items in stable order; failed items remain pending, and the limit caps attempts rather than successful results. The limit is CLI-only and must be at least 1 when supplied. Large PDFs are chunked internally to fit API limits; Ringbinder does not split or modify your document files.
+`--model` overrides the configured provider. OCR requires only that provider's key (`MISTRAL_API_KEY` or `GEMINI_API_KEY`) and never falls back to the other provider. `--concurrency/-j` overrides `ocr_concurrency` and the provider default. `--limit <n>` attempts only the next `n` unique pending content items in stable order; failed items remain pending, and the limit caps attempts rather than successful results. The limit is CLI-only and must be at least 1 when supplied. Gemini uploads a complete PDF unchanged when it fits one request. Larger PDFs and partial-range retries are locally extracted into request-sized PDFs, so malformed PDFs that need chunking can still fail in the embedded PDF parser. Ringbinder never splits or modifies your original document files.
 
 After attempting content, Ringbinder prints one actual cost total based on provider-reported usage. If usage is incomplete or a request outcome is ambiguous, it prints the known cost and warns that the actual cost may be higher.
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,126 @@ import (
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/spf13/cobra"
 )
+
+func TestSweep_ConfigAndCLIExcludesAreCumulativeAndRestorable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	scanDir := t.TempDir()
+	pathA := filepath.Join(scanDir, "a.png")
+	pathB := filepath.Join(scanDir, "b.png")
+	for _, path := range []string{pathA, pathB} {
+		if err := os.WriteFile(path, []byte("shared"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfgFile = filepath.Join(t.TempDir(), "config.yml")
+	t.Cleanup(func() { cfgFile = "" })
+	writeConfig := func(excludes ...string) {
+		t.Helper()
+		contents := "exclude: []\n"
+		if len(excludes) > 0 {
+			contents = "exclude:\n"
+			for _, pattern := range excludes {
+				contents += fmt.Sprintf("  - %q\n", pattern)
+			}
+		}
+		if err := os.WriteFile(cfgFile, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(cliExcludes ...string) {
+		t.Helper()
+		cmd := &cobra.Command{}
+		cmd.Flags().StringSlice("exclude", nil, "")
+		for _, pattern := range cliExcludes {
+			if err := cmd.Flags().Set("exclude", pattern); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := runSweep(cmd, []string{scanDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeConfig()
+	run()
+	writeConfig(pathA)
+	run()
+	withDB(t, func(database *db.DB) {
+		docA, _ := database.GetDocumentByPath(pathA)
+		docB, _ := database.GetDocumentByPath(pathB)
+		if docA == nil || !docA.Deleted || docB == nil || docB.Deleted {
+			t.Fatalf("config exclusion docs = (%+v, %+v)", docA, docB)
+		}
+		pending, err := database.PendingContents()
+		if err != nil || len(pending) != 1 {
+			t.Fatalf("shared active content = %+v, %v", pending, err)
+		}
+	})
+
+	// CLI additions cannot disable the configured safeguard.
+	run(pathB, pathB)
+	withDB(t, func(database *db.DB) {
+		for _, path := range []string{pathA, pathB} {
+			doc, err := database.GetDocumentByPath(path)
+			if err != nil || doc == nil || !doc.Deleted {
+				t.Fatalf("cumulative excluded doc %s = %+v, %v", path, doc, err)
+			}
+		}
+	})
+
+	writeConfig()
+	run()
+	withDB(t, func(database *db.DB) {
+		for _, path := range []string{pathA, pathB} {
+			doc, err := database.GetDocumentByPath(path)
+			if err != nil || doc == nil || doc.Deleted {
+				t.Fatalf("restored doc %s = %+v, %v", path, doc, err)
+			}
+		}
+	})
+}
+
+func TestSweep_AllowsAbsentConfiguredLiteralExclude(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	scanDir := t.TempDir()
+	docPath := filepath.Join(scanDir, "removed.png")
+	if err := os.WriteFile(docPath, []byte("indexed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgFile = filepath.Join(t.TempDir(), "config.yml")
+	t.Cleanup(func() { cfgFile = "" })
+	writeConfig := func(contents string) {
+		t.Helper()
+		if err := os.WriteFile(cfgFile, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func() {
+		t.Helper()
+		cmd := &cobra.Command{}
+		cmd.Flags().StringSlice("exclude", nil, "")
+		if err := runSweep(cmd, []string{scanDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeConfig("exclude: []\n")
+	run()
+	if err := os.Remove(docPath); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(fmt.Sprintf("exclude: [%q]\n", docPath))
+	run()
+
+	withDB(t, func(database *db.DB) {
+		doc, err := database.GetDocumentByPath(docPath)
+		if err != nil || doc == nil || !doc.Deleted {
+			t.Fatalf("absent excluded document = %+v, %v; want soft-deleted", doc, err)
+		}
+	})
+}
 
 func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 	home := t.TempDir()
@@ -44,8 +165,8 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 		if !doc.OCRPending {
 			t.Fatalf("initial OCRPending = false, want true")
 		}
-		if err := database.MarkContentOCRDone(doc.ContentID); err != nil {
-			t.Fatalf("MarkContentOCRDone() error = %v", err)
+		if err := database.UpsertPage(doc.ContentID, 0, "version one OCR"); err != nil {
+			t.Fatalf("UpsertPage() error = %v", err)
 		}
 	})
 
@@ -107,8 +228,8 @@ func TestSweep_OCRPendingRequiresMTimeAndChecksumChange(t *testing.T) {
 			t.Fatalf("content+mtime ModifiedAt = %s, want %s", doc.ModifiedAt.Format(time.RFC3339Nano), t3.Format(time.RFC3339Nano))
 		}
 		checksumV2 = doc.Checksum
-		if err := database.MarkContentOCRDone(doc.ContentID); err != nil {
-			t.Fatalf("MarkContentOCRDone() error = %v", err)
+		if err := database.UpsertPage(doc.ContentID, 0, "version two OCR"); err != nil {
+			t.Fatalf("UpsertPage() error = %v", err)
 		}
 	})
 

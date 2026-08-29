@@ -6,18 +6,17 @@ Notable changes to Ringbinder are documented here.
 
 ### Added
 
-- Opt-in Gemini OCR with structured searchable page and visual descriptions, provider-specific concurrency, retries, PDF chunking, and actual usage-based run cost reporting.
-- Provider selection through `--model mistral|gemini` or config, plus offline provider-specific cost estimates.
-- Bounded `cost --limit N` estimates and matching `ocr --limit N` batches for reviewing spend incrementally.
-- Explicit discounted Gemini batch OCR under `ringbinder batch`, with durable restart recovery, status/cancel/forget commands, visible blocked-work summaries, partial-range staging and direct-only blocked-range retry, frozen usage billing, remote cleanup, machine-readable status/failures, and fail-fast per-database OCR coordination.
-- Configurable sweep concurrency through `sweep_concurrency`; `sweep --concurrency` still takes precedence.
+- Gemini Flash 3.7 is now supported for OCR and is recommended for the best results. Use Gemini by itself, or list Mistral second so Ringbinder can try it when Gemini says it cannot process a page.
+- With Gemini also comes batch support. Gemini Batch API offers half-price processing for documents that can finish later. Ringbinder can submit jobs, resume them after an interruption, keep pages as they finish, retry only failed pages, and clean up uploaded files when the work is done.
+- `ringbinder cost` now shows a low-to-high price range based on the services you selected. `ringbinder batch cost` separately estimates Gemini's half-price batch processing. Both count only pages that still need OCR, and `--limit N` lets you preview a smaller set of documents.
+- Add support for `exclude` in the config file, to be able to exclude files from sweep. Any excludes added as command arguments are merged with the ones in the file.
+- Document, read, and search JSON now shows whether OCR is finished and which service handled each page.
 
 ### Changed
 
-- Eligible complete Gemini PDFs are now uploaded byte-for-byte unchanged, avoiding unnecessary local extraction and reducing exposure to parser failures. Larger documents and partial ranges still require extraction, so the fast path does not bypass parser failures in those cases.
-- A rejected original Gemini PDF switches to extracted bytes only when a multi-page HTTP 413 or `MAX_TOKENS` response can be split. One-page adaptive failures and all non-adaptive failures, including `INVALID_ARGUMENT`, do not retry a normalized representation; the existing batch retry policy may resubmit the same raw body once.
-- `sweep` now reads config when paths and `--database` are explicit unless `--concurrency` is also explicit, allowing `sweep_concurrency` to override the default.
-- Removed `--redo` from `sweep`, `cost`, and `ocr`; full OCR rebuilds now use a separate database so the active index remains available for rollback.
+- The `model` setting selects one OCR service or an ordered list, and `--model` can be repeated to set that order for one command. OCR concurrency settings and flags were removed because Ringbinder now chooses safe limits automatically.
+- Documents with unfinished OCR stay out of text search and `read` until every page is ready. You can still find them by filename and see that OCR is pending.
+- `--redo` was completely removed. To rebuild all OCR, use a separate database so your current searchable database remains available until the replacement is ready.
 
 ## [0.2.0] - 2026-08-13
 

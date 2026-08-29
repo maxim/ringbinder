@@ -23,6 +23,7 @@ import (
 const (
 	mistralEndpoint = "https://api.mistral.ai/v1/ocr"
 	mistralModel    = "mistral-ocr-4-1"
+	MistralModel    = mistralModel
 	// Ringbinder always requests bbox_annotation_format to preserve searchable
 	// image/graphic descriptions, so estimates use OCR 4.1 annotated-page pricing.
 	mistralPricePerPage  = 0.005 // $5 per 1,000 pages
@@ -101,13 +102,60 @@ func (c *MistralClient) OCRFile(ctx context.Context, filePath string, fileType s
 	return c.ocrImage(ctx, filePath, fileType, info.Size())
 }
 
+func (c *MistralClient) OCRRangeResult(
+	ctx context.Context,
+	filePath, fileType string,
+	start, end int,
+) (RangeResult, error) {
+	if start < 0 || end <= start {
+		return RangeResult{}, errors.New("invalid Mistral page range")
+	}
+	if fileType != "pdf" {
+		if start != 0 || end != 1 {
+			return RangeResult{}, errors.New("image OCR range must be page 1")
+		}
+		pages, report, err := c.OCRFile(ctx, filePath, fileType)
+		return RangeResult{Pages: pages, Billing: report}, err
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return RangeResult{}, fmt.Errorf("stat file: %w", err)
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return RangeResult{}, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+	counter := c.pageCount
+	if counter == nil {
+		counter = pdfutil.PageCountContext
+	}
+	pageCount, err := counter(ctx, f)
+	if err != nil {
+		return RangeResult{}, fmt.Errorf("%s: read PDF page count: %w", filePath, err)
+	}
+	if end > pageCount {
+		return RangeResult{}, fmt.Errorf("planned page range exceeds current PDF page count %d", pageCount)
+	}
+	if start == 0 && end == pageCount {
+		pages, report, err := c.ocrPDF(ctx, filePath, info.Size())
+		return RangeResult{Pages: pages, Billing: report}, err
+	}
+
+	var pages []PageResult
+	var report BillingReport
+	err = c.ocrPDFInterval(ctx, f, filePath, info.Size(), pageCount, start, end, &pages, &report)
+	return RangeResult{Pages: pages, Billing: report}, err
+}
+
 func (c *MistralClient) ocrImage(ctx context.Context, filePath, fileType string, sourceSize int64) ([]PageResult, BillingReport, error) {
 	limit, err := c.effectiveDecodedLimit(fileType)
 	if err != nil {
 		return nil, BillingReport{}, fmt.Errorf("%s: %w", filePath, err)
 	}
 	if sourceSize > int64(limit) {
-		return nil, BillingReport{}, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
+		return nil, BillingReport{}, DocumentFailure(fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit()))
 	}
 
 	f, err := os.Open(filePath)
@@ -121,7 +169,7 @@ func (c *MistralClient) ocrImage(ctx context.Context, filePath, fileType string,
 		return nil, BillingReport{}, fmt.Errorf("%s: read file: %w", filePath, err)
 	}
 	if tooLarge {
-		return nil, BillingReport{}, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
+		return nil, BillingReport{}, DocumentFailure(fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit()))
 	}
 	body, err := c.buildRequestBody(data, fileType)
 	if err != nil {
@@ -200,10 +248,10 @@ func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize 
 			mid := pageCount / 2
 			var results []PageResult
 			if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, 0, mid, &results, &report); err != nil {
-				return nil, report, err
+				return results, report, err
 			}
 			if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, mid, pageCount, &results, &report); err != nil {
-				return nil, report, err
+				return results, report, err
 			}
 			return results, report, nil
 		}
@@ -211,7 +259,7 @@ func (c *MistralClient) ocrPDF(ctx context.Context, filePath string, sourceSize 
 
 	var results []PageResult
 	if err := c.ocrPDFInterval(ctx, f, filePath, sourceSize, pageCount, 0, pageCount, &results, &report); err != nil {
-		return nil, report, err
+		return results, report, err
 	}
 	return results, report, nil
 }
@@ -346,7 +394,7 @@ func (c *MistralClient) planPDFChunk(
 		}
 	}
 	if best.end == 0 {
-		return pdfChunk{}, fmt.Errorf("source page %d exceeds the decoded or serialized OCR request limit", start+1)
+		return pdfChunk{}, DocumentFailure(fmt.Errorf("source page %d exceeds the decoded or serialized OCR request limit", start+1))
 	}
 	return best, nil
 }
@@ -539,6 +587,10 @@ func decodeResults(respBody []byte, expectedCount int) ([]PageResult, error) {
 		indexes = append(indexes, index)
 	}
 	sort.Ints(indexes)
+	model := strings.TrimSpace(resp.Model)
+	if model == "" {
+		model = mistralModel
+	}
 	results := make([]PageResult, 0, len(indexes))
 	for _, index := range indexes {
 		page := pages[index]
@@ -554,7 +606,7 @@ func decodeResults(respBody []byte, expectedCount int) ([]PageResult, error) {
 			}
 			markdown += fmt.Sprintf("\n\n[Image: %s — %s]", imageType, description)
 		}
-		results = append(results, PageResult{PageIndex: index, Markdown: markdown})
+		results = append(results, PageResult{PageIndex: index, Markdown: markdown, Model: model})
 	}
 	return results, nil
 }
@@ -705,7 +757,8 @@ func (c *MistralClient) doWithRetryBodyBilling(ctx context.Context, body []byte)
 		if usage != nil {
 			report.Add(*usage)
 		}
-		retryable := resp.StatusCode == http.StatusTooManyRequests ||
+		retryable := resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests ||
 			(resp.StatusCode >= http.StatusInternalServerError && resp.StatusCode < 600)
 		if resp.StatusCode >= http.StatusInternalServerError && usage == nil {
 			report.Indeterminate = true

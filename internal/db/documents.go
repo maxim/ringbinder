@@ -9,15 +9,17 @@ import (
 )
 
 type Document struct {
-	ID         int64
-	Path       string
-	ContentID  int64
-	Checksum   string
-	CreatedAt  time.Time
-	ModifiedAt time.Time
-	PageCount  int
-	OCRPending bool
-	Deleted    bool
+	ID                int64
+	Path              string
+	ContentID         int64
+	Checksum          string
+	CreatedAt         time.Time
+	ModifiedAt        time.Time
+	PageCount         int
+	OCRPagesCompleted int
+	Models            []ModelCount
+	OCRPending        bool
+	Deleted           bool
 }
 
 type ListOptions struct {
@@ -67,6 +69,17 @@ func scanDocument(scanner documentScanner) (Document, error) {
 }
 
 func (db *DB) GetDocumentByPath(path string) (*Document, error) {
+	doc, err := db.GetDocumentMetadataByPath(path)
+	if err != nil || doc == nil {
+		return doc, err
+	}
+	if err := db.hydrateDocumentOCR(doc); err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+func (db *DB) GetDocumentMetadataByPath(path string) (*Document, error) {
 	row := db.QueryRow(
 		`SELECT d.id, d.path, d.content_id, d.created_at, d.modified_at, d.deleted,
 		        c.checksum, c.page_count, c.ocr_pending
@@ -252,7 +265,25 @@ func (db *DB) queryDocuments(query string, args ...any) ([]Document, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range docs {
+		if err := db.hydrateDocumentOCR(&docs[i]); err != nil {
+			return nil, err
+		}
+	}
 	return docs, nil
+}
+
+func (db *DB) hydrateDocumentOCR(doc *Document) error {
+	completed, models, err := db.ContentOCRCoverage(doc.ContentID)
+	if err != nil {
+		return err
+	}
+	doc.OCRPagesCompleted = completed
+	doc.Models = models
+	return nil
 }
 
 func (db *DB) AllStats() (docCount int, totalPages int, err error) {

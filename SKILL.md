@@ -1,6 +1,6 @@
 ---
 name: ringbinder
-description: Use ringbinder to find documents, list documents, answer with citations, and propose file renames.
+description: Use ringbinder to find documents, list documents, answer with citations.
 ---
 
 # Ringbinder
@@ -29,21 +29,27 @@ By default `ringbinder doc list` lists 50 recent docs. Read `ringbinder doc list
    - `ringbinder find --json --limit 50 --offset 0 <query>`
    - or `ringbinder find --json --fts '<raw>'`
 
-3. Parse result fields:
+3. Parse `find --json` result fields:
    - `path`, `page_index`, `page_count`, `snippet`, `rank`, `search_source`
+   - nullable `model` (the exact OCR identifier for text results; `null` for path-only results)
+   - `ocr_pending` (whether the document still lacks OCR pages)
    - `search_source` is one of: `fts`, `trigram`, `path`
 
 4. Merge candidates:
    - dedupe by `(path, page_index)`
    - prefer `fts` over `trigram` over `path` when evidence quality conflicts
-   - keep ~10–30 pages for reading
+   - do not try to read results where `ocr_pending` is `true`; path-only matches can identify an incomplete document but provide no OCR evidence
+   - keep ~10–30 complete pages for reading
 
 5. Read full text before answering:
    - `ringbinder read --json --path <path> --page <i> --context 1`
+   - each returned page has `page_index`, `markdown`, and nullable exact `model`
    - use `--start/--end` for wider ranges when needed
 
 6. Optional metadata for ranking/citations:
    - `ringbinder doc get --json --path <path>`
+   - document JSON has `path`, `created_at`, `modified_at`, `page_count`, `ocr_pages_completed`, `models`, `ocr_pending`, and `deleted`
+   - `models` contains `{model, page_count}` entries; `model` is the exact identifier for that page and can be `null` for older results
 
 7. Answer with quotes and citations:
    - quote exact supporting lines

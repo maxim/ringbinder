@@ -1,43 +1,42 @@
 # Ringbinder
 
-Ringbinder is a small CLI tool that keeps a single SQLite file of PDFs and images that you have scattered around your filesystem. It doesn't touch, change, or ingest any of the files, only records their paths. With that, it provides convenient methods to OCR them, and search them. You can then query the db using a few methods provided by ringbinder itself, or just point any other sqlite client at it.
+Ringbinder makes PDFs and images on your computer searchable. It uses vision LLMs (like Gemini and Mistral) to read them and stores the resulting text in a local SQLite database. Your original files stay where they are and are never modified.
 
-When using OCR, it just populates text in an associated db column, it doesn't inject the text back into the pdf files or anything like that.
+Ringbinder supports Gemini Flash and Mistral OCR, staying up to date with their latest versions. At this time Gemini's quality is better, but their policy can refuse to process some documents, which is why Ringbinder supports fallback to another provider.
 
-For OCR, it integrates with Mistral by default and offers Gemini as an opt-in provider. Both transcribe text and describe visual elements for search, so I can easily find all drawings of dragons that my kids made, for example.
+There are two ways to run OCR:
 
-My use case is just scanning every piece of paper I come across (as well as immediately shredding most of them): physical mail, manuals, official documents, downloaded pdfs and images, my kids' schoolwork and drawings. I use an old ScanSnap S1500M that still works great for >15 years, and my iPhone's camera + a shortcut that scans into an iCloud-synced dir. Later I can find anything by having AI agents query the db for me. The other day I found who installed my house sump pump backup system (it was hand-written on a random page of an old disclosure doc).
+- `ringbinder ocr` processes documents now and waits for the result. This uses the normal price.
+- `ringbinder batch` (Gemini only) sends batches of work at half price and collects the results later.
 
 ## Features
 
 - Indexes PDF, PNG, JPEG, and JPG files
-- Runs OCR through the Mistral or Gemini API
-- Offers lower-cost Gemini batch OCR for jobs that can finish later and resume after interruptions
-- Stores OCR text locally as per-page Markdown
-- Searches with SQLite FTS5, including an optional trigram index for OCR-noisy matches
-- Falls back to path matches when the text index does not find anything
-- Reads exact pages, page ranges, or neighboring context pages
-- Emits JSON/NDJSON for scripts, tools, and agents
-- De-duplicates identical file contents by checksum
-- Tracks deleted, restored, changed, and unchanged files during incremental sweeps
+- Uses Gemini or Mistral for OCR
+- Can try a second OCR service when the first one says it cannot process a page
+- Offers half-price Gemini OCR for work that can finish later
+- Saves every successful page, so interrupted work can resume without starting over
+- Searches OCR text and filenames, including fuzzy matches for messy scans
+- Reads individual pages, groups of pages, or nearby pages for context
+- Produces JSON for scripts and agents
+- Recognizes identical copies of a file and OCRs them only once
+- Tracks files that were added, changed, removed, or restored
 
 ## Install
 
-Ringbinder currently targets macOS and Linux. Install it with Homebrew, which compiles the pinned release source using Go as a build-only dependency:
+Ringbinder runs on macOS and Linux. Install the released version with Homebrew:
 
 ```sh
 brew install maxim/tap/ringbinder
 ```
 
-### Developer alternatives
-
-With a Go toolchain installed, you can install the latest source directly:
+With Go installed, install the latest source directly:
 
 ```sh
 go install github.com/maxim/ringbinder@latest
 ```
 
-Or build it from a clone:
+Or build from a clone:
 
 ```sh
 git clone https://github.com/maxim/ringbinder.git
@@ -45,17 +44,21 @@ cd ringbinder
 go build -o ringbinder .
 ```
 
-OCR requires the key for the provider you select. Mistral is the default:
+For Gemini OCR, set:
+
+```sh
+export GEMINI_API_KEY="..."
+```
+
+Set a Mistral key when your config includes Mistral, or when `model` is not set and Ringbinder uses its Mistral default:
 
 ```sh
 export MISTRAL_API_KEY="..."
-# Or, when using --model gemini or model: gemini:
-export GEMINI_API_KEY="..."
 ```
 
 ## Quick start
 
-Create a config file with the paths you want Ringbinder to watch:
+Create a config file. This example scans two locations and uses Gemini:
 
 ```sh
 mkdir -p ~/.config/ringbinder
@@ -63,148 +66,107 @@ cat > ~/.config/ringbinder/config.yml <<'YAML'
 paths:
   - ~/Documents
   - ~/Downloads/**/*.pdf
+model: gemini
 YAML
 ```
 
 Then run the usual loop:
 
 ```sh
-# Scan configured paths and add new/changed files to the local database.
+# Find new, changed, and missing files.
 ringbinder sweep
 
-# Check the OCR cost for all pending content before sending anything.
+# Estimate the regular OCR price without contacting Gemini.
 ringbinder cost
 
-# OCR all pending documents.
+# OCR unfinished documents now.
 ringbinder ocr
 
-# Search the OCR text.
+# Search the finished OCR text.
 ringbinder find "property tax" --verbose
 
-# Read a page from a result. Page flags are 0-based.
+# Read a page from a result. Page numbers in flags start at 0.
 ringbinder read --path "/Users/you/Documents/taxes/assessment.pdf" --page 0 --context 1
 ```
 
-By default, the database lives at `~/.config/ringbinder/ringbinder.db`. You can override it with `database_path` in config or the global `--database` flag.
+The database defaults to `~/.config/ringbinder/ringbinder.db`. Use `database_path` in config or the global `--database` flag to put it somewhere else.
 
-## Database structure
+## How your data is stored
 
-Ringbinder keeps the schema intentionally small. `documents` is the filesystem view, `contents` is the de-duplicated file identity, `pages` is OCR output, and the FTS tables are SQLite virtual indexes fed by triggers on `pages`.
+Ringbinder keeps file locations and OCR text in one local SQLite database. Original documents are never copied into it.
 
-```mermaid
----
-title: Ringbinder SQLite schema
----
-erDiagram
-    CONTENTS ||--o{ DOCUMENTS : "has file paths"
-    CONTENTS ||--o{ PAGES : "has OCR pages"
-    CONTENTS ||--o{ GEMINI_BATCH_CONTENTS : "was included in jobs"
-    CONTENTS ||--o{ GEMINI_BATCH_REQUESTS : "has batch page ranges"
-    GEMINI_BATCHES ||--o{ GEMINI_BATCH_CONTENTS : "records included content"
-    GEMINI_BATCHES ||--o{ GEMINI_BATCH_REQUESTS : "includes while active"
-    GEMINI_BATCH_REQUESTS ||--o{ GEMINI_BATCH_PAGES : "holds completed pages"
-    PAGES ||..|| PAGES_FTS : "mirrors rowid"
-    PAGES ||..|| PAGES_FTS_TRIGRAM : "mirrors rowid"
-
-    CONTENTS {
-        int id PK
-        string checksum UK "file content hash"
-        int page_count
-        int ocr_pending "1 until OCR completes"
-    }
-
-    DOCUMENTS {
-        int id PK
-        string path UK
-        int content_id FK
-        string created_at "RFC3339Nano"
-        string modified_at "RFC3339Nano"
-        int deleted "soft delete flag"
-    }
-
-    PAGES {
-        int id PK
-        int content_id FK
-        int page_index "0-based"
-        string markdown "OCR result"
-        string search_text "normalized for FTS"
-    }
-
-    PAGES_FTS {
-        int rowid "mirrors pages.id"
-        string search_text "standard FTS5"
-    }
-
-    PAGES_FTS_TRIGRAM {
-        int rowid "mirrors pages.id"
-        string search_text "FTS5 trigram"
-    }
-
-    GEMINI_BATCHES {
-        int id PK
-        string state "job status"
-        string remote_name
-    }
-
-    GEMINI_BATCH_CONTENTS {
-        int batch_id FK
-        int content_id FK
-    }
-
-    GEMINI_BATCH_REQUESTS {
-        int id PK
-        int content_id FK
-        int batch_id FK "active job"
-        int page_start "first page, 0-based"
-        int page_end "page after last, 0-based"
-        string state
-    }
-
-    GEMINI_BATCH_PAGES {
-        int request_id FK
-        int page_index "document page, 0-based"
-        string markdown
-    }
-```
-
-A few details:
-
-- `documents.content_id` points at `contents.id`; multiple paths can share one content row when files are byte-identical.
-- `pages.content_id` points at `contents.id` with `ON DELETE CASCADE`, so OCR pages are removed when orphaned content is cleaned up.
-- `pages` is unique by `(content_id, page_index)`, which lets OCR upserts replace page text in place.
-- `pages_fts` and `pages_fts_trigram` are external-content FTS5 indexes over `pages.search_text`, maintained by the `pages_ai`, `pages_ad`, and `pages_au` triggers.
-- Most reads, searches, and listings filter out rows where `documents.deleted = 1`; those soft-deleted paths let future sweeps restore the same row if the file comes back.
-- Ringbinder keeps unfinished Gemini batch results separate from searchable pages. A document becomes searchable only after OCR has finished for every page.
-- `gemini_batch_contents` remembers which content a job touched until that job is removed, even after its request rows have been promoted into searchable pages.
-- If no indexed paths point to a file anymore, its unfinished batch work is removed. Job records remain only as long as Ringbinder needs them to check status and clean up uploaded input files and remote job resources.
+- Identical files at several locations share one set of OCR pages, so they are processed only once.
+- Every successful page is saved immediately. A failure on another page does not erase good work.
+- A document stays out of normal text search and `read` until every page is finished. You can still find it by filename and see that OCR is waiting.
+- Ringbinder records the service and model used for each page. Older OCR results may show `unknown` because this information was not recorded at the time.
+- Missing or excluded files remain in the database so Ringbinder can restore them if they reappear.
 
 ## Configuration
 
-By default Ringbinder reads:
+Ringbinder reads:
 
 ```text
 ~/.config/ringbinder/config.yml
 ```
 
-The config is intentionally small:
+A typical config looks like this:
 
 ```yaml
 paths:
   - ~/Documents
   - ~/Downloads/**/*.pdf
-  - /Volumes/Archive/scans
 
-# Optional worker settings:
-sweep_concurrency: 4
-ocr_concurrency: 20
-
-# Optional OCR provider:
+# Gemini is recommended for the best OCR results.
 model: gemini
+
+# Never include these files in a sweep.
+exclude:
+  - "**/private/*.pdf"
+  - "draft-scan.pdf"
+
+# Optional. Defaults to 4.
+sweep_concurrency: 8
 ```
 
-`sweep_concurrency` controls file-processing workers and defaults to 4; `sweep --concurrency` overrides it. Both require an integer of at least 1. `ocr_concurrency` controls simultaneous OCR requests. Its provider default is 4 for Mistral and 20 for Gemini; `ocr --concurrency` overrides it. `model` accepts exactly `mistral` or `gemini` and defaults to `mistral`.
+### Choosing OCR services
 
-Optionally, set a custom SQLite database file path:
+Set `model` to `gemini` or `mistral`. Gemini is recommended. When the setting is absent, Ringbinder uses Mistral so older configs continue working as before.
+
+You can also list two services in the order you want them tried:
+
+```yaml
+model:
+  - gemini
+  - mistral
+```
+
+Gemini handles each page first in this example. Ringbinder tries Mistral only when Gemini clearly says it cannot process that page. A timeout or temporary service problem leaves the page for a later run instead of sending it elsewhere immediately.
+
+You can make the same choice for one command:
+
+```sh
+ringbinder cost --model gemini
+ringbinder ocr --model gemini
+ringbinder ocr --model gemini --model mistral --limit 100
+```
+
+The `model` setting accepts one service or an ordered list. Repeat `--model` to set that order for one command.
+
+### Excluding files
+
+Config exclusions apply to every sweep. Command-line exclusions add more for one run; they never remove the configured exclusions.
+
+```sh
+ringbinder sweep ~/Documents --exclude "**/inbox/*.pdf" --exclude "draft-scan.pdf,*.tmp.pdf"
+```
+
+Excluded files disappear from normal OCR and search results after the next sweep. Remove the exclusion and sweep again to restore them. If an OCR service repeatedly refuses a document, excluding every copy of that file keeps Ringbinder from trying it again.
+
+### Other settings
+
+`sweep_concurrency` controls how many files Ringbinder examines at once. It defaults to 4. Override it with `sweep --concurrency`.
+
+Set a custom database location with:
 
 ```yaml
 database_path: ~/.local/share/ringbinder/ringbinder.db
@@ -212,37 +174,21 @@ paths:
   - ~/Documents
 ```
 
-`database_path` is a file path, not a directory. If omitted, Ringbinder uses `~/.config/ringbinder/ringbinder.db`.
-
-You can also pass paths directly:
+Paths can also be supplied on the command line. `--config` chooses another config file, and `--database` chooses another database:
 
 ```sh
 ringbinder sweep ~/Documents ~/Desktop/inbox
-```
-
-Use `--config` to point at a different config file:
-
-```sh
 ringbinder --config ./ringbinder.yml sweep
-```
-
-Use `--database` to point at a different SQLite database file for any command. The flag overrides `database_path` from config:
-
-```sh
 ringbinder --database ./ringbinder.db find "property tax"
 ```
 
-Globs are supported, including `**`. During a sweep you can exclude individual files or glob patterns:
-
-```sh
-ringbinder sweep ~/Documents --exclude "**/private/*.pdf" --exclude "draft-scan.pdf"
-```
+File patterns such as `*.pdf` and `**/*.pdf` are supported.
 
 ## Commands
 
 ### `sweep`
 
-Scans paths for supported files and updates the local document index.
+Find new, changed, missing, and restored files:
 
 ```sh
 ringbinder sweep [paths...]
@@ -250,105 +196,140 @@ ringbinder sweep [paths...]
 
 Useful flags:
 
-- `--exclude <pattern>` skips matching files
-- `-j, --concurrency <n>` overrides `sweep_concurrency` for scan workers
+- `--exclude <pattern>` skips matching files; repeat it or use comma-separated patterns
+- `-j, --concurrency <n>` changes how many files are examined at once
+
+A sweep marks missing and excluded files only inside the locations scanned by that command. If a file comes back, the next sweep restores it. OCR is requested again only when both the file contents and its modification time changed.
 
 ### `cost`
 
-Estimates the selected provider's OCR cost for unique pending content. It is offline and does not require an API key or upload files.
+`ringbinder cost` estimates the price of running `ringbinder ocr`. It does not contact Gemini or Mistral, needs no API key, and changes nothing in the database.
 
 ```sh
-ringbinder cost
 ringbinder cost --model gemini
+ringbinder cost --model gemini --model mistral
 ringbinder cost --limit 100
 ```
 
-`--limit <n>` estimates only the next `n` unique pending content items in stable order. When it truncates the backlog, the output shows the selected batch size and total pending count; page and price totals cover only that batch. The limit is CLI-only and must be at least 1 when supplied.
+The estimate includes only unfinished pages. Identical copies of a file count once. Documents already being handled by a Gemini batch job are left out.
 
-Mistral estimates are exact at the baked-in annotated-page price of `$0.0050/page` because Ringbinder requests image and graphic descriptions for search. Gemini estimates are visibly approximate: they assume about 560 medium-resolution input tokens per PDF page, 1,120 high-resolution input tokens per standalone image, 1,200 output-and-thinking tokens per page, and 250 input tokens of prompt/schema overhead per image request or planned 20-page PDF chunk. The baked-in standard paid Gemini rates are `$0.75/$3.75` per million input/output tokens through December 31, 2026 and `$1.50/$7.50` starting January 1, 2027 UTC. Actual generated length, byte-driven chunks, and retries can vary.
+The low estimate assumes the first selected service handles every unfinished page. The high estimate assumes every selected service has to try every unfinished page, then adds 5% for retries. Actual prices can be higher when responses are unusually long or extra requests are needed.
 
-`cost` skips documents already assigned to a Gemini batch before applying `--limit`. It reports how many it skipped and never contacts Gemini or changes batch jobs.
+Gemini pricing depends on how much data is sent and returned, so its estimate is approximate. Mistral is estimated at the built-in annotated-page price of `$0.0050/page`. “Annotated page” is Mistral's price tier for OCR that also describes images and graphics, which Ringbinder requests to make visual material searchable.
+
+For Gemini's half-price Batch API, use the separate estimate:
+
+```sh
+ringbinder batch cost --limit 100
+```
+
+`--limit <n>` estimates the next `n` documents. Identical copies still count once.
 
 ### `ocr`
 
-Runs OCR on pending content and stores extracted Markdown locally.
+`ringbinder ocr` processes unfinished pages now and waits for the results. This uses the normal price. Gemini is recommended for the best results.
 
 ```sh
-ringbinder ocr
 ringbinder ocr --model gemini
+ringbinder ocr --model gemini --model mistral
 ringbinder ocr --limit 100
-ringbinder ocr --concurrency 2
 ```
 
-`--model` overrides the configured provider. OCR requires only that provider's key (`MISTRAL_API_KEY` or `GEMINI_API_KEY`) and never falls back to the other provider. `--concurrency/-j` overrides `ocr_concurrency` and the provider default. `--limit <n>` attempts only the next `n` unique pending content items in stable order; failed items remain pending, and the limit caps attempts rather than successful results. The limit is CLI-only and must be at least 1 when supplied. Gemini uploads a complete PDF unchanged when it fits one request. Larger PDFs and partial-range retries are locally extracted into request-sized PDFs, so malformed PDFs that need chunking can still fail in the embedded PDF parser. Ringbinder never splits or modifies your original document files.
+Only unfinished pages are sent, and every successful page is saved immediately. `--limit <n>` restricts the run to the next `n` documents. A failed document still counts toward that limit.
 
-After attempting content, Ringbinder prints one actual cost total based on provider-reported usage. If usage is incomplete or a request outcome is ambiguous, it prints the known cost and warns that the actual cost may be higher.
+When two services are listed, Ringbinder starts with the first one. If that service clearly says it cannot process a page, Ringbinder tries the next one. It may break a large group of pages into smaller groups to save the pages that still work.
 
-`ringbinder ocr` sends each pending document to the selected OCR service and waits for the result. It uses the provider's regular API price; Gemini batch OCR below costs half as much. Documents that are already part of a Gemini batch job are skipped and reported; use the commands below to manage them.
+Temporary errors do not switch services. Those pages wait for the next run, while Ringbinder continues with other documents. Account, billing, permission, and API-key errors stop the run so they can be fixed.
+
+A document does not appear in normal text search or `read` until every page is ready. Successfully finished pages remain saved in the meantime.
+
+At the end, Ringbinder reports how many pages finished, which service handled them, what remains, and the known price of the work attempted. It warns when the service did not return enough billing information to know the full amount.
+
+If some pages are already part of a running Gemini batch job, `ringbinder ocr` leaves that document alone to avoid duplicate work and charges.
 
 ### `batch`
 
-Gemini batch OCR costs 50% less than regular Gemini OCR. The tradeoff is that Gemini finishes the work later instead of while the command waits. Ringbinder saves each job's progress in SQLite, so an interruption or reboot does not lose it.
+Gemini's Batch API costs half the regular Gemini price and finishes later. Use it when saving money matters more than getting the result immediately. Batch commands always use Gemini; the `model` setting does not affect them.
 
-Batch OCR only works with Gemini. If your config uses Mistral, which is the default, add `--model gemini` as shown below.
+These commands contact Gemini and require `GEMINI_API_KEY`:
+
+- `batch start`
+- `batch continue`
+- `batch list`
+- `batch cancel`
+- `batch retry`
+
+These commands stay local and need no key:
+
+- `batch cost`
+- `batch failures`
+- `batch forget`
+
+A typical batch workflow is:
 
 ```sh
-# Estimate the batch price without contacting Gemini.
-ringbinder batch cost --model gemini --limit 100
+# Estimate the half-price batch cost without contacting Gemini.
+ringbinder batch cost --limit 100
 
-# Submit pending documents and return without waiting for results.
-ringbinder batch start --model gemini --limit 100
+# Submit unfinished pages and return without waiting for OCR.
+ringbinder batch start --limit 100
 
-# Check all existing jobs once and process anything that is ready.
-ringbinder batch continue --model gemini
+# Check saved jobs, download finished pages, and continue recovery work.
+ringbinder batch continue
 
-# Ask Gemini for the current status without downloading results.
-ringbinder batch list --model gemini
-ringbinder batch list --model gemini --json
+# View current jobs.
+ringbinder batch list
+ringbinder batch list --json
 
-# Ask Gemini to cancel a job.
-ringbinder batch cancel 17 --model gemini
+# Stop or forget a job.
+ringbinder batch cancel 17
+ringbinder batch forget 17
 
-# Remove a stuck job from Ringbinder without contacting Gemini.
-ringbinder batch forget 17 --model gemini
-
-# List page ranges that could not finish, then retry one immediately.
-ringbinder batch failures --model gemini
-ringbinder batch failures --model gemini --json
-ringbinder batch retry 83 --mode direct --model gemini
+# See pages that need help and retry one group now at the regular Gemini price.
+ringbinder batch failures
+ringbinder batch failures --json
+ringbinder batch retry 83 --mode direct
 ```
 
-`batch cost` and `batch start` each accept `--limit`. The limit counts file contents, so identical files at several paths count once. Documents that were already started or partially processed by batch OCR are left out. `batch start` may split a large group of documents into several jobs, each with its own numeric ID. You can start new work while older jobs are still running.
+`batch cost` and `batch start` include only unfinished pages that are not already part of another batch job. Their `--limit` counts documents, with identical copies counted once. A large submission may be split into several jobs.
 
-`batch continue` checks every saved job once, handles any available work, and exits. It can resume an interrupted submission, download finished results, retry failed page ranges, and clean up uploaded input files and remote job resources. It does not add newly pending documents; run `batch start` for those. If Ringbinder hits an error while handling one job, it continues with the others but exits with a nonzero status. Invalid credentials or a network outage can stop the remaining online work early. For scheduled OCR after `sweep`, run `batch continue` followed by `batch start`.
+Run `batch continue` periodically. It checks saved jobs, downloads available results, retries recoverable failures, and cleans up uploaded files. It also resumes safely after an interruption or reboot. It does not add newly scanned documents; run `batch start` again for those.
 
-A document becomes searchable only after every page has finished. When a page range fails, Ringbinder may retry it, split it into smaller ranges, or report it immediately when retrying would not help. `batch start`, `batch continue`, and `batch list` report how many blocked ranges and content items need attention; `batch failures` lists each range, its error, and recovery commands. Its `attempt_count` JSON field counts automatic batch retries, not the original attempt.
+Every successful page is saved immediately. A partially finished document remains out of normal text search and `read` until its remaining pages finish.
 
-`batch retry <request-id> --mode direct` processes one blocked range immediately at the regular Gemini price. The flag is named `--mode direct` to distinguish this immediate retry from discounted batch processing. Once a document is no longer attached to an active job, ordinary `ringbinder ocr` can instead replace the whole document, including any partially staged batch result. This also allows `ringbinder ocr --model mistral` to handle a document that Gemini repeatedly refuses, but `ocr` processes every pending content item unless you limit the run.
+When `batch failures` reports pages that need attention, you can retry one group immediately:
 
-Batch estimates are approximate for the same reasons as regular Gemini estimates. `batch continue` prints the known cost for results handled during that run. Ringbinder removes completed job history, so save this output if you need a spending record.
+```sh
+ringbinder batch retry <request-id> --mode direct
+```
 
-`batch cancel` asks Gemini to stop a job. Cancellation may take time; keep running `batch continue` until it confirms the final status. Until then, `ringbinder ocr` continues to skip the documents in that job.
+Here, `--mode direct` means “run this retry now at the regular Gemini price” rather than sending it through the half-price Batch API again.
 
-`batch forget` permanently removes a job and all saved batch OCR progress for its affected documents from Ringbinder. The documents remain pending and can be selected again by `batch start` or `ocr`.
+You can also let the normal OCR command finish pages that are no longer part of a running batch. This example uses Gemini first and tries Mistral only for pages Gemini says it cannot process:
 
-Only one command that changes OCR or batch state can run against a database at a time. A second command exits with `another OCR or batch operation is already running for this database`. Searches, reads, estimates, and failure listings remain available.
+```sh
+ringbinder ocr --model gemini --model mistral
+```
+
+`batch cancel` asks Gemini to stop a job. Cancellation may take time, so keep running `batch continue` until the job is settled.
+
+`batch forget <id>` removes Ringbinder's record of unfinished work for that job. OCR pages that already succeeded are kept. Ringbinder will also stop checking or cleaning up that job on Gemini.
+
+Only one command that changes OCR or batch jobs can use a database at a time. Search, reading, estimates, and failure lists remain available.
 
 #### Common batch situations
 
-| Situation | Outcome and next action |
+| Situation | What to do |
 |---|---|
-| Ringbinder stops, the network goes offline, or a request times out | Progress remains in SQLite. Restore connectivity and run `ringbinder batch continue --model gemini`. |
-| Ringbinder cannot tell whether Gemini accepted a job | It searches Gemini for exactly one matching job and adopts it when found. It will not submit another and risk a duplicate charge. If there is no clear match, run `batch continue` again later or use `batch forget <id>` as the escape hatch. |
-| A file changes, moves, or disappears | Ringbinder checks file contents before upload and never applies results to a different version. Run `sweep`, then `batch continue`. Identical files at another indexed path can still be used. |
-| Only some pages succeed | Completed pages are kept. Failed ranges may be retried, split into smaller ranges, or reported under `batch failures` for a manual `batch retry`. The document becomes searchable after all pages finish. |
-| Cancellation loses the race and the job finishes first | `batch continue` imports the completed result normally. Otherwise, it confirms the cancellation and reports unfinished ranges under `batch failures`. |
-| Gemini expires a job before returning output | Ringbinder tries one replacement job. If that also fails without output, the affected ranges appear under `batch failures`. |
-| Gemini cannot clean up an uploaded input or remote job | Later `batch continue` calls retry temporary failures. If Gemini permanently rejects deletion, Ringbinder warns once and stops retrying it. Cleanup problems do not block OCR. Generated output files remain under Gemini's retention policy. |
+| Ringbinder stops, the network goes offline, or a request times out | Restore connectivity and run `ringbinder batch continue`. Saved progress remains in SQLite. |
+| Ringbinder cannot tell whether Gemini accepted a job | Run `ringbinder batch continue` later. Ringbinder looks for the matching job before submitting anything again. Use `batch forget <id>` only when you want Ringbinder to stop managing it. |
+| A file changes, moves, or disappears | Run `ringbinder sweep`, then `ringbinder batch continue`. Ringbinder checks the file before saving OCR results. |
+| Only some pages succeed | Successful pages stay saved. Run `batch continue`; pages that still need attention eventually appear under `batch failures`. |
+| A job is cancelled, expires, or finishes without usable output | Run `batch continue`, then follow any recovery command shown by `batch failures`. |
 
 ### `find`
 
-Searches OCR text and document paths.
+Search finished OCR text and filenames:
 
 ```sh
 ringbinder find "insurance claim"
@@ -360,15 +341,17 @@ ringbinder find --fts '"insurance" AND "claim"'
 
 Useful flags:
 
-- `--mode and|or` controls how normal query tokens are combined
-- `--fts <query>` sends a raw SQLite FTS5 query
-- `--trigram` also checks the trigram index for noisy or partial matches
-- `--limit` and `--offset` paginate results
-- `--json` emits NDJSON records
+- `--mode and|or` controls whether every search word must match
+- `--fts <query>` accepts an advanced SQLite full-text search expression
+- `--trigram` also looks for fuzzy or partial text, which helps with OCR mistakes
+- `--limit` and `--offset` move through large result sets
+- `--json` prints one JSON record per result
+
+`--verbose` also shows the OCR service and whether the document is still waiting for pages. Filename-only results can include unfinished documents.
 
 ### `read`
 
-Reads full OCR Markdown for a document page or page range.
+Read OCR text for one page or several pages:
 
 ```sh
 ringbinder read --path "/path/to/file.pdf" --page 3
@@ -377,11 +360,11 @@ ringbinder read --path "/path/to/file.pdf" --start 0 --end 4
 ringbinder read --path "/path/to/file.pdf" --page 3 --json
 ```
 
-Page flags are 0-based. Human-readable output displays pages as 1-based.
+Page flags start at 0. Human-readable output displays pages starting at 1 and shows the service and model used for each page. Older results show `unknown`. `read` returns no OCR text while any page in the document is unfinished.
 
 ### `doc`
 
-Lists indexed documents or fetches metadata for one document.
+List indexed documents or inspect one document:
 
 ```sh
 ringbinder doc list
@@ -391,56 +374,65 @@ ringbinder doc get --path "/path/to/file.pdf"
 ringbinder doc get --path "/path/to/file.pdf" --json
 ```
 
-## Rebuilding OCR with another model
+Human-readable output shows how many pages are finished and how many pages each OCR service handled. See [Automation](#automation) for the JSON fields.
 
-Build a second database instead of replacing OCR in the active database. The existing database remains searchable throughout the rebuild.
+## Rebuilding all OCR
+
+To rerun every document with a different OCR service, create a second database. Your current database remains searchable until the replacement is ready.
 
 ```sh
 new_db="$HOME/.config/ringbinder/ringbinder-new.db"
 
-# Index the configured paths into a separate database.
 ringbinder --database "$new_db" sweep
-
-# Review and run one bounded batch with the target provider.
 ringbinder --database "$new_db" cost --model gemini --limit 100
 ringbinder --database "$new_db" ocr --model gemini --limit 100
 
-# If the sample looks good, estimate and process the remaining backlog.
 ringbinder --database "$new_db" cost --model gemini
 ringbinder --database "$new_db" ocr --model gemini
 ```
 
-Check the first batch's OCR results before continuing. If they look good, the unbounded `cost` and `ocr` commands estimate and process everything still pending. Then run one final `sweep` against the new database and use the same unbounded commands to drain any newly pending items.
-
-After verifying searches against `--database "$new_db"`, update `database_path` in the config to point to the new file.
+Check a small sample first. When the results look good, process the rest, run one final `sweep`, and finish any newly found pages. Then set `database_path` to the new database.
 
 ## Automation
 
-Use `--json` on supported commands when you want stable machine-readable output:
+Use `--json` when another program or agent needs the results:
 
 ```sh
 ringbinder find --json --limit 10 "lease renewal"
 ringbinder read --json --path "/path/to/lease.pdf" --page 2 --context 1
 ringbinder doc list --json --limit 100
-ringbinder batch list --model gemini --json
-ringbinder batch failures --model gemini --json
+ringbinder doc get --json --path "/path/to/lease.pdf"
+ringbinder batch list --json
+ringbinder batch failures --json
 ```
 
-`find`, `doc list`, and `batch failures` emit one NDJSON object per line. Each batch failure includes `request_id`, `paths`, one-based `page_start` and `page_end`, `attempt_count`, and `error`; `attempt_count` is the number of automatic batch retries. `read` and `doc get` emit one JSON object.
+`find --json` prints one record per result. Important fields include:
 
-`batch list --json` emits one object with five fields: `batches`, `blocked_requests`, `blocked_contents`, `cleanup_pending`, and `refresh_errors`. The blocked counts remain visible after completed job history has been removed. If Gemini could not refresh a job's status, that job has `stale: true` and the problem appears in `refresh_errors` with `batch_id` and `message`. `batch_id` is the local job ID, or `null` when the whole refresh failed; one overall error can leave several jobs marked stale. The command prints the JSON and exits with a nonzero status when any refresh fails.
+- `path`, `page_index`, `page_count`, `snippet`, `rank`, and `search_source`
+- `model`: the service and model used for an OCR text result; `null` for a filename-only result
+- `ocr_pending`: `true` while the document still has unfinished pages
 
-The included `SKILL.md` is an example agent skill that explains how to use Ringbinder for cited document retrieval.
+`read --json` prints one object with `path` and `pages`. Each page has `page_index`, `markdown`, and `model`. The model is `null` for older results where it was not recorded.
+
+`doc get --json` prints one object. `doc list --json` prints one object per line. Each object has `path`, `created_at`, `modified_at`, `page_count`, `ocr_pages_completed`, `models`, `ocr_pending`, and `deleted`. `models` counts pages by service and model; older pages are grouped under `"model": null`.
+
+`batch failures --json` prints one record for each failed group of pages. Each record has `request_id`, `paths`, `page_start`, `page_end`, `attempt_count`, and `error`. Page numbers start at 1 here. `attempt_count` counts automatic retries after the original attempt.
+
+`batch list --json` prints current jobs, pages that need attention, cleanup still to do, and refresh errors. A job with `"stale": true` could not be checked during that run. Details appear in `refresh_errors`.
+
+The included `SKILL.md` is an example agent skill for finding and citing scanned documents.
 
 ## Privacy and storage
 
-Ringbinder keeps its index and OCR text in a local SQLite database. By default it uses `~/.config/ringbinder/ringbinder.db`; set `database_path` or pass `--database` to use a different file.
+Ringbinder keeps its index and OCR text in a local SQLite database. By default that is `~/.config/ringbinder/ringbinder.db`; use `database_path` or `--database` to choose another location.
 
-`ringbinder ocr` sends each selected document or image to Mistral or Gemini. `batch start` uploads documents to Gemini, and `batch continue`, `list`, `cancel`, and `retry` may also contact Gemini while managing those jobs. Cost estimates stay local and offline, as do `batch failures` and `batch forget`.
+Ringbinder keeps a record of missing and excluded files so it can restore them later. Their OCR text therefore stays in the database after the files disappear or are excluded. Ringbinder has no command for deleting selected OCR records; create a fresh database when you need to remove retained text.
 
-For batch jobs, Ringbinder creates private temporary upload files. It never copies the original document bytes into the SQLite batch-tracking tables, although completed OCR text is kept there until the whole document is ready. After processing a job, Ringbinder asks Gemini to delete the uploaded JSONL input and remote job resource. Gemini manages generated batch output under its own retention policy; its Files API only promises deletion for uploaded files. `batch continue` retries temporary cleanup failures. If Gemini permanently rejects deletion as invalid, Ringbinder warns once and stops retrying it.
+`ringbinder ocr` sends unfinished pages to the selected OCR service. When two services are listed, a page may be sent to the second one if the first says it cannot process it. `batch start` uploads work to Gemini, while `batch continue`, `list`, `cancel`, and `retry` may contact Gemini to manage saved jobs. `cost`, `batch cost`, `batch failures`, and `batch forget` stay local and offline.
 
-If uploading a folder's documents to an OCR service is not acceptable, do not include that folder in your config.
+For batch jobs, Ringbinder creates private temporary upload and download files and removes them after use. It does not store the original document bytes in the database. Successful OCR text is saved locally as soon as it arrives, even when other pages are unfinished. Ringbinder asks Gemini to delete uploaded files and finished job records; Gemini keeps generated output according to its own retention policy. `batch continue` retries cleanup when a temporary problem gets in the way.
+
+If sending a folder's documents to an OCR service is unacceptable, exclude that folder from configuration and run `ringbinder sweep`.
 
 ## Development
 

@@ -53,6 +53,37 @@ func TestWalkGeminiFileRequestsUsesOriginalCompletePDF(t *testing.T) {
 	}
 }
 
+func TestWalkGeminiFileRequestsPlanningErrorIncludesExactRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "planning-error.pdf")
+	if err := os.WriteFile(path, []byte("pdf source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := NewGeminiClient("", time.Now().UTC())
+	client.pageCount = func(context.Context, io.ReadSeeker) (int, error) { return 25, nil }
+	client.extractRange = func(context.Context, io.ReadSeeker, int, int, int) ([]byte, error) {
+		return nil, errors.New("parser failed")
+	}
+	err := client.WalkFileRequests(
+		context.Background(), path, "pdf",
+		func(GeminiPreparedRequest) error {
+			t.Fatal("planning failure yielded a request")
+			return nil
+		},
+		func(sizeErr *GeminiRangeSizeError) error {
+			t.Fatalf("planning failure rejected as a size error: %v", sizeErr)
+			return nil
+		},
+	)
+	var planningErr *GeminiPlanningError
+	if !errors.As(err, &planningErr) {
+		t.Fatalf("WalkFileRequests() error = %v, want GeminiPlanningError", err)
+	}
+	if planningErr.PageStart != 0 || planningErr.PageEnd != 20 ||
+		!strings.Contains(planningErr.Error(), "pages 1-20") {
+		t.Fatalf("planning error = %+v (%v), want range [0,20)", planningErr, planningErr)
+	}
+}
+
 func TestWalkGeminiFileRequestsContinuesAfterOversizedMiddlePage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "three-pages.pdf")
 	if err := os.WriteFile(path, []byte("pdf source"), 0o600); err != nil {

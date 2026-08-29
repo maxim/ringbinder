@@ -10,44 +10,90 @@ import (
 )
 
 type Config struct {
-	Paths            []string `yaml:"paths"`
-	DatabasePath     string   `yaml:"database_path"`
-	Model            *string  `yaml:"model"`
-	SweepConcurrency *int     `yaml:"sweep_concurrency"`
-	OCRConcurrency   *int     `yaml:"ocr_concurrency"`
+	Paths            []string  `yaml:"paths"`
+	DatabasePath     string    `yaml:"database_path"`
+	Model            *[]string `yaml:"-"`
+	Exclude          []string  `yaml:"-"`
+	SweepConcurrency *int      `yaml:"sweep_concurrency"`
 }
 
 func (c *Config) UnmarshalYAML(node *yaml.Node) error {
-	type plainConfig Config
-	var decoded plainConfig
+	var decoded struct {
+		Paths            []string `yaml:"paths"`
+		DatabasePath     string   `yaml:"database_path"`
+		SweepConcurrency *int     `yaml:"sweep_concurrency"`
+	}
 	if err := node.Decode(&decoded); err != nil {
 		return err
 	}
-	*c = Config(decoded)
+	*c = Config{
+		Paths:            decoded.Paths,
+		DatabasePath:     decoded.DatabasePath,
+		SweepConcurrency: decoded.SweepConcurrency,
+	}
 
-	// yaml.v3 maps a present null scalar to a nil pointer just like an absent
-	// key. Preserve key presence so command validation rejects explicit blanks
-	// rather than silently selecting provider defaults.
 	for i := 0; i+1 < len(node.Content); i += 2 {
-		switch node.Content[i].Value {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		switch key {
 		case "model":
-			if c.Model == nil {
-				empty := ""
-				c.Model = &empty
+			models, err := decodeStringOrList(value, "model", false)
+			if err != nil {
+				return err
 			}
+			c.Model = &models
+		case "exclude":
+			patterns, err := decodeStringOrList(value, "exclude", true)
+			if err != nil {
+				return err
+			}
+			c.Exclude = patterns
+		case "ocr_concurrency":
+			return fmt.Errorf("ocr_concurrency is no longer supported; OCR provider limits are fixed")
 		case "sweep_concurrency":
+			// yaml.v3 maps a present null scalar to a nil pointer just like an
+			// absent key. Preserve presence so command validation rejects null.
 			if c.SweepConcurrency == nil {
 				zero := 0
 				c.SweepConcurrency = &zero
 			}
-		case "ocr_concurrency":
-			if c.OCRConcurrency == nil {
-				zero := 0
-				c.OCRConcurrency = &zero
-			}
 		}
 	}
 	return nil
+}
+
+func decodeStringOrList(node *yaml.Node, setting string, allowEmpty bool) ([]string, error) {
+	if node.Tag == "!!null" {
+		return nil, fmt.Errorf("%s cannot be null", setting)
+	}
+
+	var values []string
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if node.Tag != "!!str" {
+			return nil, fmt.Errorf("%s must be a string or an array of strings", setting)
+		}
+		values = []string{node.Value}
+	case yaml.SequenceNode:
+		if len(node.Content) == 0 && !allowEmpty {
+			return nil, fmt.Errorf("%s cannot be empty", setting)
+		}
+		values = make([]string, 0, len(node.Content))
+		for _, item := range node.Content {
+			if item.Kind != yaml.ScalarNode || item.Tag != "!!str" {
+				return nil, fmt.Errorf("%s entries must be strings", setting)
+			}
+			values = append(values, item.Value)
+		}
+	default:
+		return nil, fmt.Errorf("%s must be a string or an array of strings", setting)
+	}
+
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return nil, fmt.Errorf("%s entries cannot be blank", setting)
+		}
+	}
+	return values, nil
 }
 
 func DefaultDir() string {

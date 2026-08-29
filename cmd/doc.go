@@ -54,13 +54,20 @@ var docListCmd = &cobra.Command{
 	RunE:  runDocList,
 }
 
+type modelOutputJSON struct {
+	Model     *string `json:"model"`
+	PageCount int     `json:"page_count"`
+}
+
 type docGetOutputJSON struct {
-	Path       string `json:"path"`
-	CreatedAt  string `json:"created_at"`
-	ModifiedAt string `json:"modified_at"`
-	PageCount  int    `json:"page_count"`
-	OCRPending bool   `json:"ocr_pending"`
-	Deleted    bool   `json:"deleted"`
+	Path              string            `json:"path"`
+	CreatedAt         string            `json:"created_at"`
+	ModifiedAt        string            `json:"modified_at"`
+	PageCount         int               `json:"page_count"`
+	OCRPagesCompleted int               `json:"ocr_pages_completed"`
+	Models            []modelOutputJSON `json:"models"`
+	OCRPending        bool              `json:"ocr_pending"`
+	Deleted           bool              `json:"deleted"`
 }
 
 func runDocGet(cmd *cobra.Command, args []string) error {
@@ -82,14 +89,7 @@ func runDocGet(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("document not found: %s", docGetPath)
 	}
 
-	payload := docGetOutputJSON{
-		Path:       document.Path,
-		CreatedAt:  document.CreatedAt.Format(time.RFC3339Nano),
-		ModifiedAt: document.ModifiedAt.Format(time.RFC3339Nano),
-		PageCount:  document.PageCount,
-		OCRPending: document.OCRPending,
-		Deleted:    document.Deleted,
-	}
+	payload := documentJSON(*document)
 
 	if docGetJSON {
 		jsonEncoder := json.NewEncoder(os.Stdout)
@@ -101,6 +101,8 @@ func runDocGet(cmd *cobra.Command, args []string) error {
 	fmt.Printf("created_at: %s\n", payload.CreatedAt)
 	fmt.Printf("modified_at: %s\n", payload.ModifiedAt)
 	fmt.Printf("page_count: %d\n", payload.PageCount)
+	fmt.Printf("ocr_coverage: %d/%d\n", payload.OCRPagesCompleted, payload.PageCount)
+	fmt.Printf("models: %s\n", formatModelCounts(payload.Models))
 	fmt.Printf("ocr_pending: %t\n", payload.OCRPending)
 	fmt.Printf("deleted: %t\n", payload.Deleted)
 	return nil
@@ -143,14 +145,7 @@ func runDocList(cmd *cobra.Command, args []string) error {
 		jsonEncoder := json.NewEncoder(os.Stdout)
 		jsonEncoder.SetEscapeHTML(false)
 		for _, document := range documents {
-			payload := docGetOutputJSON{
-				Path:       document.Path,
-				CreatedAt:  document.CreatedAt.Format(time.RFC3339Nano),
-				ModifiedAt: document.ModifiedAt.Format(time.RFC3339Nano),
-				PageCount:  document.PageCount,
-				OCRPending: document.OCRPending,
-				Deleted:    document.Deleted,
-			}
+			payload := documentJSON(document)
 			if err := jsonEncoder.Encode(payload); err != nil {
 				return err
 			}
@@ -160,10 +155,12 @@ func runDocList(cmd *cobra.Command, args []string) error {
 
 	for _, document := range documents {
 		fmt.Printf(
-			"%s  %s  (%d pages)\n",
+			"%s  %s  (%d/%d OCR; %s)\n",
 			document.CreatedAt.Format(time.RFC3339Nano),
 			document.Path,
+			document.OCRPagesCompleted,
 			document.PageCount,
+			formatModelCounts(modelCountsJSON(document.Models)),
 		)
 	}
 	if len(documents) > 0 {
@@ -171,6 +168,42 @@ func runDocList(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("%d document(s).\n", len(documents))
 	return nil
+}
+
+func documentJSON(document db.Document) docGetOutputJSON {
+	return docGetOutputJSON{
+		Path:              document.Path,
+		CreatedAt:         document.CreatedAt.Format(time.RFC3339Nano),
+		ModifiedAt:        document.ModifiedAt.Format(time.RFC3339Nano),
+		PageCount:         document.PageCount,
+		OCRPagesCompleted: document.OCRPagesCompleted,
+		Models:            modelCountsJSON(document.Models),
+		OCRPending:        document.OCRPending,
+		Deleted:           document.Deleted,
+	}
+}
+
+func modelCountsJSON(models []db.ModelCount) []modelOutputJSON {
+	result := make([]modelOutputJSON, len(models))
+	for i, model := range models {
+		result[i] = modelOutputJSON{Model: model.Model, PageCount: model.PageCount}
+	}
+	return result
+}
+
+func formatModelCounts(models []modelOutputJSON) string {
+	if len(models) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(models))
+	for i, model := range models {
+		name := "unknown"
+		if model.Model != nil {
+			name = *model.Model
+		}
+		parts[i] = fmt.Sprintf("%s=%d", name, model.PageCount)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func parseDocListTimeFlag(raw string) (*time.Time, error) {

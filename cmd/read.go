@@ -35,8 +35,9 @@ var readCmd = &cobra.Command{
 }
 
 type readPageJSON struct {
-	PageIndex int    `json:"page_index"`
-	Markdown  string `json:"markdown"`
+	PageIndex int     `json:"page_index"`
+	Markdown  string  `json:"markdown"`
+	Model     *string `json:"model"`
 }
 
 type readOutputJSON struct {
@@ -74,6 +75,7 @@ func runRead(cmd *cobra.Command, args []string) error {
 			pages[i] = readPageJSON{
 				PageIndex: pageRecord.PageIndex,
 				Markdown:  pageRecord.Markdown,
+				Model:     pageRecord.Model,
 			}
 		}
 
@@ -90,7 +92,11 @@ func runRead(cmd *cobra.Command, args []string) error {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Printf("--- page %d ---\n", pageRecord.PageIndex+1)
+		model := "unknown"
+		if pageRecord.Model != nil {
+			model = *pageRecord.Model
+		}
+		fmt.Printf("--- page %d (OCR: %s) ---\n", pageRecord.PageIndex+1, model)
 		fmt.Println(pageRecord.Markdown)
 	}
 

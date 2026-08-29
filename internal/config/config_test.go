@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -45,56 +47,67 @@ paths:
 	}
 }
 
-func TestLoad_PreservesSettingPresence(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config.yml")
-	if err := os.WriteFile(cfgPath, []byte("model: '   '\nsweep_concurrency: 0\nocr_concurrency: 0\n"), 0644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
+func TestLoad_ModelAndExcludeScalarOrList(t *testing.T) {
+	tests := []struct {
+		name        string
+		yaml        string
+		wantModels  []string
+		wantExclude []string
+	}{
+		{name: "absent"},
+		{name: "scalars", yaml: "model: mistral\nexclude: '*.tmp.pdf'\n", wantModels: []string{"mistral"}, wantExclude: []string{"*.tmp.pdf"}},
+		{name: "flow lists", yaml: "model: [gemini, mistral]\nexclude: ['a.pdf', '*.png']\n", wantModels: []string{"gemini", "mistral"}, wantExclude: []string{"a.pdf", "*.png"}},
+		{name: "block lists", yaml: "model:\n  - gemini\n  - mistral\nexclude:\n  - a.pdf\n", wantModels: []string{"gemini", "mistral"}, wantExclude: []string{"a.pdf"}},
+		{name: "empty excludes", yaml: "exclude: []\n", wantExclude: []string{}},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yml")
+			if err := os.WriteFile(path, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if tt.wantModels == nil {
+				if cfg.Model != nil {
+					t.Fatalf("Model = %#v, want absent", cfg.Model)
+				}
+			} else if fmt.Sprint(*cfg.Model) != fmt.Sprint(tt.wantModels) {
+				t.Fatalf("Model = %v, want %v", *cfg.Model, tt.wantModels)
+			}
+			if fmt.Sprint(cfg.Exclude) != fmt.Sprint(tt.wantExclude) {
+				t.Fatalf("Exclude = %v, want %v", cfg.Exclude, tt.wantExclude)
+			}
+		})
+	}
+}
 
-	cfg, err := Load(cfgPath)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+func TestLoad_RejectsInvalidModelAndStaleConcurrency(t *testing.T) {
+	tests := []struct {
+		name, yaml, want string
+	}{
+		{name: "null model", yaml: "model:\n", want: "model cannot be null"},
+		{name: "empty model list", yaml: "model: []\n", want: "model cannot be empty"},
+		{name: "blank model", yaml: "model: [' ']\n", want: "model entries cannot be blank"},
+		{name: "wrong model type", yaml: "model: 1\n", want: "model must be a string"},
+		{name: "null exclude", yaml: "exclude:\n", want: "exclude cannot be null"},
+		{name: "blank exclude", yaml: "exclude: [' ']\n", want: "exclude entries cannot be blank"},
+		{name: "non-string exclude", yaml: "exclude: [1]\n", want: "exclude entries must be strings"},
+		{name: "stale concurrency", yaml: "ocr_concurrency: 4\n", want: "ocr_concurrency is no longer supported"},
 	}
-	if cfg.Model == nil || *cfg.Model != "   " {
-		t.Fatalf("Model = %#v, want present whitespace value", cfg.Model)
-	}
-	if cfg.SweepConcurrency == nil || *cfg.SweepConcurrency != 0 {
-		t.Fatalf("SweepConcurrency = %#v, want present zero value", cfg.SweepConcurrency)
-	}
-	if cfg.OCRConcurrency == nil || *cfg.OCRConcurrency != 0 {
-		t.Fatalf("OCRConcurrency = %#v, want present zero value", cfg.OCRConcurrency)
-	}
-
-	blankPath := filepath.Join(t.TempDir(), "blank.yml")
-	if err := os.WriteFile(blankPath, []byte("model:\nsweep_concurrency:\nocr_concurrency:\n"), 0644); err != nil {
-		t.Fatalf("WriteFile(blank) error = %v", err)
-	}
-	blank, err := Load(blankPath)
-	if err != nil {
-		t.Fatalf("Load(blank) error = %v", err)
-	}
-	if blank.Model == nil || *blank.Model != "" {
-		t.Fatalf("blank Model = %#v, want present empty value", blank.Model)
-	}
-	if blank.SweepConcurrency == nil || *blank.SweepConcurrency != 0 {
-		t.Fatalf("blank SweepConcurrency = %#v, want present zero value", blank.SweepConcurrency)
-	}
-	if blank.OCRConcurrency == nil || *blank.OCRConcurrency != 0 {
-		t.Fatalf("blank OCRConcurrency = %#v, want present zero value", blank.OCRConcurrency)
-	}
-
-	missingPath := filepath.Join(t.TempDir(), "missing.yml")
-	missing, err := Load(missingPath)
-	if err != nil {
-		t.Fatalf("Load(missing) error = %v", err)
-	}
-	if missing.Model != nil || missing.SweepConcurrency != nil || missing.OCRConcurrency != nil {
-		t.Fatalf(
-			"missing settings = (%#v, %#v, %#v), want nil",
-			missing.Model,
-			missing.SweepConcurrency,
-			missing.OCRConcurrency,
-		)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yml")
+			if err := os.WriteFile(path, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Load() error = %v, want %q", err, tt.want)
+			}
+		})
 	}
 }
 

@@ -48,6 +48,45 @@ func TestInsertDocument_WithContentID(t *testing.T) {
 	}
 }
 
+func TestGetDocumentMetadataByPathSkipsOCRCoverage(t *testing.T) {
+	t.Parallel()
+
+	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	contentID, err := database.InsertContent("metadata", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := database.InsertDocument("/docs/metadata.pdf", contentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	model := "provider-model"
+	if err := database.UpsertContentPages(contentID, []PageInput{{
+		PageIndex: 0, Markdown: "page", Model: &model,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata, err := database.GetDocumentMetadataByPath("/docs/metadata.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata == nil || metadata.OCRPagesCompleted != 0 || metadata.Models != nil {
+		t.Fatalf("metadata document = %+v, want coverage left unhydrated", metadata)
+	}
+	full, err := database.GetDocumentByPath("/docs/metadata.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full == nil || full.OCRPagesCompleted != 1 || len(full.Models) != 1 {
+		t.Fatalf("full document = %+v, want hydrated coverage", full)
+	}
+}
+
 func TestUpdateDocument_ChangesContentID(t *testing.T) {
 	t.Parallel()
 
@@ -116,8 +155,10 @@ func TestAllDocuments_IncludesNonPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertContent(bbb) error = %v", err)
 	}
-	if err := database.MarkContentOCRDone(contentB); err != nil {
-		t.Fatalf("MarkContentOCRDone() error = %v", err)
+	for pageIndex := 0; pageIndex < 2; pageIndex++ {
+		if err := database.UpsertPage(contentB, pageIndex, "complete"); err != nil {
+			t.Fatalf("UpsertPage(%d) error = %v", pageIndex, err)
+		}
 	}
 
 	id1, err := database.InsertDocument("/docs/a.pdf", contentA, now, now)
@@ -277,8 +318,10 @@ func TestAllStats_IncludesNonPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertContent(done) error = %v", err)
 	}
-	if err := database.MarkContentOCRDone(contentDone); err != nil {
-		t.Fatalf("MarkContentOCRDone() error = %v", err)
+	for pageIndex := 0; pageIndex < 2; pageIndex++ {
+		if err := database.UpsertPage(contentDone, pageIndex, "complete"); err != nil {
+			t.Fatalf("UpsertPage(%d) error = %v", pageIndex, err)
+		}
 	}
 
 	if _, err := database.InsertDocument("/docs/a.pdf", contentPending, now, now); err != nil {

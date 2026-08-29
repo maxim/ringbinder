@@ -61,7 +61,11 @@ func TestGeminiOCRFileRequestAndMarkdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := pages, []PageResult{{PageIndex: 0, Markdown: "# Receipt\n\n[Page: A receipt page]\n\n[Image: logo — Store mark]"}}; !equalPages(got, want) {
+	if got, want := pages, []PageResult{{
+		PageIndex: 0,
+		Markdown:  "# Receipt\n\n[Page: A receipt page]\n\n[Image: logo — Store mark]",
+		Model:     geminiModel,
+	}}; !equalPages(got, want) {
 		t.Fatalf("pages = %#v, want %#v", got, want)
 	}
 	if got, want := report.KnownCost, GeminiCost(client.runAt, 10, 5); got != want || report.Indeterminate {
@@ -541,7 +545,11 @@ func TestGeminiPDFChunksUseRelativeIndexesAndAbsoluteOffsets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := pages, []PageResult{{0, "[Page: Page]"}, {1, "[Page: Page]"}, {2, "[Page: Page]"}}; !equalPages(got, want) {
+	if got, want := pages, []PageResult{
+		{PageIndex: 0, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 1, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 2, Markdown: "[Page: Page]", Model: geminiModel},
+	}; !equalPages(got, want) {
 		t.Fatalf("pages = %#v, want %#v", got, want)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -592,7 +600,12 @@ func TestGeminiPDFRecursivelySplits413AndKeepsBilling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPages := []PageResult{{0, "[Page: Page]"}, {1, "[Page: Page]"}, {2, "[Page: Page]"}, {3, "[Page: Page]"}}
+	wantPages := []PageResult{
+		{PageIndex: 0, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 1, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 2, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 3, Markdown: "[Page: Page]", Model: geminiModel},
+	}
 	if !equalPages(pages, wantPages) {
 		t.Fatalf("pages = %#v, want %#v", pages, wantPages)
 	}
@@ -652,7 +665,10 @@ func TestGeminiPDFMaxTokensWithoutCandidateIndexSplitsImmediately(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPages := []PageResult{{0, "[Page: Page]"}, {1, "[Page: Page]"}}
+	wantPages := []PageResult{
+		{PageIndex: 0, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 1, Markdown: "[Page: Page]", Model: geminiModel},
+	}
 	if !equalPages(pages, wantPages) || atomic.LoadInt32(&calls) != 3 {
 		t.Fatalf("pages = %#v, calls = %d; want split with absolute indexes", pages, calls)
 	}
@@ -706,7 +722,10 @@ func TestGeminiPDFAdaptiveSplitRetainsIndeterminateBilling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPages := []PageResult{{0, "[Page: Page]"}, {1, "[Page: Page]"}}
+	wantPages := []PageResult{
+		{PageIndex: 0, Markdown: "[Page: Page]", Model: geminiModel},
+		{PageIndex: 1, Markdown: "[Page: Page]", Model: geminiModel},
+	}
 	if !equalPages(pages, wantPages) {
 		t.Fatalf("pages = %#v, want %#v", pages, wantPages)
 	}
@@ -734,7 +753,7 @@ func TestGeminiSinglePageOriginalAdaptiveFailuresDoNotExtract(t *testing.T) {
 			response: func(w http.ResponseWriter) {
 				_, _ = w.Write([]byte(geminiResponseJSON("MAX_TOKENS", `{}`, 2, 1, 1)))
 			},
-			wantCalls: 2,
+			wantCalls: 1,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

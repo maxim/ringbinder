@@ -101,6 +101,7 @@ type GeminiBatchRequest struct {
 type GeminiStagedPage struct {
 	PageIndex int
 	Markdown  string
+	Model     string
 }
 
 type GeminiCleanup struct {
@@ -113,6 +114,8 @@ type GeminiCleanup struct {
 }
 
 func (db *DB) PendingContentsForDirect() ([]Content, int, error) {
+	// Exclude the whole content item while any batch request is active. Direct
+	// and asynchronous writers must not compete over ownership of its ranges.
 	contents, err := db.pendingContentsWithRequestFilter(
 		`NOT EXISTS (
 		   SELECT 1 FROM gemini_batch_requests r
@@ -138,12 +141,63 @@ func (db *DB) PendingContentsForDirect() ([]Content, int, error) {
 }
 
 func (db *DB) PendingContentsForGeminiBatch() ([]Content, error) {
-	return db.pendingContentsWithRequestFilter(
-		`NOT EXISTS (
-		   SELECT 1 FROM gemini_batch_requests r
-		   WHERE r.content_id = c.id
-		 )`,
+	contents, err := db.PendingContents()
+	if err != nil {
+		return nil, err
+	}
+	eligible := make([]Content, 0, len(contents))
+	for _, content := range contents {
+		ranges, err := db.MissingUnownedPageRanges(content.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(ranges) > 0 {
+			eligible = append(eligible, content)
+		}
+	}
+	return eligible, nil
+}
+
+func (db *DB) MissingUnownedPageRanges(contentID int64) ([]PageRange, error) {
+	missing, err := db.MissingPageIndexes(contentID)
+	if err != nil || len(missing) == 0 {
+		return nil, err
+	}
+	rows, err := db.Query(
+		`SELECT page_start, page_end FROM gemini_batch_requests
+		 WHERE content_id = ? ORDER BY page_start, page_end`,
+		contentID,
 	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reserved []PageRange
+	for rows.Next() {
+		var pageRange PageRange
+		if err := rows.Scan(&pageRange.Start, &pageRange.End); err != nil {
+			return nil, err
+		}
+		reserved = append(reserved, pageRange)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	available := make([]int, 0, len(missing))
+	for _, index := range missing {
+		owned := false
+		for _, pageRange := range reserved {
+			if index >= pageRange.Start && index < pageRange.End {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			available = append(available, index)
+		}
+	}
+	return coalescePageIndexes(available), nil
 }
 
 func (db *DB) pendingContentsWithRequestFilter(filter string) ([]Content, error) {
@@ -724,6 +778,84 @@ func (db *DB) StageGeminiDirectRequest(
 	)
 }
 
+func (db *DB) CompleteGeminiDirectRequest(
+	requestID int64,
+	pages []PageInput,
+	knownCost int64,
+	indeterminate bool,
+	now time.Time,
+) (contentComplete bool, err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer rollbackOnError(tx, &err)
+	var contentID int64
+	var start, end int
+	var state string
+	if err = tx.QueryRow(
+		`SELECT content_id, page_start, page_end, state
+		 FROM gemini_batch_requests WHERE id = ?`,
+		requestID,
+	).Scan(&contentID, &start, &end, &state); err != nil {
+		return false, err
+	}
+	if state != GeminiRequestBlocked {
+		return false, fmt.Errorf("Gemini request %d is not blocked", requestID)
+	}
+	for _, page := range pages {
+		if page.PageIndex < start || page.PageIndex >= end {
+			return false, fmt.Errorf(
+				"Gemini request %d returned page index %d outside its range",
+				requestID, page.PageIndex,
+			)
+		}
+	}
+	if len(pages) > 0 {
+		if err = upsertContentPagesTx(tx, contentID, pages); err != nil {
+			return false, err
+		}
+	}
+	var completed int
+	if err = tx.QueryRow(
+		`SELECT COUNT(*) FROM pages
+		 WHERE content_id = ? AND page_index >= ? AND page_index < ?`,
+		contentID, start, end,
+	).Scan(&completed); err != nil {
+		return false, err
+	}
+	if completed != end-start {
+		return false, fmt.Errorf(
+			"Gemini request %d still has %d missing page(s)",
+			requestID, end-start-completed,
+		)
+	}
+	if err = recomputeContentPendingTx(tx, contentID); err != nil {
+		return false, err
+	}
+	indeterminateValue := 0
+	if indeterminate {
+		indeterminateValue = 1
+	}
+	if _, err = tx.Exec(
+		`UPDATE gemini_batch_requests
+		 SET state = 'staged', known_cost = ?, cost_indeterminate = ?,
+		     last_error = '', updated_at = ?
+		 WHERE id = ?`,
+		knownCost, indeterminateValue, now.UTC().Format(time.RFC3339Nano), requestID,
+	); err != nil {
+		return false, err
+	}
+	var pending int
+	if err = tx.QueryRow(`SELECT ocr_pending FROM contents WHERE id = ?`, contentID).Scan(&pending); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return pending == 0, nil
+}
+
 func (db *DB) stageGeminiRequest(
 	requestID int64,
 	expectedState string,
@@ -756,19 +888,24 @@ func (db *DB) stageGeminiRequest(
 		return fmt.Errorf("Gemini request %d returned %d pages; expected %d", requestID, len(pages), end-start)
 	}
 	seen := make(map[int]bool, len(pages))
+	inputs := make([]PageInput, 0, len(pages))
 	for _, page := range pages {
 		if page.PageIndex < start || page.PageIndex >= end || seen[page.PageIndex] {
 			return fmt.Errorf("Gemini request %d returned invalid absolute page index %d", requestID, page.PageIndex)
 		}
-		seen[page.PageIndex] = true
-		if _, err = tx.Exec(
-			`INSERT INTO gemini_batch_pages (request_id, content_id, page_index, markdown)
-			 VALUES (?, ?, ?, ?)
-			 ON CONFLICT(request_id, page_index) DO UPDATE SET markdown = excluded.markdown`,
-			requestID, contentID, page.PageIndex, page.Markdown,
-		); err != nil {
-			return err
+		if strings.TrimSpace(page.Model) == "" {
+			return fmt.Errorf("Gemini request %d returned a blank OCR model", requestID)
 		}
+		seen[page.PageIndex] = true
+		model := page.Model
+		inputs = append(inputs, PageInput{
+			PageIndex: page.PageIndex,
+			Markdown:  page.Markdown,
+			Model:     &model,
+		})
+	}
+	if err = upsertContentPagesTx(tx, contentID, inputs); err != nil {
+		return err
 	}
 	indeterminateValue := 0
 	if indeterminate {
@@ -1010,17 +1147,19 @@ func (db *DB) BlockGeminiBatchRequests(batchID int64, message string, now time.T
 	return err
 }
 
-func (db *DB) PromoteReadyGeminiContents() (promoted int, err error) {
+func (db *DB) RetireCompletedGeminiRequests() (completed int, err error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer rollbackOnError(tx, &err)
 
+	// Successful request pages are canonical immediately. Once exact coverage is
+	// complete, only request bookkeeping remains to be retired.
 	rows, err := tx.Query(
-		`SELECT c.id, c.page_count
+		`SELECT c.id
 		 FROM contents c
-		 WHERE c.ocr_pending = 1
+		 WHERE c.ocr_pending = 0
 		   AND EXISTS (
 		     SELECT 1 FROM gemini_batch_requests r
 		     WHERE r.content_id = c.id AND r.state = 'staged'
@@ -1030,80 +1169,35 @@ func (db *DB) PromoteReadyGeminiContents() (promoted int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	var candidates []struct {
-		id    int64
-		pages int
-	}
+	var contentIDs []int64
 	for rows.Next() {
-		var candidate struct {
-			id    int64
-			pages int
-		}
-		if err = rows.Scan(&candidate.id, &candidate.pages); err != nil {
+		var contentID int64
+		if err = rows.Scan(&contentID); err != nil {
 			_ = rows.Close()
 			return 0, err
 		}
-		candidates = append(candidates, candidate)
+		contentIDs = append(contentIDs, contentID)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
 	}
 	if err = rows.Close(); err != nil {
 		return 0, err
 	}
-
-	for _, candidate := range candidates {
-		var count int
-		var minimum, maximum sql.NullInt64
-		if err = tx.QueryRow(
-			`SELECT COUNT(*), MIN(page_index), MAX(page_index)
-			 FROM gemini_batch_pages WHERE content_id = ?`,
-			candidate.id,
-		).Scan(&count, &minimum, &maximum); err != nil {
+	for _, contentID := range contentIDs {
+		if _, err = tx.Exec(
+			`DELETE FROM gemini_batch_requests WHERE content_id = ? AND state = 'staged'`,
+			contentID,
+		); err != nil {
 			return 0, err
 		}
-		if count != candidate.pages || !minimum.Valid || !maximum.Valid ||
-			minimum.Int64 != 0 || maximum.Int64 != int64(candidate.pages-1) {
-			continue
-		}
-
-		pageRows, queryErr := tx.Query(
-			`SELECT page_index, markdown FROM gemini_batch_pages
-			 WHERE content_id = ? ORDER BY page_index`,
-			candidate.id,
-		)
-		if queryErr != nil {
-			return 0, queryErr
-		}
-		var pages []PageInput
-		for pageRows.Next() {
-			var page PageInput
-			if err = pageRows.Scan(&page.PageIndex, &page.Markdown); err != nil {
-				_ = pageRows.Close()
-				return 0, err
-			}
-			pages = append(pages, page)
-		}
-		if err = pageRows.Err(); err != nil {
-			_ = pageRows.Close()
-			return 0, err
-		}
-		if err = pageRows.Close(); err != nil {
-			return 0, err
-		}
-		if len(pages) != candidate.pages {
-			return 0, fmt.Errorf("content %d staged page coverage changed during promotion", candidate.id)
-		}
-		if err = replaceContentPagesTx(tx, candidate.id, pages); err != nil {
-			return 0, err
-		}
-		if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE content_id = ?`, candidate.id); err != nil {
-			return 0, err
-		}
-		promoted++
+		completed++
 	}
-
 	if err = tx.Commit(); err != nil {
 		return 0, err
 	}
-	return promoted, nil
+	return completed, nil
 }
 
 func (db *DB) ReplaceContentPagesDirect(contentID int64, pages []PageInput, now time.Time) (err error) {
@@ -1128,44 +1222,50 @@ func (db *DB) ReplaceContentPagesDirect(contentID int64, pages []PageInput, now 
 	if err != nil {
 		return err
 	}
-	if err = replaceContentPagesTx(tx, contentID, pages); err != nil {
+	if err = upsertContentPagesTx(tx, contentID, pages); err != nil {
 		return err
 	}
-	// Successful whole-file direct OCR supersedes partial, unowned batch staging
-	// and provenance so forgetting an older batch cannot erase the newer result.
-	if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE content_id = ?`, contentID); err != nil {
+
+	rows, err := tx.Query(
+		`SELECT r.id, r.page_start, r.page_end,
+		        (SELECT COUNT(*) FROM pages p
+		         WHERE p.content_id = r.content_id
+		           AND p.page_index >= r.page_start AND p.page_index < r.page_end)
+		 FROM gemini_batch_requests r
+		 WHERE r.content_id = ? AND r.batch_id IS NULL`,
+		contentID,
+	)
+	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM gemini_batch_contents WHERE content_id = ?`, contentID); err != nil {
+	var completedRequestIDs []int64
+	for rows.Next() {
+		var requestID int64
+		var start, end, completed int
+		if err = rows.Scan(&requestID, &start, &end, &completed); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if completed == end-start {
+			completedRequestIDs = append(completedRequestIDs, requestID)
+		}
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, requestID := range completedRequestIDs {
+		if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE id = ?`, requestID); err != nil {
+			return err
+		}
 	}
 	if err = reconcilePreparedGeminiBatchesTx(tx, prepared, now); err != nil {
 		return err
 	}
 	return tx.Commit()
-}
-
-func replaceContentPagesTx(tx *sql.Tx, contentID int64, pages []PageInput) error {
-	for _, page := range pages {
-		if _, err := tx.Exec(
-			`INSERT INTO pages (content_id, page_index, markdown, search_text)
-			 VALUES (?, ?, ?, ?)
-			 ON CONFLICT(content_id, page_index) DO UPDATE SET
-			   markdown = excluded.markdown,
-			   search_text = excluded.search_text`,
-			contentID, page.PageIndex, page.Markdown, normalizeSearchText(page.Markdown),
-		); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(
-		`DELETE FROM pages WHERE content_id = ? AND page_index >= ?`,
-		contentID, len(pages),
-	); err != nil {
-		return err
-	}
-	_, err := tx.Exec(`UPDATE contents SET ocr_pending = 0 WHERE id = ?`, contentID)
-	return err
 }
 
 func preparedGeminiBatchesForContentsTx(
@@ -1268,6 +1368,8 @@ func (db *DB) ForgetGeminiBatch(batchID int64, now time.Time) (batch *GeminiBatc
 	}
 	defer rollbackOnError(tx, &err)
 
+	// Supported migrations only create complete provenance. Keep this fail-closed
+	// guard for databases assembled or edited outside Ringbinder.
 	var provenanceComplete int
 	if err = tx.QueryRow(
 		`SELECT content_provenance_complete FROM gemini_batches WHERE id = ?`, batchID,
@@ -1281,10 +1383,8 @@ func (db *DB) ForgetGeminiBatch(batchID int64, now time.Time) (batch *GeminiBatc
 		)
 	}
 
-	// Request rows disappear after promotion, so batch-to-content provenance
-	// remains separate until the batch itself is finalized or forgotten.
 	rows, err := tx.Query(
-		`SELECT content_id FROM gemini_batch_contents
+		`SELECT DISTINCT content_id FROM gemini_batch_requests
 		 WHERE batch_id = ? ORDER BY content_id`,
 		batchID,
 	)
@@ -1308,29 +1408,16 @@ func (db *DB) ForgetGeminiBatch(batchID int64, now time.Time) (batch *GeminiBatc
 		return nil, err
 	}
 
-	prepared, err := preparedGeminiBatchesForContentsTx(tx, contentIDs, batchID)
-	if err != nil {
+	// Only unfinished requests still owned by this batch are abandoned.
+	// Canonical successes and requests already reassigned to replacement batches
+	// belong to their newer lineage and must survive forgetting this record.
+	if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE batch_id = ?`, batchID); err != nil {
 		return nil, err
 	}
 	for _, contentID := range contentIDs {
-		// Forgetting is content-wide so partial ranges cannot strand a document
-		// or keep it out of a future fresh batch. Request deletion cascades staged
-		// pages; canonical pages cover the promotion-before-finalization window.
-		if _, err = tx.Exec(`DELETE FROM gemini_batch_requests WHERE content_id = ?`, contentID); err != nil {
+		if err = recomputeContentPendingTx(tx, contentID); err != nil {
 			return nil, err
 		}
-		if _, err = tx.Exec(`DELETE FROM pages WHERE content_id = ?`, contentID); err != nil {
-			return nil, err
-		}
-		if _, err = tx.Exec(`DELETE FROM gemini_batch_contents WHERE content_id = ?`, contentID); err != nil {
-			return nil, err
-		}
-		if _, err = tx.Exec(`UPDATE contents SET ocr_pending = 1 WHERE id = ?`, contentID); err != nil {
-			return nil, err
-		}
-	}
-	if err = reconcilePreparedGeminiBatchesTx(tx, prepared, now); err != nil {
-		return nil, err
 	}
 
 	// Forget intentionally abandons remote artifacts, including any queued

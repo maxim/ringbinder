@@ -65,13 +65,13 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 
 	contents, err := command.database.PendingContentsForGeminiBatch()
 	if err != nil {
-		return fmt.Errorf("query untouched pending contents: %w", err)
+		return fmt.Errorf("query pending contents with unassigned pages: %w", err)
 	}
 	if limit > 0 && limit < len(contents) {
 		contents = contents[:limit]
 	}
 	if len(contents) == 0 {
-		fmt.Println("No untouched documents pending Gemini batch OCR.")
+		fmt.Println("No documents have unassigned pages pending Gemini batch OCR.")
 		return reportBatchBlockedSummary(command.database)
 	}
 
@@ -122,7 +122,8 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		contentStartSize := group.size
 		contentStartPlans := len(group.plans)
 		var blockedPlans []db.GeminiBlockedRequest
-		prepareErr := planner.WalkFileRequests(cmd.Context(), path, fileType, func(request ocr.GeminiPreparedRequest) error {
+		missingRanges, prepareErr := command.database.MissingUnownedPageRanges(content.ID)
+		yield := func(request ocr.GeminiPreparedRequest) error {
 			plan := db.GeminiRequestPlan{
 				ContentID: content.ID, RequestKey: newGeminiLocalKey(), FileType: fileType,
 				PageStart: request.PageStart, PageEnd: request.PageEnd,
@@ -151,7 +152,8 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 			group.size += int64(len(line))
 			group.plans = append(group.plans, plan)
 			return nil
-		}, func(sizeErr *ocr.GeminiRangeSizeError) error {
+		}
+		reject := func(sizeErr *ocr.GeminiRangeSizeError) error {
 			blockedPlans = append(blockedPlans, db.GeminiBlockedRequest{
 				Plan: db.GeminiRequestPlan{
 					ContentID: content.ID, RequestKey: newGeminiLocalKey(), FileType: fileType,
@@ -160,7 +162,16 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 				Message: sizeErr.Error(),
 			})
 			return nil
-		})
+		}
+		for _, pageRange := range missingRanges {
+			if prepareErr != nil {
+				break
+			}
+			prepareErr = walkGeminiMissingRange(
+				cmd.Context(), planner, path, fileType,
+				pageRange.Start, pageRange.End, yield, reject,
+			)
+		}
 		// Nothing is persisted until every selected item is prepared. On
 		// cancellation, discard all in-memory groups instead of blocking work.
 		if contextErr := cmd.Context().Err(); contextErr != nil {
@@ -183,7 +194,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 				blockedWork = append(blockedWork, db.GeminiBlockedRequest{
 					Plan: db.GeminiRequestPlan{
 						ContentID: content.ID, RequestKey: newGeminiLocalKey(), FileType: fileType,
-						PageStart: planningErr.PageStart, PageEnd: content.PageCount,
+						PageStart: planningErr.PageStart, PageEnd: planningErr.PageEnd,
 					},
 					Message: planningErr.Error(),
 				})
@@ -202,7 +213,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 	}
 	if len(groups) == 0 && len(blockedWork) == 0 {
 		if len(commandErrors) == 0 {
-			fmt.Println("No valid untouched documents could be prepared for Gemini batch OCR.")
+			fmt.Println("No valid pending page ranges could be prepared for Gemini batch OCR.")
 		}
 		if summaryErr := reportBatchBlockedSummary(command.database); summaryErr != nil {
 			commandErrors = append(commandErrors, summaryErr)
@@ -374,6 +385,50 @@ func geminiBatchMembershipMatches(manifest []string, requests []db.GeminiBatchRe
 		}
 	}
 	return true
+}
+
+func walkGeminiMissingRange(
+	ctx context.Context,
+	planner *ocr.GeminiClient,
+	path, fileType string,
+	start, end int,
+	yield func(ocr.GeminiPreparedRequest) error,
+	reject func(*ocr.GeminiRangeSizeError) error,
+) error {
+	// Use maximal page-limit chunks first. Midpoint recursion below is reserved
+	// for requests that still exceed byte limits after this deterministic split.
+	if fileType == "pdf" && end-start > geminiPDFPagesPerChunk {
+		for chunkStart := start; chunkStart < end; chunkStart += geminiPDFPagesPerChunk {
+			chunkEnd := min(chunkStart+geminiPDFPagesPerChunk, end)
+			if err := walkGeminiMissingRange(
+				ctx, planner, path, fileType, chunkStart, chunkEnd, yield, reject,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	request, err := planner.PrepareRangeRequest(ctx, path, fileType, start, end)
+	if err == nil {
+		return yield(request)
+	}
+	var sizeErr *ocr.GeminiRangeSizeError
+	if !errors.As(err, &sizeErr) {
+		return &ocr.GeminiPlanningError{
+			PageStart: start,
+			PageEnd:   end,
+			Cause:     fmt.Errorf("%s: %w", path, err),
+		}
+	}
+	if end-start == 1 {
+		return reject(sizeErr)
+	}
+	mid := start + (end-start)/2
+	if err := walkGeminiMissingRange(ctx, planner, path, fileType, start, mid, yield, reject); err != nil {
+		return err
+	}
+	return walkGeminiMissingRange(ctx, planner, path, fileType, mid, end, yield, reject)
 }
 
 func marshalGeminiBatchLine(key string, request []byte) ([]byte, error) {

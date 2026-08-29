@@ -126,7 +126,7 @@ func runBatchFailures(cmd *cobra.Command, args []string) error {
 	if !jsonOutput {
 		fmt.Println()
 		fmt.Println("Recovery commands:")
-		fmt.Println("  Retry one range at direct Gemini pricing: ringbinder batch retry <request-id> --mode direct --model gemini")
+		fmt.Println("  Retry one range at direct Gemini pricing: ringbinder batch retry <request-id> --mode direct")
 		fmt.Println("  Retry all pending documents with Mistral: ringbinder ocr --model mistral")
 	}
 	return nil

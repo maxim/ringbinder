@@ -148,7 +148,7 @@ func TestBatchContinueDoesNotReportIdleAfterPromotingStagedContent(t *testing.T)
 	batch, request := addPreparedImageTestBatch(t, database, "promote")
 	if err := database.StageGeminiRequest(
 		request.ID,
-		[]db.GeminiStagedPage{{PageIndex: 0, Markdown: "ready"}},
+		[]db.GeminiStagedPage{{PageIndex: 0, Markdown: "ready", Model: "gemini-test"}},
 		nil,
 		nil,
 		0,

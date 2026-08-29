@@ -152,46 +152,6 @@ func TestOCRCoordinatorLockFailsFastAndReleases(t *testing.T) {
 	_ = third.Close()
 }
 
-func TestDirectOCRSkipsAssignedBatchAndClearsUnownedStagingAfterSuccess(t *testing.T) {
-	database := openCostTestDB(t)
-	now := time.Now().UTC()
-	ownedID := addCostContent(t, database, "owned", 1, true, "/docs/owned.png")
-	blockedID := addCostContent(t, database, "blocked", 1, true, "/docs/blocked.png")
-	if _, err := database.CreateGeminiBatch(
-		"owned-batch", ocr.GeminiBatchModel, 375, 1875, nil,
-		[]db.GeminiRequestPlan{{ContentID: ownedID, RequestKey: "owned-key", FileType: "png", PageStart: 0, PageEnd: 1}},
-		now,
-	); err != nil {
-		t.Fatalf("CreateGeminiBatch() error = %v", err)
-	}
-	blockedRequestID, err := database.CreateBlockedGeminiRequest(
-		db.GeminiRequestPlan{ContentID: blockedID, RequestKey: "blocked-key", FileType: "png", PageStart: 0, PageEnd: 1},
-		"blocked", now,
-	)
-	if err != nil {
-		t.Fatalf("CreateBlockedGeminiRequest() error = %v", err)
-	}
-	provider := &fakeOCRProvider{pages: []ocr.PageResult{{PageIndex: 0, Markdown: "replacement"}}}
-	output := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, provider, 0, 1); err != nil {
-			t.Fatalf("processOCR() error = %v", err)
-		}
-	})
-	if !strings.Contains(output, "Skipped 1 content item(s) already managed by batch OCR.") {
-		t.Fatalf("output = %q, want assigned skip count", output)
-	}
-	if provider.calls.Load() != 1 {
-		t.Fatalf("provider calls = %d, want only unowned blocked content", provider.calls.Load())
-	}
-	request, err := database.GeminiRequestByID(blockedRequestID)
-	if err != nil {
-		t.Fatalf("GeminiRequestByID() error = %v", err)
-	}
-	if request != nil {
-		t.Fatalf("blocked staging was not cleared after successful direct replacement: %+v", request)
-	}
-}
-
 func TestDirectCostReportsBatchOwnedExclusion(t *testing.T) {
 	resetCommandState(t)
 	dbPath := filepath.Join(t.TempDir(), "direct-cost.db")
@@ -209,50 +169,18 @@ func TestDirectCostReportsBatchOwnedExclusion(t *testing.T) {
 	}
 	_ = database.Close()
 	cmd := commandWithDatabaseFlag(t, dbPath)
-	cmd.Flags().String("model", "", "")
+	cmd.Flags().StringArray("model", nil, "")
 	cmd.Flags().Int("limit", 0, "")
 	if err := cmd.Flags().Set("model", modelMistral); err != nil {
-		t.Fatalf("set model: %v", err)
+		t.Fatalf("set OCR model: %v", err)
 	}
 	output := captureStdout(t, func() {
 		if err := runCost(cmd, nil); err != nil {
 			t.Fatalf("runCost() error = %v", err)
 		}
 	})
-	if output != "Excluded from estimate: 1 content item(s) already managed by batch OCR\nNo documents pending OCR.\n" {
+	if output != "OCR models: mistral\nExcluded from estimate: 1 content item(s) already managed by batch OCR\nNo documents pending OCR.\n" {
 		t.Fatalf("output = %q", output)
-	}
-}
-
-func TestBatchCommandsRejectMistralBeforeAPIKeyOrMutation(t *testing.T) {
-	resetCommandState(t)
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("GEMINI_API_KEY", "")
-	dbPath := filepath.Join(t.TempDir(), "batch.db")
-	database, err := db.Open(dbPath)
-	if err != nil {
-		t.Fatalf("db.Open() error = %v", err)
-	}
-	contentID := addCostContent(t, database, "tracked", 1, true, "/docs/tracked.png")
-	if _, err := database.CreateGeminiBatch(
-		"tracked-batch", ocr.GeminiBatchModel, 375, 1875, nil,
-		[]db.GeminiRequestPlan{{ContentID: contentID, RequestKey: "tracked-key", FileType: "png", PageStart: 0, PageEnd: 1}},
-		time.Now().UTC(),
-	); err != nil {
-		t.Fatalf("CreateGeminiBatch() error = %v", err)
-	}
-	_ = database.Close()
-
-	cmd := commandWithDatabaseFlag(t, dbPath)
-	_, err = openGeminiBatchCommand(cmd, true, true)
-	if err == nil {
-		t.Fatal("openGeminiBatchCommand() error = nil, want Mistral rejection")
-	}
-	if !strings.Contains(err.Error(), "1 tracked Gemini batch(es) exist; re-run with --model gemini") {
-		t.Fatalf("error = %q, want tracked recovery instruction", err)
-	}
-	if strings.Contains(err.Error(), "GEMINI_API_KEY") {
-		t.Fatalf("error = %q, model rejection must precede API key validation", err)
 	}
 }
 
@@ -451,7 +379,7 @@ func TestBatchStartReportsExistingBlockedWorkWhenUntouchedFilesCannotBePrepared(
 		t.Fatalf("runBatchStart() error = %v", runErr)
 	}
 	for _, want := range []string{
-		"No valid untouched documents could be prepared for Gemini batch OCR.",
+		"No valid pending page ranges could be prepared for Gemini batch OCR.",
 		"1 blocked Gemini batch OCR page range across 1 content item requires attention.",
 		"ringbinder batch failures",
 	} {
@@ -544,6 +472,42 @@ func TestBatchFailuresIsLocalOnlyNDJSON(t *testing.T) {
 	}
 	if strings.Contains(output, "batch discard") {
 		t.Fatalf("human output still recommends removed discard command: %q", output)
+	}
+}
+
+func TestEstimateGeminiBatchCostUsesSparseUnownedMissingRanges(t *testing.T) {
+	database := openCostTestDB(t)
+	contentID := addCostContent(t, database, "sparse-batch-cost", 5, true, "/docs/sparse.pdf")
+	model := "existing"
+	if err := database.UpsertContentPages(contentID, []db.PageInput{
+		{PageIndex: 0, Markdown: "done", Model: &model},
+		{PageIndex: 2, Markdown: "done", Model: &model},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateGeminiBatch(
+		"sparse-owned", ocr.GeminiBatchModel, 375, 1875, nil,
+		[]db.GeminiRequestPlan{{
+			ContentID: contentID, RequestKey: "owned-page-4", FileType: "pdf",
+			PageStart: 3, PageEnd: 4,
+		}},
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	estimate, err := estimateGeminiBatchCost(database, 0, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only page indexes 1 and 4 are missing and unowned; each is its own range.
+	want := ocr.GeminiBatchCost(
+		at,
+		2*geminiPDFMediaTokens+2*geminiRequestOverhead,
+		2*geminiOutputTokens,
+	)
+	if estimate.items != 1 || estimate.pages != 2 || estimate.cost != want {
+		t.Fatalf("estimate = %+v, want 1 item, 2 pages, cost %d", estimate, want)
 	}
 }
 

@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +12,40 @@ import (
 	"github.com/maxim/ringbinder/internal/ocr"
 )
 
+func TestEstimateOCRChainCostUsesOnlyMissingPagesAndFivePercentHighScenario(t *testing.T) {
+	t.Parallel()
+	database := openCostTestDB(t)
+	contentID := addCostContent(t, database, "partial", 5, true, "/docs/partial.pdf")
+	model := "historical"
+	if err := database.UpsertContentPages(contentID, []db.PageInput{
+		{PageIndex: 0, Markdown: "done", Model: &model},
+		{PageIndex: 2, Markdown: "done", Model: &model},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	estimate, err := estimateOCRChainCost(
+		database, []string{modelMistral, modelGemini}, 0, at,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate.items != 1 || estimate.pages != 3 {
+		t.Fatalf("estimate = %+v, want 1 item and 3 missing pages", estimate)
+	}
+	mistral := ocr.MistralCost(3)
+	// Missing ranges are page 2 and pages 4-5: 3 media pages and 2 requests.
+	gemini := ocr.GeminiCost(
+		at,
+		3*geminiPDFMediaTokens+2*geminiRequestOverhead,
+		3*geminiOutputTokens,
+	)
+	wantHigh := ((mistral+gemini)*105 + 99) / 100
+	if estimate.low != mistral || estimate.high != wantHigh {
+		t.Fatalf("range = %d..%d, want %d..%d", estimate.low, estimate.high, mistral, wantHigh)
+	}
+}
+
 func TestEstimateOCRCost_GeminiAssumptionsAndPriceBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -20,7 +53,7 @@ func TestEstimateOCRCost_GeminiAssumptionsAndPriceBoundary(t *testing.T) {
 	addCostContent(t, database, "pdf", 21, true, "/docs/report.pdf")
 	addCostContent(t, database, "image", 1, true, "/docs/photo.png")
 
-	before, err := estimateOCRCost(database, modelGemini, 0, time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC))
+	before, err := estimateOCRChainCost(database, []string{modelGemini}, 0, time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("estimateOCRCost(before) error = %v", err)
 	}
@@ -33,7 +66,7 @@ func TestEstimateOCRCost_GeminiAssumptionsAndPriceBoundary(t *testing.T) {
 		t.Fatalf("before cost = %d, want %d", got, want)
 	}
 
-	after, err := estimateOCRCost(database, modelGemini, 0, time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC))
+	after, err := estimateOCRChainCost(database, []string{modelGemini}, 0, time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("estimateOCRCost(after) error = %v", err)
 	}
@@ -51,7 +84,7 @@ func TestEstimateOCRCost_LimitUsesStablePendingPrefix(t *testing.T) {
 	addCostContent(t, database, "third", 7, true, "/docs/third.pdf")
 	addCostContent(t, database, "completed", 20, false, "/docs/completed.pdf")
 
-	estimate, err := estimateOCRCost(database, modelMistral, 2, time.Now())
+	estimate, err := estimateOCRChainCost(database, []string{modelMistral}, 2, time.Now())
 	if err != nil {
 		t.Fatalf("estimateOCRCost() error = %v", err)
 	}
@@ -79,7 +112,7 @@ func TestRunCost_LimitedBatchPrintsSelectedAndTotal(t *testing.T) {
 	}
 
 	cmd := commandWithDatabaseFlag(t, dbPath)
-	cmd.Flags().String("model", "", "")
+	cmd.Flags().StringArray("model", nil, "")
 	cmd.Flags().Int("limit", 0, "")
 	if err := cmd.Flags().Set("model", modelMistral); err != nil {
 		t.Fatalf("Set(model) error = %v", err)
@@ -93,8 +126,10 @@ func TestRunCost_LimitedBatchPrintsSelectedAndTotal(t *testing.T) {
 			t.Fatalf("runCost() error = %v", err)
 		}
 	})
-	want := "Pending OCR batch: 2 of 3 content item(s), 5 pages\nEstimated cost: $0.0250 (at " +
-		ocr.FormatCurrency(ocr.MistralPageCost()) + "/page)\n"
+	want := "OCR models: mistral\n" +
+		"Selected: 2 of 3 pending content item(s), 5 missing pages\n" +
+		"Estimated cost range: $0.03–$0.03\n" +
+		"High estimate assumes every model processes every missing page and adds 5% for retries; actual cost may be higher.\n"
 	if output != want {
 		t.Fatalf("output = %q, want %q", output, want)
 	}
@@ -115,7 +150,7 @@ func TestRunCost_GeminiIsOfflineAndPrintsApproximation(t *testing.T) {
 	}
 
 	cmd := commandWithDatabaseFlag(t, dbPath)
-	cmd.Flags().String("model", "", "")
+	cmd.Flags().StringArray("model", nil, "")
 	cmd.Flags().Int("limit", 0, "")
 	if err := cmd.Flags().Set("model", modelGemini); err != nil {
 		t.Fatalf("Set(model) error = %v", err)
@@ -129,67 +164,11 @@ func TestRunCost_GeminiIsOfflineAndPrintsApproximation(t *testing.T) {
 			t.Fatalf("runCost() error = %v", err)
 		}
 	})
-	if !strings.Contains(output, "Pending OCR: 1 content item(s), 1 pages") {
+	if !strings.Contains(output, "Selected: 1 pending content item(s), 1 missing pages") {
 		t.Fatalf("output = %q, want content count", output)
 	}
-	if !strings.Contains(output, "Estimated cost: ~$0.01 (actual cost may vary)") {
+	if !strings.Contains(output, "Estimated cost range: $0.01–$0.01") {
 		t.Fatalf("output = %q, want approximate cost", output)
-	}
-}
-
-func TestCostAndOCRLimitsSelectMatchingAdvancingBatches(t *testing.T) {
-	database := openCostTestDB(t)
-	firstID := addCostContent(t, database, "first", 2, true, "/docs/first.pdf", "/docs/first-copy.pdf")
-	secondID := addCostContent(t, database, "second", 1, true, "/docs/second.jpg")
-	thirdID := addCostContent(t, database, "third", 7, true, "/docs/third.pdf")
-
-	firstEstimate, err := estimateOCRCost(database, modelMistral, 2, time.Now())
-	if err != nil {
-		t.Fatalf("estimateOCRCost(first) error = %v", err)
-	}
-	if firstEstimate.items != 2 || firstEstimate.totalItems != 3 || firstEstimate.pages != 3 || !firstEstimate.truncated {
-		t.Fatalf("first estimate = %+v, want first two pending items", firstEstimate)
-	}
-
-	provider := &fakeOCRProvider{pages: []ocr.PageResult{{PageIndex: 0, Markdown: "text"}}}
-	firstOutput := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, provider, 2, 1); err != nil {
-			t.Fatalf("processOCR(first) error = %v", err)
-		}
-	})
-	if !strings.Contains(firstOutput, "Processing 2 of 3 pending content item(s).") {
-		t.Fatalf("first OCR output = %q, want truncated batch message", firstOutput)
-	}
-
-	pending, err := database.PendingContents()
-	if err != nil {
-		t.Fatalf("PendingContents() error = %v", err)
-	}
-	if len(pending) != 1 || pending[0].ID != thirdID {
-		t.Fatalf("pending after first batch = %+v, want only third content", pending)
-	}
-	if firstID >= secondID || secondID >= thirdID {
-		t.Fatalf("content IDs = %d, %d, %d, want ascending insertion order", firstID, secondID, thirdID)
-	}
-
-	secondEstimate, err := estimateOCRCost(database, modelMistral, 1, time.Now())
-	if err != nil {
-		t.Fatalf("estimateOCRCost(second) error = %v", err)
-	}
-	if secondEstimate.items != 1 || secondEstimate.totalItems != 1 || secondEstimate.pages != 7 || secondEstimate.truncated {
-		t.Fatalf("second estimate = %+v, want untruncated third item", secondEstimate)
-	}
-
-	secondOutput := captureStdout(t, func() {
-		if err := processOCR(context.Background(), database, provider, 1, 1); err != nil {
-			t.Fatalf("processOCR(second) error = %v", err)
-		}
-	})
-	if strings.Contains(secondOutput, "Processing ") {
-		t.Fatalf("second OCR output = %q, want normal untruncated output", secondOutput)
-	}
-	if provider.calls.Load() != 3 {
-		t.Fatalf("provider calls = %d, want all three items across batches", provider.calls.Load())
 	}
 }
 
@@ -198,7 +177,7 @@ func TestRunCost_RejectsNonPositiveExplicitLimit(t *testing.T) {
 		t.Run(limit, func(t *testing.T) {
 			resetCommandState(t)
 			cmd := commandWithDatabaseFlag(t, filepath.Join(t.TempDir(), "cost.db"))
-			cmd.Flags().String("model", "", "")
+			cmd.Flags().StringArray("model", nil, "")
 			cmd.Flags().Int("limit", 0, "")
 			if err := cmd.Flags().Set("model", modelMistral); err != nil {
 				t.Fatalf("Set(model) error = %v", err)
@@ -238,8 +217,10 @@ func addCostContent(t *testing.T, database *db.DB, checksum string, pages int, p
 		}
 	}
 	if !pending {
-		if err := database.MarkContentOCRDone(contentID); err != nil {
-			t.Fatalf("MarkContentOCRDone() error = %v", err)
+		for pageIndex := 0; pageIndex < pages; pageIndex++ {
+			if err := database.UpsertPage(contentID, pageIndex, "complete"); err != nil {
+				t.Fatalf("UpsertPage(%d) error = %v", pageIndex, err)
+			}
 		}
 	}
 	return contentID

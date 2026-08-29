@@ -2,13 +2,10 @@ package cmd
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
-	"path/filepath"
 
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
@@ -17,10 +14,8 @@ import (
 )
 
 func init() {
-	batchCmd.PersistentFlags().String("model", "", "OCR provider (Gemini is required for batch commands)")
-
-	batchCostCmd.Flags().Int("limit", 0, "Maximum number of untouched pending content items to estimate")
-	batchStartCmd.Flags().Int("limit", 0, "Maximum number of untouched pending content items to start")
+	batchCostCmd.Flags().Int("limit", 0, "Maximum number of pending content items to estimate")
+	batchStartCmd.Flags().Int("limit", 0, "Maximum number of pending content items to start")
 	batchListCmd.Flags().Bool("json", false, "Output one JSON status envelope")
 	batchFailuresCmd.Flags().Bool("json", false, "Output newline-delimited JSON")
 	batchRetryCmd.Flags().String("mode", "", "Retry mode (required: direct)")
@@ -69,7 +64,7 @@ var batchCostCmd = &cobra.Command{
 
 var batchStartCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start discounted OCR for untouched pending content",
+	Short: "Start discounted OCR for unassigned pending pages",
 	Args:  cobra.NoArgs,
 	RunE:  runBatchStart,
 }
@@ -97,7 +92,7 @@ var batchCancelCmd = &cobra.Command{
 
 var batchForgetCmd = &cobra.Command{
 	Use:   "forget <local-id>",
-	Short: "Forget one batch and erase affected documents' progress",
+	Short: "Forget one batch while retaining completed OCR pages",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runBatchForget,
 }
@@ -129,20 +124,13 @@ func openGeminiBatchCommand(
 	cmd *cobra.Command,
 	requireAPIKey, lockCoordinator bool,
 ) (*batchCommandContext, error) {
-	cfg, err := loadCommandConfig(cmd, "model")
-	if err != nil {
-		return nil, err
-	}
-	model, err := resolveModel(cmd, cfg)
+	cfg, err := loadCommandConfig(cmd)
 	if err != nil {
 		return nil, err
 	}
 	dbPath, err := resolveDatabasePath(cmd, cfg)
 	if err != nil {
 		return nil, err
-	}
-	if model != modelGemini {
-		return nil, mistralBatchRejection(dbPath)
 	}
 
 	apiKey := ""
@@ -186,47 +174,4 @@ func (ctx *batchCommandContext) Close() {
 	if ctx.coordinator != nil {
 		_ = ctx.coordinator.Close()
 	}
-}
-
-func mistralBatchRejection(databasePath string) error {
-	count, known := trackedGeminiBatchCountReadOnly(databasePath)
-	if known {
-		return fmt.Errorf(
-			"Gemini batch OCR requires --model gemini; %d tracked Gemini batch(es) exist; re-run with --model gemini",
-			count,
-		)
-	}
-	return errors.New("Gemini batch OCR requires --model gemini; re-run with --model gemini")
-}
-
-func trackedGeminiBatchCountReadOnly(databasePath string) (int, bool) {
-	path, err := filepath.Abs(databasePath)
-	if err != nil {
-		return 0, false
-	}
-	if _, err := os.Stat(path); err != nil {
-		return 0, os.IsNotExist(err)
-	}
-	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}
-	database, err := sql.Open("sqlite", dsn.String())
-	if err != nil {
-		return 0, false
-	}
-	defer database.Close()
-
-	var exists int
-	if err := database.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master
-		 WHERE type = 'table' AND name = 'gemini_batches'`,
-	).Scan(&exists); err != nil {
-		return 0, false
-	}
-	if exists == 0 {
-		return 0, true
-	}
-	var count int
-	if err := database.QueryRow(`SELECT COUNT(*) FROM gemini_batches`).Scan(&count); err != nil {
-		return 0, false
-	}
-	return count, true
 }

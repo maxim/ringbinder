@@ -1,6 +1,28 @@
 package cmd
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestReadJSONIncludesPerPageModel(t *testing.T) {
+	t.Parallel()
+	model := "provider-v1"
+	encoded, err := json.Marshal(readOutputJSON{
+		Path: "/docs/example.pdf",
+		Pages: []readPageJSON{
+			{PageIndex: 0, Markdown: "historical", Model: nil},
+			{PageIndex: 1, Markdown: "current", Model: &model},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"path":"/docs/example.pdf","pages":[{"page_index":0,"markdown":"historical","model":null},{"page_index":1,"markdown":"current","model":"provider-v1"}]}`
+	if string(encoded) != want {
+		t.Fatalf("JSON = %s, want %s", encoded, want)
+	}
+}
 
 func TestResolveReadRange_PageWithContext(t *testing.T) {
 	t.Parallel()

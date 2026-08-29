@@ -49,11 +49,6 @@ func (db *DB) InsertContent(checksum string, pageCount int) (int64, error) {
 	return res.LastInsertId()
 }
 
-func (db *DB) MarkContentOCRDone(contentID int64) error {
-	_, err := db.Exec("UPDATE contents SET ocr_pending = 0 WHERE id = ?", contentID)
-	return err
-}
-
 func (db *DB) PendingContents() ([]Content, error) {
 	rows, err := db.Query(
 		`SELECT c.id, c.checksum, c.page_count, c.ocr_pending
@@ -115,21 +110,16 @@ func (db *DB) CleanupOrphanContents() (int, error) {
 		}
 	}()
 
+	// Soft-deleted documents are durable restoration records. A content row is
+	// truly orphaned only after a changed document has moved away from it and no
+	// document row—active or deleted—retains that identity.
 	orphanSubquery := `SELECT c.id
 	                   FROM contents c
 	                   WHERE NOT EXISTS (
 	                     SELECT 1
 	                     FROM documents d
-	                     WHERE d.content_id = c.id AND d.deleted = 0
+	                     WHERE d.content_id = c.id
 	                   )`
-
-	if _, err = tx.Exec(
-		`DELETE FROM documents
-		 WHERE deleted = 1
-		   AND content_id IN (` + orphanSubquery + `)`,
-	); err != nil {
-		return 0, err
-	}
 
 	res, err := tx.Exec(
 		`DELETE FROM contents

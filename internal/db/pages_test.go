@@ -341,8 +341,14 @@ func TestSearch_ReturnsPageCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insertTestDocumentWithContent() error = %v", err)
 	}
-	if err := database.UpsertPage(contentID, 3, "searchable content"); err != nil {
-		t.Fatalf("UpsertPage() error = %v", err)
+	for pageIndex := 0; pageIndex < 7; pageIndex++ {
+		markdown := "other content"
+		if pageIndex == 3 {
+			markdown = "searchable content"
+		}
+		if err := database.UpsertPage(contentID, pageIndex, markdown); err != nil {
+			t.Fatalf("UpsertPage(%d) error = %v", pageIndex, err)
+		}
 	}
 
 	results, err := database.Search("searchable")
@@ -436,6 +442,9 @@ func TestGetPageMarkdownByPathAndIndex(t *testing.T) {
 	if err := database.UpsertPage(contentID, 1, "page-one"); err != nil {
 		t.Fatalf("UpsertPage(1) error = %v", err)
 	}
+	if err := database.UpsertPage(contentID, 2, "page-two"); err != nil {
+		t.Fatalf("UpsertPage(2) error = %v", err)
+	}
 
 	markdown, err := database.GetPageMarkdownByPathAndIndex("/docs/read.pdf", 1)
 	if err != nil {
@@ -512,7 +521,7 @@ func TestUpsertPage_StoresNormalizedSearchText(t *testing.T) {
 	}
 }
 
-func TestReplaceContentPages_Atomic(t *testing.T) {
+func TestReplaceContentPages_UpsertsWithoutDeletingUnrelatedPages(t *testing.T) {
 	t.Parallel()
 
 	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
@@ -563,8 +572,8 @@ func TestReplaceContentPages_Atomic(t *testing.T) {
 		t.Fatalf("rows.Err() = %v", err)
 	}
 
-	if len(indices) != 3 {
-		t.Fatalf("page count = %d, want 3", len(indices))
+	if len(indices) != 5 {
+		t.Fatalf("page count = %d, want 5", len(indices))
 	}
 	for i := 0; i < 3; i++ {
 		if indices[i] != i {
@@ -573,6 +582,11 @@ func TestReplaceContentPages_Atomic(t *testing.T) {
 		wantMarkdown := fmt.Sprintf("new-%d", i)
 		if markdowns[i] != wantMarkdown {
 			t.Fatalf("markdown[%d] = %q, want %q", i, markdowns[i], wantMarkdown)
+		}
+	}
+	for i := 3; i < 5; i++ {
+		if markdowns[i] != "old-page" {
+			t.Fatalf("retained markdown[%d] = %q, want old-page", i, markdowns[i])
 		}
 	}
 

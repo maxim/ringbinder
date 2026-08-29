@@ -47,7 +47,7 @@ func TestRunDocList_UsesConfigDatabasePath(t *testing.T) {
 	}
 }
 
-func TestRunSweep_ExplicitPathsAndDatabaseBypassInvalidConfig(t *testing.T) {
+func TestRunSweep_ExplicitPathsStillLoadPersistentSafeguards(t *testing.T) {
 	resetCommandState(t)
 
 	invalidConfig := filepath.Join(t.TempDir(), "invalid.yml")
@@ -66,11 +66,12 @@ func TestRunSweep_ExplicitPathsAndDatabaseBypassInvalidConfig(t *testing.T) {
 	if err := cmd.Flags().Set("concurrency", "4"); err != nil {
 		t.Fatalf("Set(concurrency) error = %v", err)
 	}
-	if err := runSweep(cmd, []string{scanDir}); err != nil {
-		t.Fatalf("runSweep() error = %v", err)
+	err := runSweep(cmd, []string{scanDir})
+	if err == nil || !strings.Contains(err.Error(), "load config") {
+		t.Fatalf("runSweep() error = %v, want config error", err)
 	}
-	if _, err := os.Stat(dbPath); err != nil {
-		t.Fatalf("database file stat error = %v", err)
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("database stat error = %v, want no database", err)
 	}
 }
 

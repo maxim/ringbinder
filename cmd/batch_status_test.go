@@ -65,7 +65,7 @@ func TestBatchForgetErasesLocalWorkWithoutAPIActivityOrWarning(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("runBatchForget() error = %v", runErr)
 	}
-	wantOutput := "Forgot Gemini batch " + strconv.FormatInt(batchID, 10) + " and erased saved OCR progress for its affected documents.\n"
+	wantOutput := "Forgot Gemini batch " + strconv.FormatInt(batchID, 10) + "; completed OCR pages were retained.\n"
 	if output != wantOutput || stderr != "" {
 		t.Fatalf("stdout = %q, stderr = %q; want %q and no warning", output, stderr, wantOutput)
 	}

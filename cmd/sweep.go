@@ -44,15 +44,9 @@ type sweepResult struct {
 }
 
 func runSweep(cmd *cobra.Command, args []string) error {
-	var cfg *config.Config
-	var err error
-	if len(args) == 0 {
-		cfg, err = loadConfig()
-	} else {
-		// Even with explicit paths and database, load config unless concurrency is
-		// explicit so sweep_concurrency can override the command's default.
-		cfg, err = loadCommandConfig(cmd, "concurrency")
-	}
+	// Persistent exclusions are safeguards, so explicit paths and flags never
+	// bypass the configured list.
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
@@ -76,10 +70,11 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no files or directories matched provided sweep paths")
 	}
 
-	excludePatterns, err := cmd.Flags().GetStringSlice("exclude")
+	cliExclude, err := cmd.Flags().GetStringSlice("exclude")
 	if err != nil {
 		return fmt.Errorf("read exclude flag: %w", err)
 	}
+	excludePatterns := dedupeStrings(append(append([]string(nil), cfg.Exclude...), cliExclude...))
 	for i, pattern := range excludePatterns {
 		pattern = config.ExpandHome(pattern)
 		if !containsGlobMeta(pattern) {
@@ -88,10 +83,10 @@ func runSweep(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("resolve exclude path %q: %w", pattern, err)
 			}
 			info, err := os.Stat(abs)
-			if err != nil {
+			if err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("stat exclude path %q: %w", pattern, err)
 			}
-			if info.IsDir() {
+			if err == nil && info.IsDir() {
 				return fmt.Errorf("exclude path %q is a directory; only files are supported", pattern)
 			}
 			excludePatterns[i] = abs
@@ -242,7 +237,7 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check existing record
-		existing, err := database.GetDocumentByPath(res.fi.Path)
+		existing, err := database.GetDocumentMetadataByPath(res.fi.Path)
 		if err != nil {
 			dbErr = fmt.Errorf("query document: %w", err)
 			cancel()
@@ -280,12 +275,21 @@ func runSweep(cmd *cobra.Command, args []string) error {
 			}
 
 			if !desiredPending {
-				if err := database.MarkContentOCRDone(contentID); err != nil {
-					dbErr = fmt.Errorf("mark content OCR done: %w", err)
+				// A checksum-only change intentionally does not request OCR again.
+				// Copy the prior canonical pages instead of manufacturing a complete
+				// content row with no page coverage.
+				if err := database.CopyContentPages(existing.ContentID, contentID); err != nil {
+					dbErr = fmt.Errorf("carry forward OCR pages: %w", err)
 					cancel()
 					continue
 				}
-				content.OCRPending = false
+				carried, err := database.GetContentByChecksum(res.checksum)
+				if err != nil {
+					dbErr = fmt.Errorf("query carried content: %w", err)
+					cancel()
+					continue
+				}
+				content.OCRPending = carried == nil || carried.OCRPending
 			}
 		}
 
@@ -341,7 +345,6 @@ func runSweep(cmd *cobra.Command, args []string) error {
 	if _, err := database.CleanupOrphanContents(); err != nil {
 		return fmt.Errorf("cleanup orphan contents: %w", err)
 	}
-
 	fmt.Printf("Sweep complete: %d scanned, %d new, %d updated, %d restored, %d deleted, %d unchanged\n",
 		scanned.Load(), newCount, updatedCount, restoredCount, deletedCount, unchangedCount)
 
@@ -369,6 +372,19 @@ func resolveSweepConcurrency(cmd *cobra.Command, cfg *config.Config) (int, error
 	}
 
 	return defaultSweepConcurrency, nil
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
 }
 
 func containsGlobMeta(path string) bool {

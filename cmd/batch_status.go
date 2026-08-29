@@ -230,7 +230,7 @@ func runBatchForget(cmd *cobra.Command, args []string) error {
 	if batch == nil {
 		return fmt.Errorf("Gemini batch %d not found", batchID)
 	}
-	fmt.Printf("Forgot Gemini batch %d and erased saved OCR progress for its affected documents.\n", batchID)
+	fmt.Printf("Forgot Gemini batch %d; completed OCR pages were retained.\n", batchID)
 	return nil
 }
 

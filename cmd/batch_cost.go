@@ -25,7 +25,7 @@ func runBatchCost(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if estimate.items == 0 {
-		fmt.Println("No untouched documents pending Gemini batch OCR.")
+		fmt.Println("No documents have unassigned pages pending Gemini batch OCR.")
 		return nil
 	}
 	if estimate.truncated {
@@ -43,7 +43,7 @@ func runBatchCost(cmd *cobra.Command, args []string) error {
 func estimateGeminiBatchCost(database *db.DB, limit int, at time.Time) (costEstimate, error) {
 	contents, err := database.PendingContentsForGeminiBatch()
 	if err != nil {
-		return costEstimate{}, fmt.Errorf("query untouched pending contents: %w", err)
+		return costEstimate{}, fmt.Errorf("query pending contents with unassigned pages: %w", err)
 	}
 	estimate := costEstimate{items: len(contents), totalItems: len(contents)}
 	if limit > 0 && limit < len(contents) {
@@ -61,13 +61,22 @@ func estimateGeminiBatchCost(database *db.DB, limit int, at time.Time) (costEsti
 		if fileType == "" {
 			continue
 		}
-		estimate.pages += content.PageCount
-		pages := int64(content.PageCount)
-		outputTokens += pages * geminiOutputTokens
+		ranges, err := database.MissingUnownedPageRanges(content.ID)
+		if err != nil {
+			return costEstimate{}, fmt.Errorf("query missing ranges for content %d: %w", content.ID, err)
+		}
+		pages := 0
+		requests := 0
+		for _, pageRange := range ranges {
+			count := pageRange.End - pageRange.Start
+			pages += count
+			requests += (count + geminiPDFPagesPerChunk - 1) / geminiPDFPagesPerChunk
+		}
+		estimate.pages += pages
+		outputTokens += int64(pages * geminiOutputTokens)
 		if fileType == "pdf" {
-			requests := (pages + geminiPDFPagesPerChunk - 1) / geminiPDFPagesPerChunk
-			inputTokens += pages*geminiPDFMediaTokens + requests*geminiRequestOverhead
-		} else {
+			inputTokens += int64(pages*geminiPDFMediaTokens + requests*geminiRequestOverhead)
+		} else if pages > 0 {
 			inputTokens += geminiImageMediaTokens + geminiRequestOverhead
 		}
 	}

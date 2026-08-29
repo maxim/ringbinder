@@ -11,6 +11,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var newGeminiDirectProvider = func(apiKey string, runAt time.Time) ocr.Provider {
+	return ocr.NewGeminiClient(apiKey, runAt)
+}
+
 func runBatchRetry(cmd *cobra.Command, args []string) error {
 	requestID, err := parsePositiveID(args[0], "request")
 	if err != nil {
@@ -48,32 +52,76 @@ func runBatchRetry(cmd *cobra.Command, args []string) error {
 	}
 
 	runAt := time.Now().UTC()
-	client := ocr.NewGeminiClient(command.apiKey, runAt)
-	pages, report, ocrErr := client.OCRRange(
-		cmd.Context(), path, fileType, request.PageStart, request.PageEnd,
-	)
-	printBatchBilling("Direct retry", report)
-	if ocrErr != nil {
-		return ocrErr
-	}
-	if err := verifyContentPath(path, request.Checksum); err != nil {
+	provider := newGeminiDirectProvider(command.apiKey, runAt)
+	missing, err := missingRequestRanges(command.database, *request)
+	if err != nil {
 		return err
 	}
-	staged := make([]db.GeminiStagedPage, len(pages))
-	for i, page := range pages {
-		staged[i] = db.GeminiStagedPage{PageIndex: page.PageIndex, Markdown: page.Markdown}
+	var billing ocr.BillingReport
+	var finalPages []db.PageInput
+	for rangeIndex, pageRange := range missing {
+		result, ocrErr := provider.OCRRangeResult(
+			cmd.Context(), path, fileType, pageRange.Start, pageRange.End,
+		)
+		billing.Add(result.Billing)
+		if len(result.Pages) > 0 {
+			if err := validateOCRRangePages(pageRange, result.Pages, ocrErr == nil); err != nil {
+				printBatchBilling("Direct retry", billing)
+				return err
+			}
+			if err := verifyContentPath(path, request.Checksum); err != nil {
+				printBatchBilling("Direct retry", billing)
+				return err
+			}
+			inputs := make([]db.PageInput, len(result.Pages))
+			for i, page := range result.Pages {
+				model := page.Model
+				inputs[i] = db.PageInput{
+					PageIndex: page.PageIndex,
+					Markdown:  page.Markdown,
+					Model:     &model,
+				}
+			}
+			// Keep earlier partial progress immediately, but commit the final pages
+			// with the blocked-to-staged transition so a crash cannot separate them.
+			if rangeIndex == len(missing)-1 && ocrErr == nil {
+				finalPages = inputs
+			} else if err := command.database.UpsertContentPages(request.ContentID, inputs); err != nil {
+				printBatchBilling("Direct retry", billing)
+				return fmt.Errorf("store direct Gemini retry pages: %w", err)
+			}
+		}
+		if ocrErr != nil {
+			printBatchBilling("Direct retry", billing)
+			return ocrErr
+		}
 	}
-	if err := command.database.StageGeminiDirectRequest(
-		request.ID, staged, int64(report.KnownCost), report.Indeterminate, time.Now().UTC(),
-	); err != nil {
-		return fmt.Errorf("stage direct Gemini retry: %w", err)
-	}
-	promoted, err := command.database.PromoteReadyGeminiContents()
+	printBatchBilling("Direct retry", billing)
+	contentComplete, err := command.database.CompleteGeminiDirectRequest(
+		request.ID, finalPages, int64(billing.KnownCost), billing.Indeterminate, time.Now().UTC(),
+	)
 	if err != nil {
-		return fmt.Errorf("promote completed Gemini content: %w", err)
+		return fmt.Errorf("complete direct Gemini retry: %w", err)
 	}
-	fmt.Printf("Retried Gemini request %d directly; %d content item(s) promoted.\n", request.ID, promoted)
+	if _, err := command.database.RetireCompletedGeminiRequests(); err != nil {
+		return fmt.Errorf("retire completed Gemini requests: %w", err)
+	}
+	status := "content item remains pending"
+	if contentComplete {
+		status = "OCR completed for its content item"
+	}
+	fmt.Printf("Retried Gemini request %d directly; %s.\n", request.ID, status)
 	return nil
+}
+
+func missingRequestRanges(database *db.DB, request db.GeminiBatchRequest) ([]db.PageRange, error) {
+	ranges, err := database.MissingPageRangesWithin(
+		request.ContentID, request.PageStart, request.PageEnd,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query missing pages for Gemini request %d: %w", request.ID, err)
+	}
+	return ranges, nil
 }
 
 func matchingContentPath(database *db.DB, contentID int64, expectedChecksum string) (string, error) {
@@ -99,7 +147,7 @@ func verifyContentPath(path, expectedChecksum string) error {
 		return fmt.Errorf("recheck %s: %w", path, err)
 	}
 	if actual != expectedChecksum {
-		return fmt.Errorf("%s changed while preparing Gemini batch input; run ringbinder sweep", path)
+		return fmt.Errorf("%s changed during OCR input processing; run ringbinder sweep", path)
 	}
 	return nil
 }

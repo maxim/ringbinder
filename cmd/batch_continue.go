@@ -103,10 +103,10 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 	}
 
 	if !globalFailure {
-		promoted, promoteErr := command.database.PromoteReadyGeminiContents()
-		if promoteErr != nil {
-			commandErrors = append(commandErrors, fmt.Errorf("promote completed Gemini content: %w", promoteErr))
-		} else if promoted > 0 {
+		completed, retireErr := command.database.RetireCompletedGeminiRequests()
+		if retireErr != nil {
+			commandErrors = append(commandErrors, fmt.Errorf("retire completed Gemini requests: %w", retireErr))
+		} else if completed > 0 {
 			didWork = true
 		}
 		retryFound, retryErrors := submitRetryableGeminiRequests(cmd, command.database, transport, planner)
@@ -446,9 +446,9 @@ func accountSucceededGeminiBatch(
 	if errors.As(accountErr, &incomplete) {
 		return accountErr
 	}
-	_, promoteErr := database.PromoteReadyGeminiContents()
+	_, retireErr := database.RetireCompletedGeminiRequests()
 	_, finalizeErr := database.FinalizeGeminiBatch(batch.ID, time.Now().UTC())
-	return errors.Join(accountErr, promoteErr, finalizeErr)
+	return errors.Join(accountErr, retireErr, finalizeErr)
 }
 
 func finalizeUnavailableGeminiOutput(
@@ -487,7 +487,7 @@ func accountGeminiOutput(
 
 	// Spool raw lines to an unlinked file and retain only offsets. This validates
 	// the complete key set (especially late duplicates and missing keys) before
-	// staging any response, without retaining provider payloads in SQLite.
+	// applying any response, without retaining provider payloads in SQLite.
 	output, err := newPrivateTempFile("ringbinder-gemini-output-")
 	if err != nil {
 		return err
@@ -629,6 +629,7 @@ func accountGeminiOutputLine(
 		pages[i] = db.GeminiStagedPage{
 			PageIndex: request.PageStart + page.PageIndex,
 			Markdown:  page.Markdown,
+			Model:     page.Model,
 		}
 	}
 	return database.StageGeminiRequest(

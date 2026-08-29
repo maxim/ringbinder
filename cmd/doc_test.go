@@ -1,9 +1,37 @@
 package cmd
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/maxim/ringbinder/internal/db"
 )
+
+func TestDocumentJSONIncludesCoverageAndNullableModels(t *testing.T) {
+	t.Parallel()
+	exact := "provider-model-v1"
+	payload := documentJSON(db.Document{
+		Path:              "/docs/example.pdf",
+		CreatedAt:         time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ModifiedAt:        time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		PageCount:         3,
+		OCRPagesCompleted: 2,
+		Models: []db.ModelCount{
+			{Model: nil, PageCount: 1},
+			{Model: &exact, PageCount: 1},
+		},
+		OCRPending: true,
+	})
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"path":"/docs/example.pdf","created_at":"2026-01-01T00:00:00Z","modified_at":"2026-01-02T00:00:00Z","page_count":3,"ocr_pages_completed":2,"models":[{"model":null,"page_count":1},{"model":"provider-model-v1","page_count":1}],"ocr_pending":true,"deleted":false}`
+	if string(encoded) != want {
+		t.Fatalf("JSON = %s, want %s", encoded, want)
+	}
+}
 
 func TestParseDocListTimeFlag_Empty(t *testing.T) {
 	t.Parallel()

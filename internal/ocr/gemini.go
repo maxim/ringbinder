@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	geminiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
-	geminiModel    = "gemini-3.7-flash"
+	geminiEndpoint    = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
+	geminiModel       = "gemini-3.7-flash"
+	GeminiDirectModel = geminiModel
 
 	geminiMaxPDFPages      = 20
 	geminiMaxRequestBytes  = 95 * 1024 * 1024
@@ -53,10 +54,17 @@ type GeminiDecodedResult struct {
 
 type GeminiPlanningError struct {
 	PageStart int
+	PageEnd   int
 	Cause     error
 }
 
 func (e *GeminiPlanningError) Error() string {
+	if e.PageEnd > e.PageStart {
+		return fmt.Sprintf(
+			"cannot plan Gemini request for %s: %v",
+			formatPageRange(e.PageStart, e.PageEnd), e.Cause,
+		)
+	}
 	return fmt.Sprintf("cannot plan Gemini request at source page %d: %v", e.PageStart+1, e.Cause)
 }
 
@@ -204,12 +212,16 @@ func (c *GeminiClient) WalkFileRequests(
 				continue
 			}
 			cause := fmt.Errorf("%s, %s: %w", filePath, formatPageRange(start, min(pages, start+c.pageLimitValue())), err)
-			return &GeminiPlanningError{PageStart: start, Cause: cause}
+			return &GeminiPlanningError{
+				PageStart: start,
+				PageEnd:   min(pages, start+c.pageLimitValue()),
+				Cause:     cause,
+			}
 		}
 		body, err := c.buildRequestBody(chunk.data, "pdf", chunk.end-chunk.start)
 		if err != nil {
 			cause := fmt.Errorf("%s, %s: %w", filePath, formatPageRange(chunk.start, chunk.end), err)
-			return &GeminiPlanningError{PageStart: chunk.start, Cause: cause}
+			return &GeminiPlanningError{PageStart: chunk.start, PageEnd: chunk.end, Cause: cause}
 		}
 		if err := yield(GeminiPreparedRequest{PageStart: chunk.start, PageEnd: chunk.end, Body: body}); err != nil {
 			return err
@@ -238,6 +250,13 @@ func (c *GeminiClient) PrepareRangeRequest(
 		return c.prepareImageRequest(ctx, filePath, fileType, info.Size())
 	}
 
+	if end-start > c.pageLimitValue() {
+		return GeminiPreparedRequest{}, &GeminiRangeSizeError{
+			PageStart: start,
+			PageEnd:   end,
+			Cause:     fmt.Errorf("range exceeds the %d-page request limit", c.pageLimitValue()),
+		}
+	}
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return GeminiPreparedRequest{}, fmt.Errorf("stat file: %w", err)
@@ -367,9 +386,18 @@ func (c *GeminiClient) OCRRange(
 	var results []PageResult
 	var report BillingReport
 	if err := c.ocrPDFInterval(ctx, f, filePath, info.Size(), pages, start, end, &results, &report); err != nil {
-		return nil, report, err
+		return results, report, err
 	}
 	return results, report, nil
+}
+
+func (c *GeminiClient) OCRRangeResult(
+	ctx context.Context,
+	filePath, fileType string,
+	start, end int,
+) (RangeResult, error) {
+	pages, report, err := c.OCRRange(ctx, filePath, fileType, start, end)
+	return RangeResult{Pages: pages, Billing: report}, err
 }
 
 func DecodeGeminiBatchResult(
@@ -417,7 +445,7 @@ func (c *GeminiClient) ocrImage(ctx context.Context, filePath, fileType string, 
 		return nil, BillingReport{}, fmt.Errorf("%s: %w", filePath, err)
 	}
 	if sourceSize > int64(limit) {
-		return nil, BillingReport{}, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
+		return nil, BillingReport{}, DocumentFailure(fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit()))
 	}
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -429,7 +457,7 @@ func (c *GeminiClient) ocrImage(ctx context.Context, filePath, fileType string, 
 		return nil, BillingReport{}, fmt.Errorf("%s: read file: %w", filePath, err)
 	}
 	if tooLarge {
-		return nil, BillingReport{}, fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit())
+		return nil, BillingReport{}, DocumentFailure(fmt.Errorf("%s: oversized %s image cannot be transformed: inline OCR request exceeds %d bytes", filePath, fileType, c.requestLimit()))
 	}
 	body, err := c.buildRequestBody(data, fileType, 1)
 	if err != nil {
@@ -643,7 +671,7 @@ func (c *GeminiClient) generateAndDecode(ctx context.Context, body []byte, expec
 		if expectedPages > 1 && isGeminiMaxTokens(err) {
 			return nil, report, err
 		}
-		if semanticAttempt == 1 {
+		if ClassifyFailure(err) == FailureDocument || semanticAttempt == 1 {
 			return nil, report, err
 		}
 	}
@@ -704,7 +732,7 @@ func (c *GeminiClient) doWithRetry(ctx context.Context, body []byte) ([]byte, Bi
 				return nil, report, ctx.Err()
 			}
 			if attempt == maxAttempts {
-				return nil, report, fmt.Errorf("read response after %d attempts: %w", maxAttempts, readErr)
+				return nil, report, TemporaryFailure(fmt.Errorf("read response after %d attempts: %w", maxAttempts, readErr))
 			}
 			backoff = geminiNextBackoff(backoff, "", time.Now(), randFloat)
 			continue
@@ -721,7 +749,9 @@ func (c *GeminiClient) doWithRetry(ctx context.Context, body []byte) ([]byte, Bi
 		if usage != nil {
 			report.Add(*usage)
 		}
-		retryable := resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode < 600)
+		retryable := resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests ||
+			(resp.StatusCode >= 500 && resp.StatusCode < 600)
 		if resp.StatusCode >= 500 && usage == nil {
 			report.Indeterminate = true
 		}
@@ -943,8 +973,14 @@ func geminiPageSchema(expectedPages int) geminiSchema {
 }
 
 type geminiResponse struct {
-	Candidates    []*geminiCandidate `json:"candidates"`
-	UsageMetadata *geminiUsage       `json:"usageMetadata"`
+	Candidates     []*geminiCandidate    `json:"candidates"`
+	UsageMetadata  *geminiUsage          `json:"usageMetadata"`
+	ModelVersion   string                `json:"modelVersion"`
+	PromptFeedback *geminiPromptFeedback `json:"promptFeedback"`
+}
+
+type geminiPromptFeedback struct {
+	BlockReason string `json:"blockReason"`
 }
 type geminiCandidate struct {
 	Content      *geminiContentResponse `json:"content"`
@@ -978,6 +1014,12 @@ type geminiVisual struct {
 
 type geminiFinishError struct{ reason string }
 
+type geminiPromptBlockError struct{ reason string }
+
+func (e *geminiPromptBlockError) Error() string {
+	return fmt.Sprintf("Gemini blocked the prompt with reason %s", e.reason)
+}
+
 func (e *geminiFinishError) Error() string {
 	if e.reason == "RECITATION" {
 		return "Gemini stopped generation for potential recitation (RECITATION)"
@@ -993,6 +1035,11 @@ func decodeGeminiResults(body []byte, expectedPages int) ([]PageResult, error) {
 	var response geminiResponse
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if response.PromptFeedback != nil &&
+		response.PromptFeedback.BlockReason != "" &&
+		response.PromptFeedback.BlockReason != "BLOCK_REASON_UNSPECIFIED" {
+		return nil, &geminiPromptBlockError{reason: response.PromptFeedback.BlockReason}
 	}
 	if len(response.Candidates) != 1 || response.Candidates[0] == nil {
 		return nil, fmt.Errorf("expected exactly one usable candidate, got %d", len(response.Candidates))
@@ -1056,6 +1103,10 @@ func decodeGeminiResults(body []byte, expectedPages int) ([]PageResult, error) {
 	if !valid {
 		return nil, fmt.Errorf("invalid response page indexes or fields: expected %v, actual [%s]", expectedIndexes(expectedPages), strings.Join(actual, " "))
 	}
+	model := strings.TrimSpace(response.ModelVersion)
+	if model == "" {
+		model = geminiModel
+	}
 	indexes := make([]int, 0, len(pages))
 	for index := range pages {
 		indexes = append(indexes, index)
@@ -1063,7 +1114,11 @@ func decodeGeminiResults(body []byte, expectedPages int) ([]PageResult, error) {
 	sort.Ints(indexes)
 	results := make([]PageResult, 0, len(indexes))
 	for _, index := range indexes {
-		results = append(results, PageResult{PageIndex: index, Markdown: renderGeminiMarkdown(pages[index])})
+		results = append(results, PageResult{
+			PageIndex: index,
+			Markdown:  renderGeminiMarkdown(pages[index]),
+			Model:     model,
+		})
 	}
 	return results, nil
 }

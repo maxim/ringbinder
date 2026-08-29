@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/maxim/ringbinder/internal/db"
@@ -11,8 +12,7 @@ import (
 
 // These intentionally approximate medium-resolution PDF input, high-resolution
 // image input, and average candidate-plus-thinking output. Request overhead uses
-// nominal 20-page chunks; byte-driven splits and retries remain actual-cost
-// variability rather than false precision in an offline estimate.
+// nominal 20-page chunks; byte-driven splits remain actual-cost variability.
 const (
 	geminiPDFMediaTokens   = 560
 	geminiImageMediaTokens = 1_120
@@ -22,7 +22,7 @@ const (
 )
 
 func init() {
-	costCmd.Flags().String("model", "", "OCR provider: mistral or gemini")
+	costCmd.Flags().StringArray("model", nil, "OCR model in priority order (repeat: mistral or gemini)")
 	costCmd.Flags().Int("limit", 0, "Maximum number of pending content items to estimate")
 	rootCmd.AddCommand(costCmd)
 }
@@ -30,7 +30,7 @@ func init() {
 var costCmd = &cobra.Command{
 	Use:   "cost",
 	Short: "Estimate OCR cost for documents",
-	Long:  "Shows the number of pending content items and pages, and estimates the selected OCR API cost.",
+	Long:  "Shows the selected unfinished documents and an estimated cost range for the chosen OCR models.",
 	RunE:  runCost,
 }
 
@@ -40,6 +40,8 @@ type costEstimate struct {
 	pages      int
 	excluded   int
 	cost       ocr.Currency
+	low        ocr.Currency
+	high       ocr.Currency
 	truncated  bool
 }
 
@@ -48,7 +50,7 @@ func runCost(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	model, err := resolveModel(cmd, cfg)
+	settings, err := resolveOCRSettings(cmd, cfg)
 	if err != nil {
 		return err
 	}
@@ -62,10 +64,11 @@ func runCost(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	estimate, err := estimateOCRCost(database, model, limit, time.Now().UTC())
+	estimate, err := estimateOCRChainCost(database, settings.models, limit, time.Now().UTC())
 	if err != nil {
 		return err
 	}
+	fmt.Printf("OCR models: %s\n", strings.Join(settings.models, " -> "))
 	if estimate.excluded > 0 {
 		fmt.Printf("Excluded from estimate: %d content item(s) already managed by batch OCR\n", estimate.excluded)
 	}
@@ -73,67 +76,109 @@ func runCost(cmd *cobra.Command, args []string) error {
 		fmt.Println("No documents pending OCR.")
 		return nil
 	}
-
 	if estimate.truncated {
-		fmt.Printf("Pending OCR batch: %d of %d content item(s), %d pages\n",
+		fmt.Printf("Selected: %d of %d pending content item(s), %d missing pages\n",
 			estimate.items, estimate.totalItems, estimate.pages)
 	} else {
-		fmt.Printf("Pending OCR: %d content item(s), %d pages\n", estimate.items, estimate.pages)
+		fmt.Printf("Selected: %d pending content item(s), %d missing pages\n", estimate.items, estimate.pages)
 	}
-	if model == modelGemini {
-		fmt.Printf("Estimated cost: ~%s (actual cost may vary)\n", formatApproxCurrency(estimate.cost))
-	} else {
-		fmt.Printf(
-			"Estimated cost: %s (at %s/page)\n",
-			ocr.FormatCurrency(estimate.cost), ocr.FormatCurrency(ocr.MistralPageCost()),
-		)
-	}
+	fmt.Printf(
+		"Estimated cost range: %s–%s\n",
+		formatApproxCurrency(estimate.low), formatApproxCurrency(estimate.high),
+	)
+	fmt.Println("High estimate assumes every model processes every missing page and adds 5% for retries; actual cost may be higher.")
 	return nil
 }
 
-func estimateOCRCost(database *db.DB, model string, limit int, at time.Time) (costEstimate, error) {
+func estimateOCRChainCost(
+	database *db.DB,
+	models []string,
+	limit int,
+	at time.Time,
+) (costEstimate, error) {
 	batch, err := pendingContentBatch(database, limit)
 	if err != nil {
 		return costEstimate{}, fmt.Errorf("query contents: %w", err)
 	}
-
 	estimate := costEstimate{
 		items:      len(batch.contents),
 		totalItems: batch.total,
 		excluded:   batch.excluded,
 		truncated:  batch.truncated,
 	}
-	var inputTokens, outputTokens int64
 	for _, content := range batch.contents {
-		path, err := database.GetDocumentPathForContent(content.ID)
+		missing, err := database.MissingPageIndexes(content.ID)
 		if err != nil {
-			return costEstimate{}, fmt.Errorf("query document path for content %d: %w", content.ID, err)
+			return costEstimate{}, fmt.Errorf("query missing pages for content %d: %w", content.ID, err)
 		}
-		fileType := classifyPath(path)
-		if fileType == "" {
+		estimate.pages += len(missing)
+	}
+	if len(models) == 0 || estimate.items == 0 {
+		return estimate, nil
+	}
+
+	modelCosts := make([]ocr.Currency, len(models))
+	for i, model := range models {
+		modelCosts[i], err = estimateModelCost(database, batch.contents, model, at)
+		if err != nil {
+			return costEstimate{}, err
+		}
+	}
+	estimate.low = modelCosts[0]
+	for _, cost := range modelCosts {
+		estimate.high += cost
+	}
+	// Round upward in billionths of a dollar so the documented 5% retry
+	// assumption is never understated by integer division.
+	estimate.high = (estimate.high*105 + 99) / 100
+	estimate.cost = estimate.low
+	return estimate, nil
+}
+
+func estimateModelCost(
+	database *db.DB,
+	contents []db.Content,
+	model string,
+	at time.Time,
+) (ocr.Currency, error) {
+	var pages int
+	var inputTokens, outputTokens int64
+	for _, content := range contents {
+		missing, err := database.MissingPageIndexes(content.ID)
+		if err != nil {
+			return 0, fmt.Errorf("query missing pages for content %d: %w", content.ID, err)
+		}
+		if len(missing) == 0 {
 			continue
 		}
-
-		estimate.pages += content.PageCount
+		pages += len(missing)
 		if model != modelGemini {
 			continue
 		}
-		pages := int64(content.PageCount)
-		outputTokens += pages * geminiOutputTokens
-		if fileType == "pdf" {
-			requests := (pages + geminiPDFPagesPerChunk - 1) / geminiPDFPagesPerChunk
-			inputTokens += pages*geminiPDFMediaTokens + requests*geminiRequestOverhead
-		} else {
-			inputTokens += geminiImageMediaTokens + geminiRequestOverhead
+		path, err := database.GetDocumentPathForContent(content.ID)
+		if err != nil {
+			return 0, fmt.Errorf("query document path for content %d: %w", content.ID, err)
 		}
+		outputTokens += int64(len(missing) * geminiOutputTokens)
+		if classifyPath(path) != "pdf" {
+			inputTokens += geminiImageMediaTokens + geminiRequestOverhead
+			continue
+		}
+		ranges, err := database.MissingPageRanges(content.ID)
+		if err != nil {
+			return 0, fmt.Errorf("query missing ranges for content %d: %w", content.ID, err)
+		}
+		requests := 0
+		for _, pageRange := range ranges {
+			count := pageRange.End - pageRange.Start
+			requests += (count + geminiPDFPagesPerChunk - 1) / geminiPDFPagesPerChunk
+		}
+		inputTokens += int64(len(missing)*geminiPDFMediaTokens + requests*geminiRequestOverhead)
 	}
-
 	if model == modelGemini {
-		estimate.cost = ocr.GeminiCost(at, inputTokens, outputTokens)
-	} else {
-		estimate.cost = ocr.MistralCost(estimate.pages)
+		return ocr.GeminiCost(at, inputTokens, outputTokens), nil
 	}
-	return estimate, nil
+	return ocr.MistralCost(pages), nil
 }
 
 func formatApproxCurrency(cost ocr.Currency) string {

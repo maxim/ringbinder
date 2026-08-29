@@ -96,15 +96,12 @@ func (db *DB) migrate() error {
 		}
 		return nil
 	case 2:
-		if err := db.applySchemaVersion(schemaV2ToV3SQL+schemaV3ToV4SQL, schemaVersion); err != nil {
+		if err := db.applySchemaVersion(schemaV2ToV5SQL, schemaVersion); err != nil {
 			return fmt.Errorf("migrate schema v2->v%d: %w", schemaVersion, err)
 		}
 		return nil
-	case 3:
-		if err := db.applySchemaVersion(schemaV3ToV4SQL, schemaVersion); err != nil {
-			return fmt.Errorf("migrate schema v3->v%d: %w", schemaVersion, err)
-		}
-		return nil
+	case 3, 4:
+		return fmt.Errorf("unsupported unreleased schema version %d; transfer data with a one-off export into a fresh database", ver)
 	case schemaVersion:
 		return nil
 	default:
@@ -130,10 +127,7 @@ func (db *DB) migrateV1ToCurrent() (err error) {
 	if err = backfillPageSearchTextTx(tx); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(schemaV2ToV3SQL); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(schemaV3ToV4SQL); err != nil {
+	if _, err = tx.Exec(schemaV2ToV5SQL); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {

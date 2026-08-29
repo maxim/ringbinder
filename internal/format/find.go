@@ -31,6 +31,13 @@ func FormatFindResults(results []db.SearchResult, verbose, color bool) string {
 		b.WriteByte('\n')
 
 		if verbose {
+			model := "null"
+			if r.Model != nil {
+				model = *r.Model
+			}
+			metadata := fmt.Sprintf("model: %s; ocr_pending: %t", model, r.OCRPending)
+			b.WriteString(styleDim("    "+metadata, color))
+			b.WriteByte('\n')
 			snippet := formatSnippet(r.Snippet, color)
 			if snippet != "" {
 				b.WriteString(indentAllLines(snippet, "    "))

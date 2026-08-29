@@ -71,7 +71,7 @@ func TestInsertContent(t *testing.T) {
 	}
 }
 
-func TestMarkContentOCRDone(t *testing.T) {
+func TestContentCompletesOnlyWithExactPageCoverage(t *testing.T) {
 	t.Parallel()
 
 	database, err := Open(filepath.Join(t.TempDir(), "test.db"))
@@ -85,11 +85,18 @@ func TestMarkContentOCRDone(t *testing.T) {
 		t.Fatalf("InsertContent() error = %v", err)
 	}
 
-	if err := database.MarkContentOCRDone(id); err != nil {
-		t.Fatalf("MarkContentOCRDone() error = %v", err)
+	if err := database.UpsertPage(id, 0, "first"); err != nil {
+		t.Fatalf("UpsertPage(0) error = %v", err)
+	}
+	content, err := database.GetContentByChecksum("ocr-done")
+	if err != nil || content == nil || !content.OCRPending {
+		t.Fatalf("partial content = %+v, %v; want pending", content, err)
+	}
+	if err := database.UpsertPage(id, 1, "second"); err != nil {
+		t.Fatalf("UpsertPage(1) error = %v", err)
 	}
 
-	content, err := database.GetContentByChecksum("ocr-done")
+	content, err = database.GetContentByChecksum("ocr-done")
 	if err != nil {
 		t.Fatalf("GetContentByChecksum() error = %v", err)
 	}
@@ -131,6 +138,14 @@ func TestCleanupOrphanContents(t *testing.T) {
 		t.Fatalf("UpsertPage(orphan) error = %v", err)
 	}
 
+	trueOrphanID, err := database.InsertContent("true-orphan", 1)
+	if err != nil {
+		t.Fatalf("InsertContent(true orphan) error = %v", err)
+	}
+	if err := database.UpsertPage(trueOrphanID, 0, "unreferenced page"); err != nil {
+		t.Fatalf("UpsertPage(true orphan) error = %v", err)
+	}
+
 	seenPaths := map[string]bool{"/docs/live.pdf": true}
 	if _, err := database.SoftDeleteMissing(seenPaths, []string{"/docs"}); err != nil {
 		t.Fatalf("SoftDeleteMissing() error = %v", err)
@@ -152,19 +167,19 @@ func TestCleanupOrphanContents(t *testing.T) {
 		t.Fatalf("live content removed unexpectedly")
 	}
 
-	orphanContent, err := database.GetContentByChecksum("orphan-checksum")
+	softDeletedContent, err := database.GetContentByChecksum("orphan-checksum")
 	if err != nil {
-		t.Fatalf("GetContentByChecksum(orphan) error = %v", err)
+		t.Fatalf("GetContentByChecksum(soft deleted) error = %v", err)
 	}
-	if orphanContent != nil {
-		t.Fatalf("orphan content still exists")
+	if softDeletedContent == nil {
+		t.Fatalf("soft-deleted content was removed")
 	}
 
-	var orphanPages int
-	if err := database.QueryRow("SELECT COUNT(*) FROM pages WHERE content_id = ?", orphanContentID).Scan(&orphanPages); err != nil {
-		t.Fatalf("count orphan pages error = %v", err)
+	var trueOrphanPages int
+	if err := database.QueryRow("SELECT COUNT(*) FROM pages WHERE content_id = ?", trueOrphanID).Scan(&trueOrphanPages); err != nil {
+		t.Fatalf("count true orphan pages error = %v", err)
 	}
-	if orphanPages != 0 {
-		t.Fatalf("orphan pages = %d, want 0", orphanPages)
+	if trueOrphanPages != 0 {
+		t.Fatalf("true orphan pages = %d, want 0", trueOrphanPages)
 	}
 }

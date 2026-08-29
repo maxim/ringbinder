@@ -62,18 +62,36 @@ func TestFormatFindResults_MultiPageShowsPageNumber(t *testing.T) {
 func TestFormatFindResults_VerboseShowsSnippet(t *testing.T) {
 	t.Parallel()
 
+	model := "provider-v1"
 	results := []db.SearchResult{
 		{
-			Path:      "/docs/verbose.pdf",
-			PageIndex: 0,
-			PageCount: 1,
-			Snippet:   "visible snippet",
+			Path:       "/docs/verbose.pdf",
+			PageIndex:  0,
+			PageCount:  1,
+			Snippet:    "visible snippet",
+			Model:      &model,
+			OCRPending: false,
 		},
 	}
 
 	got := FormatFindResults(results, true, false)
-	if !strings.Contains(got, "    visible snippet") {
-		t.Fatalf("FormatFindResults() output missing indented snippet:\n%s", got)
+	for _, want := range []string{
+		"    visible snippet",
+		"model: provider-v1; ocr_pending: false",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("FormatFindResults() output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatFindResults_VerboseShowsPendingPathMetadata(t *testing.T) {
+	t.Parallel()
+	got := FormatFindResults([]db.SearchResult{{
+		Path: "/docs/pending.pdf", SearchSource: "path", OCRPending: true,
+	}}, true, false)
+	if !strings.Contains(got, "model: null; ocr_pending: true") {
+		t.Fatalf("FormatFindResults() output missing pending path metadata:\n%s", got)
 	}
 }
 

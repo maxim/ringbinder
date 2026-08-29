@@ -355,6 +355,20 @@ func TestAccountGeminiOutputStagesValidatedPagesAndBatchBilling(t *testing.T) {
 	if stored == nil || stored.State != db.GeminiRequestStaged || stored.BatchID != nil {
 		t.Fatalf("stored request = %+v, want detached staged", stored)
 	}
+	var canonicalModel string
+	if err := database.QueryRow(
+		`SELECT model FROM pages WHERE content_id = ? AND page_index = 0`,
+		request.ContentID,
+	).Scan(&canonicalModel); err != nil {
+		t.Fatalf("query canonical page: %v", err)
+	}
+	content, err := database.GetContentByID(request.ContentID)
+	if err != nil || content == nil || content.OCRPending {
+		t.Fatalf("content = %+v, %v; want immediately complete canonical coverage", content, err)
+	}
+	if canonicalModel != "gemini-response-test" {
+		t.Fatalf("canonical model = %q, want response model", canonicalModel)
+	}
 	wantCost := ocr.Currency(10*batch.InputPrice + 25*batch.OutputPrice)
 	if !totals.accounted || totals.billing.Indeterminate || totals.billing.KnownCost != wantCost {
 		t.Fatalf("totals = %+v, want known cost %d", totals, wantCost)
@@ -1153,6 +1167,7 @@ func successfulGeminiOutputLine(t *testing.T, key string, pageIndex int, input, 
 		pageIndex,
 	)
 	response := map[string]any{
+		"modelVersion": "gemini-response-test",
 		"candidates": []any{map[string]any{
 			"content":      map[string]any{"parts": []any{map[string]any{"text": payload}}},
 			"finishReason": "STOP",

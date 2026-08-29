@@ -731,8 +731,12 @@ func TestOCRFileStopsAfterLateChunkValidationFailure(t *testing.T) {
 	if err == nil {
 		t.Fatalf("OCRFile() error = nil")
 	}
-	if results != nil {
-		t.Fatalf("results = %v, want discarded aggregate", results)
+	wantResults := []PageResult{
+		{PageIndex: 0, Markdown: "source-0", Model: mistralModel},
+		{PageIndex: 1, Markdown: "source-1", Model: mistralModel},
+	}
+	if !equalPages(results, wantResults) {
+		t.Fatalf("results = %v, want retained successful chunk %v", results, wantResults)
 	}
 	for _, want := range []string{"late-failure.pdf", "source pages 3-4", "expected [0 1]", "actual [null]"} {
 		if !strings.Contains(err.Error(), want) {

@@ -14,6 +14,8 @@ type findResultJSON struct {
 	Snippet      string  `json:"snippet"`
 	Rank         float64 `json:"rank"`
 	SearchSource string  `json:"search_source"`
+	Model        *string `json:"model"`
+	OCRPending   bool    `json:"ocr_pending"`
 }
 
 // WriteFindResultsNDJSON writes one JSON object per line so callers can stream
@@ -30,6 +32,8 @@ func WriteFindResultsNDJSON(w io.Writer, results []db.SearchResult) error {
 			Snippet:      result.Snippet,
 			Rank:         result.Rank,
 			SearchSource: result.SearchSource,
+			Model:        result.Model,
+			OCRPending:   result.OCRPending,
 		}
 		if err := encoder.Encode(payload); err != nil {
 			return err

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Stable release tag (for example, v0.2.0)
+        description: Stable release tag (for example, v0.3.0)
         required: true
         type: string
 
@@ -246,7 +246,8 @@ jobs:
             "ringbinder version $RELEASE_VERSION"
           HOME="$smoke_dir/home" "$smoke_dir/ringbinder" --help >/dev/null
           test "$(HOME="$smoke_dir/home" "$smoke_dir/ringbinder" \
-            --database "$smoke_dir/ringbinder.db" cost)" = "No documents pending OCR."
+            --database "$smoke_dir/ringbinder.db" cost)" = \
+            $'OCR models: mistral\nNo documents pending OCR.'
           test -f "$smoke_dir/ringbinder.db"
 
   release:

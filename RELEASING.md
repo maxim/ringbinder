@@ -36,7 +36,7 @@ Run the tests and the same kind of host build used by the formula, substituting 
 
 ```sh
 set -euo pipefail
-version=v0.2.0
+version=v0.3.0
 go test ./...
 
 tmpdir="$(mktemp -d)"
@@ -51,7 +51,8 @@ test "$(HOME="$tmpdir/home" "$tmpdir/ringbinder" --version)" = \
   "ringbinder version $version"
 HOME="$tmpdir/home" "$tmpdir/ringbinder" --help >/dev/null
 test "$(HOME="$tmpdir/home" "$tmpdir/ringbinder" \
-  --database "$tmpdir/ringbinder.db" cost)" = "No documents pending OCR."
+  --database "$tmpdir/ringbinder.db" cost)" = \
+  $'OCR models: mistral\nNo documents pending OCR.'
 test -f "$tmpdir/ringbinder.db"
 ```
 
@@ -109,7 +110,7 @@ HOMEBREW_NO_INSTALL_FROM_API=1 brew audit --strict maxim/tap/ringbinder
    ```
 
    GitHub's workflow tokens cannot read the immutable-release setting or ruleset bypass actors. The workflow checks every field visible to its limited tokens and still validates that GitHub marked the published release immutable before it updates Homebrew.
-5. Open [Ringbinder Actions](https://github.com/maxim/ringbinder/actions/workflows/release.yml), select **Run workflow**, choose `main`, and enter the next stable tag such as `v0.2.0`.
+5. Open [Ringbinder Actions](https://github.com/maxim/ringbinder/actions/workflows/release.yml), select **Run workflow**, choose `main`, and enter the next stable tag such as `v0.3.0`.
 6. Wait for the release workflow and the tap's macOS/Linux jobs to finish.
 
 The workflow:
@@ -128,7 +129,7 @@ Confirm the tag, release, formula, and installation after the workflow succeeds:
 
 ```sh
 set -euo pipefail
-version=v0.2.0
+version=v0.3.0
 git fetch origin "refs/tags/$version:refs/tags/$version"
 sha="$(gh api "repos/maxim/ringbinder/git/ref/tags/$version" --jq .object.sha)"
 test "$sha" = "$(git rev-list -n1 "$version")"
@@ -145,7 +146,7 @@ test "$("$prefix/bin/ringbinder" --version)" = "ringbinder version $version"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 test "$("$prefix/bin/ringbinder" --database "$tmpdir/ringbinder.db" cost)" = \
-  "No documents pending OCR."
+  $'OCR models: mistral\nNo documents pending OCR.'
 test -f "$tmpdir/ringbinder.db"
 test -z "$(brew deps maxim/tap/ringbinder)"
 brew deps --include-build maxim/tap/ringbinder | grep -Fx go

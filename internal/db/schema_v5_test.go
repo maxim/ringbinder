@@ -59,7 +59,7 @@ PRAGMA user_version = 2;
 
 func TestFreshV5UsesModelColumn(t *testing.T) {
 	if schemaVersion != 5 {
-		t.Fatalf("schemaVersion = %d, want unreleased version 5 revised in place", schemaVersion)
+		t.Fatalf("schemaVersion = %d, want released version 5", schemaVersion)
 	}
 	database, err := Open(filepath.Join(t.TempDir(), "fresh-v5.db"))
 	if err != nil {

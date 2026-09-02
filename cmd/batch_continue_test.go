@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,6 +25,22 @@ import (
 type readThenError struct {
 	data []byte
 	done bool
+}
+
+type cancelOnOutputWriter struct {
+	bytes.Buffer
+	cancel    context.CancelFunc
+	marker    string
+	cancelled bool
+}
+
+func (writer *cancelOnOutputWriter) Write(data []byte) (int, error) {
+	count, err := writer.Buffer.Write(data)
+	if !writer.cancelled && strings.Contains(writer.String(), writer.marker) {
+		writer.cancelled = true
+		writer.cancel()
+	}
+	return count, err
 }
 
 func (reader *readThenError) Read(buffer []byte) (int, error) {
@@ -49,6 +66,180 @@ func TestInterruptedGeminiOutputDownloadDoesNotMutateRequests(t *testing.T) {
 	}
 	if stored == nil || stored.State != db.GeminiRequestAssigned || stored.BatchID == nil {
 		t.Fatalf("stored request = %+v, want original assignment retained", stored)
+	}
+}
+
+func TestCanceledGeminiOutputImportLeavesRequestAssigned(t *testing.T) {
+	database, batch, request := createOutputTestBatch(t, 0, 1)
+	line := successfulGeminiOutputLine(t, request.RequestKey, 0, 10, 20, 5)
+	ctx, cancel := context.WithCancel(context.Background())
+	var totals batchContinueTotals
+	err := accountGeminiOutputWithCallbacks(
+		ctx,
+		bytes.NewReader(line),
+		database,
+		batch,
+		&totals,
+		func(int) { cancel() },
+		nil,
+	)
+	var incomplete *incompleteGeminiOutputError
+	if !errors.As(err, &incomplete) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("accountGeminiOutputWithCallbacks() error = %v, want incomplete cancellation", err)
+	}
+	stored, err := database.GeminiRequestByID(request.ID)
+	if err != nil || stored == nil || stored.State != db.GeminiRequestAssigned || stored.BatchID == nil {
+		t.Fatalf("stored request = %+v, error = %v, want original assignment", stored, err)
+	}
+}
+
+func TestCanceledGeminiOutputImportResumesAfterOneManifestKey(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "partial-output.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	contentID, err := database.InsertContent("partial-output-checksum", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := database.InsertDocument("/docs/partial-output.pdf", contentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	prices := ocr.GeminiBatchPrices(now)
+	batchID, err := database.CreateGeminiBatch(
+		"partial-output", ocr.GeminiBatchModel, int64(prices.Input), int64(prices.Output), nil,
+		[]db.GeminiRequestPlan{
+			{ContentID: contentID, RequestKey: "partial-first", FileType: "pdf", PageStart: 0, PageEnd: 1},
+			{ContentID: contentID, RequestKey: "partial-second", FileType: "pdf", PageStart: 1, PageEnd: 2},
+		},
+		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := database.GetGeminiBatch(batchID)
+	if err != nil || batch == nil {
+		t.Fatalf("GetGeminiBatch() = %+v, %v", batch, err)
+	}
+	requests, err := database.GeminiRequestsForBatch(batchID)
+	if err != nil || len(requests) != 2 {
+		t.Fatalf("GeminiRequestsForBatch() = %+v, %v", requests, err)
+	}
+	output := append(
+		successfulGeminiOutputLine(t, requests[0].RequestKey, 0, 10, 20, 5),
+		successfulGeminiOutputLine(t, requests[1].RequestKey, 0, 10, 20, 5)...,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var processed int
+	var totals batchContinueTotals
+	err = accountGeminiOutputWithCallbacks(
+		ctx,
+		bytes.NewReader(output),
+		database,
+		*batch,
+		&totals,
+		nil,
+		func() {
+			processed++
+			if processed == 1 {
+				cancel()
+			}
+		},
+	)
+	var incomplete *incompleteGeminiOutputError
+	if !errors.As(err, &incomplete) || !errors.Is(err, context.Canceled) || processed != 1 {
+		t.Fatalf("partial output processing = (%v, %d keys), want cancellation after one key", err, processed)
+	}
+	first, err := database.GeminiRequestByID(requests[0].ID)
+	if err != nil || first == nil || first.State != db.GeminiRequestStaged || first.BatchID != nil {
+		t.Fatalf("first request after interruption = %+v, %v; want staged and detached", first, err)
+	}
+	second, err := database.GeminiRequestByID(requests[1].ID)
+	if err != nil || second == nil || second.State != db.GeminiRequestAssigned || second.BatchID == nil {
+		t.Fatalf("second request after interruption = %+v, %v; want assigned and resumable", second, err)
+	}
+
+	batch.OutputFileName = "files/partial-output"
+	api := &fakeGeminiBatchAPI{output: output}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := accountSucceededGeminiBatch(cmd, database, api, *batch, &totals); err != nil {
+		t.Fatalf("accountSucceededGeminiBatch() resume error = %v", err)
+	}
+	if api.downloadCalls != 1 {
+		t.Fatalf("resume downloads = %d, want one complete output refresh", api.downloadCalls)
+	}
+	if stored, err := database.GetGeminiBatch(batchID); err != nil || stored != nil {
+		t.Fatalf("batch after resumed import = %+v, %v; want finalized", stored, err)
+	}
+	content, err := database.GetContentByID(contentID)
+	if err != nil || content == nil || content.OCRPending {
+		t.Fatalf("content after resumed import = %+v, %v; want completed OCR", content, err)
+	}
+}
+
+func TestCanceledGeminiOutputImportAfterFinalKeyResumesBookkeeping(t *testing.T) {
+	database, batch, request := createOutputTestBatch(t, 0, 1)
+	batch.OutputFileName = "files/final-key-output"
+	if err := database.SetGeminiBatchRemote(
+		batch.ID, "batches/final-key", db.GeminiBatchSucceeded,
+		batch.OutputFileName, "", time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	storedBatch, err := database.GetGeminiBatch(batch.ID)
+	if err != nil || storedBatch == nil {
+		t.Fatalf("GetGeminiBatch() = %+v, %v", storedBatch, err)
+	}
+	batch = *storedBatch
+	line := successfulGeminiOutputLine(t, request.RequestKey, 0, 10, 20, 5)
+	ctx, cancel := context.WithCancel(context.Background())
+	out := &cancelOnOutputWriter{
+		cancel: cancel,
+		marker: fmt.Sprintf("Importing Gemini batch %d output · 1/1 requests", batch.ID),
+	}
+	coordinator := newProgressCoordinator(out, io.Discard, true)
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	api := &fakeGeminiBatchAPI{output: line}
+	var totals batchContinueTotals
+
+	err = accountSucceededGeminiBatch(cmd, database, api, batch, &totals, coordinator)
+	coordinator.Finish(ctx.Err() != nil)
+	if !errors.Is(err, context.Canceled) || !out.cancelled {
+		t.Fatalf("accountSucceededGeminiBatch() error = %v, cancelled = %t; want final-key cancellation", err, out.cancelled)
+	}
+	storedRequest, err := database.GeminiRequestByID(request.ID)
+	if err != nil || storedRequest == nil || storedRequest.State != db.GeminiRequestStaged ||
+		storedRequest.BatchID != nil {
+		t.Fatalf("request after final-key cancellation = %+v, %v; want staged and recoverable", storedRequest, err)
+	}
+	storedBatch, err = database.GetGeminiBatch(batch.ID)
+	if err != nil || storedBatch == nil || storedBatch.State != db.GeminiBatchSucceeded ||
+		storedBatch.OutputFileName != batch.OutputFileName {
+		t.Fatalf("batch after final-key cancellation = %+v, %v; want tracked succeeded batch", storedBatch, err)
+	}
+	billing := totals.billing
+
+	resume := &cobra.Command{}
+	resume.SetContext(context.Background())
+	if _, err := advanceGeminiBatch(resume, database, api, nil, *storedBatch, &totals); err != nil {
+		t.Fatalf("advanceGeminiBatch() resume error = %v", err)
+	}
+	if totals.billing != billing {
+		t.Fatalf("billing after resume = %+v, want unchanged %+v without reapplying output", totals.billing, billing)
+	}
+	if api.downloadCalls != 2 {
+		t.Fatalf("output downloads = %d, want cancellation and resume downloads", api.downloadCalls)
+	}
+	if storedBatch, err := database.GetGeminiBatch(batch.ID); err != nil || storedBatch != nil {
+		t.Fatalf("batch after resumed bookkeeping = %+v, %v; want finalized", storedBatch, err)
+	}
+	if storedRequest, err := database.GeminiRequestByID(request.ID); err != nil || storedRequest != nil {
+		t.Fatalf("request after resumed bookkeeping = %+v, %v; want retired", storedRequest, err)
 	}
 }
 
@@ -310,6 +501,91 @@ func TestRetryPreparationCancellationPreservesRetryableRequest(t *testing.T) {
 	}
 }
 
+func TestPreparedBatchCancellationAfterContentCheckPreservesAssignment(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		installHook func(*testing.T, context.CancelFunc)
+	}{
+		{name: "matching path", installHook: cancelAfterMatchingContentPath},
+		{name: "verification", installHook: cancelAfterVerifyingContentPath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, batch, request := createPreparedImageTestBatch(t, "prepared-"+test.name)
+			ctx, cancel := context.WithCancel(context.Background())
+			test.installHook(t, cancel)
+			cmd := &cobra.Command{}
+			cmd.SetContext(ctx)
+
+			err := resumePreparedGeminiBatch(
+				cmd, database, &fakeGeminiBatchAPI{}, ocr.NewGeminiClient("", time.Now().UTC()), batch,
+			)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("resumePreparedGeminiBatch() error = %v, want context cancellation", err)
+			}
+			stored, err := database.GeminiRequestByID(request.ID)
+			if err != nil || stored == nil || stored.State != db.GeminiRequestAssigned || stored.BatchID == nil {
+				t.Fatalf("stored request = %+v, error = %v, want original assignment", stored, err)
+			}
+		})
+	}
+}
+
+func TestRetryPreparationCancellationAfterContentCheckPreservesRetryableRequest(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		installHook func(*testing.T, context.CancelFunc)
+	}{
+		{name: "matching path", installHook: cancelAfterMatchingContentPath},
+		{name: "verification", installHook: cancelAfterVerifyingContentPath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, _, request := createPreparedImageTestBatch(t, "retry-"+test.name)
+			if _, err := database.RetryGeminiRequest(request.ID, "retry", time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			test.installHook(t, cancel)
+			cmd := &cobra.Command{}
+			cmd.SetContext(ctx)
+
+			found, errs := submitRetryableGeminiRequests(
+				cmd, database, &fakeGeminiBatchAPI{}, ocr.NewGeminiClient("", time.Now().UTC()),
+			)
+			if !found || len(errs) != 1 || !errors.Is(errs[0], context.Canceled) {
+				t.Fatalf("submitRetryableGeminiRequests() = (%t, %v), want context cancellation", found, errs)
+			}
+			stored, err := database.GeminiRequestByID(request.ID)
+			if err != nil || stored == nil || stored.State != db.GeminiRequestRetryable || stored.BatchID != nil {
+				t.Fatalf("stored request = %+v, error = %v, want retryable", stored, err)
+			}
+		})
+	}
+}
+
+func cancelAfterMatchingContentPath(t *testing.T, cancel context.CancelFunc) {
+	t.Helper()
+	original := matchingContentPath
+	matchingContentPath = func(database *db.DB, contentID int64, expectedChecksum string) (string, error) {
+		path, _ := original(database, contentID, expectedChecksum)
+		cancel()
+		return path, errors.New("source path changed")
+	}
+	t.Cleanup(func() { matchingContentPath = original })
+}
+
+func cancelAfterVerifyingContentPath(t *testing.T, cancel context.CancelFunc) {
+	t.Helper()
+	original := verifyContentPath
+	verifyContentPath = func(path, expectedChecksum string) error {
+		if err := original(path, expectedChecksum); err != nil {
+			return err
+		}
+		cancel()
+		return errors.New("source changed")
+	}
+	t.Cleanup(func() { verifyContentPath = original })
+}
+
 func TestRetrySubmissionStopsAfterGlobalFailure(t *testing.T) {
 	database, _, firstRequest := createPreparedImageTestBatch(t, "global-one")
 	secondBatch, secondRequest := addPreparedImageTestBatch(t, database, "global-two")
@@ -338,6 +614,36 @@ func TestRetrySubmissionStopsAfterGlobalFailure(t *testing.T) {
 	}
 	if batch, err := database.GetGeminiBatch(secondBatch.ID); err != nil || batch == nil {
 		t.Fatalf("original second batch = %+v, error = %v", batch, err)
+	}
+}
+
+func TestRetryPreparationGlobalFailureIsNotReportedAsCancellation(t *testing.T) {
+	database, _, firstRequest := createPreparedImageTestBatch(t, "global-progress-one")
+	_, secondRequest := addPreparedImageTestBatch(t, database, "global-progress-two")
+	if _, err := database.RetryGeminiRequest(firstRequest.ID, "retry", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.RetryGeminiRequest(secondRequest.ID, "retry", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeGeminiBatchAPI{createError: &ocr.GeminiBatchAPIError{
+		StatusCode: 401,
+		Body:       []byte("invalid credentials"),
+	}}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var out, errOut bytes.Buffer
+	coordinator := newProgressCoordinator(&out, &errOut, false)
+
+	found, errs := submitRetryableGeminiRequests(
+		cmd, database, api, ocr.NewGeminiClient("", time.Now().UTC()), coordinator,
+	)
+	coordinator.Finish(false)
+	if !found || len(errs) != 1 || !ocr.IsGeminiGlobalFailure(errs[0]) {
+		t.Fatalf("submitRetryableGeminiRequests() errors = %v, want one global failure", errs)
+	}
+	if strings.Contains(out.String(), "Stopped at") || strings.Contains(out.String(), "Preparing Gemini retry input complete") {
+		t.Fatalf("global failure rendered as cancellation or completion: %q", out.String())
 	}
 }
 
@@ -392,6 +698,84 @@ func TestAccountGeminiOutputRejectsDuplicateAndRetriesOnce(t *testing.T) {
 	}
 	if !totals.billing.Indeterminate {
 		t.Fatalf("duplicate output cost should be indeterminate")
+	}
+}
+
+func TestGeminiOutputManifestAnomaliesAdvanceEveryKnownKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		output    func(*testing.T, db.GeminiBatchRequest) []byte
+		orphan    bool
+		wantError bool
+	}{
+		{name: "missing key", output: func(*testing.T, db.GeminiBatchRequest) []byte { return nil }},
+		{name: "malformed line", output: func(*testing.T, db.GeminiBatchRequest) []byte { return []byte("{not JSON}\n") }, wantError: true},
+		{name: "foreign key", output: func(*testing.T, db.GeminiBatchRequest) []byte {
+			return []byte(`{"key":"foreign-key","response":{}}` + "\n")
+		}, wantError: true},
+		{name: "locally orphaned key", output: func(t *testing.T, request db.GeminiBatchRequest) []byte {
+			return successfulGeminiOutputLine(t, request.RequestKey, 0, 10, 20, 5)
+		}, orphan: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, batch, request := createOutputTestBatch(t, 0, 1)
+			if test.orphan {
+				if _, err := database.Exec(`DELETE FROM documents WHERE content_id = ?`, request.ContentID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.Exec(`DELETE FROM contents WHERE id = ?`, request.ContentID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			validated := 0
+			processed := 0
+			var totals batchContinueTotals
+			err := accountGeminiOutputWithCallbacks(
+				context.Background(), bytes.NewReader(test.output(t, request)), database, batch, &totals,
+				func(total int) {
+					if total != 1 {
+						t.Errorf("validated manifest keys = %d, want 1", total)
+					}
+					validated++
+				},
+				func() { processed++ },
+			)
+			if (err != nil) != test.wantError {
+				t.Fatalf("accountGeminiOutputWithCallbacks() error = %v, wantError %t", err, test.wantError)
+			}
+			if validated != 1 || processed != 1 {
+				t.Fatalf("progress callbacks = validated %d, processed %d; want one each", validated, processed)
+			}
+
+			stored, lookupErr := database.GeminiRequestByID(request.ID)
+			if test.orphan {
+				if lookupErr != nil || stored != nil {
+					t.Fatalf("orphaned request = %+v, %v; want local no-op", stored, lookupErr)
+				}
+			} else if lookupErr != nil || stored == nil || stored.State != db.GeminiRequestRetryable ||
+				stored.AttemptCount != 1 || stored.BatchID != nil {
+				t.Fatalf("request after %s = %+v, %v; want detached automatic retry", test.name, stored, lookupErr)
+			}
+
+			// The lower-level helper leaves finalization to continue. Re-running
+			// the immutable output through that command boundary must finalize the
+			// now-unassigned batch even when validation reported an anomaly.
+			batch.OutputFileName = "files/output"
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			finalizeErr := accountSucceededGeminiBatch(
+				cmd, database, &fakeGeminiBatchAPI{output: test.output(t, request)}, batch, &batchContinueTotals{},
+			)
+			if (finalizeErr != nil) != test.wantError {
+				t.Fatalf("accountSucceededGeminiBatch() error = %v, wantError %t", finalizeErr, test.wantError)
+			}
+			if finalized, err := database.GetGeminiBatch(batch.ID); err != nil || finalized != nil {
+				t.Fatalf("finalized batch = %+v, %v; want no tracked batch", finalized, err)
+			}
+		})
 	}
 }
 

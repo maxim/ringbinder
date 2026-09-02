@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,7 +14,7 @@ import (
 
 func init() {
 	ocrCmd.Flags().StringArray("model", nil, "OCR model in priority order (repeat: mistral or gemini)")
-	ocrCmd.Flags().Int("limit", 0, "Maximum number of pending content items to process")
+	ocrCmd.Flags().Int("limit", 0, "Maximum number of pending documents to process")
 	rootCmd.AddCommand(ocrCmd)
 }
 
@@ -27,6 +26,7 @@ var ocrCmd = &cobra.Command{
 }
 
 func runOCR(cmd *cobra.Command, args []string) error {
+	ensureCommandContext(cmd)
 	cfg, err := loadCommandConfig(cmd, "model")
 	if err != nil {
 		return err
@@ -61,7 +61,12 @@ func runOCR(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	return processOCRChain(cmd.Context(), database, providers, settings.models, limit, os.Stdout, cmd.ErrOrStderr())
+	progressOutput := newCommandProgress(cmd)
+	defer func() { progressOutput.Finish(cmd.Context().Err() != nil) }()
+	return processOCRChain(
+		cmd.Context(), database, providers, settings.models, limit,
+		commandStdout(cmd), progressOutput.ErrWriter(), progressOutput,
+	)
 }
 
 func replacePagesWhileActive(ctx context.Context, writeMu *sync.Mutex, replace func() error) error {

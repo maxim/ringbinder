@@ -268,6 +268,108 @@ func TestCanceledSubmissionStaysUploaded(t *testing.T) {
 	}
 }
 
+func TestLateSuccessfulUploadResumesWithoutUploadingAgain(t *testing.T) {
+	database, batch, request := createPreparedImageTestBatch(t, "late-upload")
+	line := []byte(fmt.Sprintf(`{"key":%q}`+"\n", request.RequestKey))
+	ctx, cancel := context.WithCancel(context.Background())
+	api := &fakeGeminiBatchAPI{
+		uploadFunc: func(context.Context, string, io.ReadSeeker, int64) (ocr.GeminiRemoteFile, error) {
+			cancel()
+			return ocr.GeminiRemoteFile{Name: "files/late-upload"}, nil
+		},
+	}
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	err := uploadAndSubmitGeminiBatch(
+		cmd, database, api, batch.ID, bytes.NewReader(line), int64(len(line)),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("uploadAndSubmitGeminiBatch() error = %v, want context cancellation", err)
+	}
+	stored, err := database.GetGeminiBatch(batch.ID)
+	if err != nil || stored == nil || stored.State != db.GeminiBatchUploaded ||
+		stored.InputFileName != "files/late-upload" {
+		t.Fatalf("batch after late upload = %+v, %v; want uploaded remote file", stored, err)
+	}
+	if api.uploadCalls != 1 || api.createCalls != 0 {
+		t.Fatalf("remote calls after cancellation = %d uploads, %d creates; want 1, 0", api.uploadCalls, api.createCalls)
+	}
+
+	resume := &cobra.Command{}
+	resume.SetContext(context.Background())
+	resume.SetOut(io.Discard)
+	resume.SetErr(io.Discard)
+	var totals batchContinueTotals
+	if _, err := advanceGeminiBatch(resume, database, api, nil, *stored, &totals); err != nil {
+		t.Fatalf("advanceGeminiBatch() error = %v", err)
+	}
+	if api.uploadCalls != 1 || api.createCalls != 1 || len(api.createInputFiles) != 1 ||
+		api.createInputFiles[0] != "files/late-upload" {
+		t.Fatalf(
+			"resumed remote calls = %d uploads, %d creates with inputs %v; want saved upload submitted once",
+			api.uploadCalls, api.createCalls, api.createInputFiles,
+		)
+	}
+	resumed, err := database.GetGeminiBatch(batch.ID)
+	if err != nil || resumed == nil || resumed.State != db.GeminiBatchPending ||
+		resumed.InputFileName != "files/late-upload" || resumed.RemoteName != "batches/1" {
+		t.Fatalf("batch after resumed submission = %+v, %v; want persisted upload and remote batch", resumed, err)
+	}
+}
+
+func TestLateSuccessfulSubmissionResumesByPollingRemoteBatch(t *testing.T) {
+	database, batch, _ := createPreparedImageTestBatch(t, "late-submission")
+	if err := database.SetGeminiBatchUploaded(batch.ID, "files/late-submission", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	api := &fakeGeminiBatchAPI{
+		createFunc: func(context.Context, string, string, string) (ocr.GeminiRemoteBatch, error) {
+			cancel()
+			return ocr.GeminiRemoteBatch{Name: "batches/late-submission", State: "JOB_STATE_PENDING"}, nil
+		},
+	}
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	if err := submitUploadedGeminiBatch(cmd, database, api, batch.ID); err != nil {
+		t.Fatalf("submitUploadedGeminiBatch() error = %v", err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("command context error = %v, want cancellation", ctx.Err())
+	}
+	stored, err := database.GetGeminiBatch(batch.ID)
+	if err != nil || stored == nil || stored.State != db.GeminiBatchPending ||
+		stored.RemoteName != "batches/late-submission" {
+		t.Fatalf("batch after late submission = %+v, %v; want persisted remote batch", stored, err)
+	}
+
+	var polledName string
+	api.getFunc = func(_ context.Context, name string) (ocr.GeminiRemoteBatch, error) {
+		polledName = name
+		return ocr.GeminiRemoteBatch{Name: "batches/late-submission", State: "JOB_STATE_RUNNING"}, nil
+	}
+	resume := &cobra.Command{}
+	resume.SetContext(context.Background())
+	resume.SetOut(io.Discard)
+	resume.SetErr(io.Discard)
+	var totals batchContinueTotals
+	if _, err := advanceGeminiBatch(resume, database, api, nil, *stored, &totals); err != nil {
+		t.Fatalf("advanceGeminiBatch() error = %v", err)
+	}
+	if api.createCalls != 1 || api.getCalls != 1 || polledName != "batches/late-submission" {
+		t.Fatalf(
+			"resume calls = %d creates, %d polls of %q; want no resubmission and one poll of saved remote",
+			api.createCalls, api.getCalls, polledName,
+		)
+	}
+}
+
 func TestSerialUploadsHaveSeparateProgressLifecycles(t *testing.T) {
 	database, firstBatch, firstRequest := createPreparedImageTestBatch(t, "serial-one")
 	secondBatch, secondRequest := addPreparedImageTestBatch(t, database, "serial-two")
@@ -321,14 +423,44 @@ func TestUploadSourceReadErrorReportsConsumedBytes(t *testing.T) {
 	}
 }
 
+func TestUploadProgressChecksCommandOutputWriter(t *testing.T) {
+	database, batch, request := createPreparedImageTestBatch(t, "redirected-upload")
+	line := []byte(fmt.Sprintf(`{"key":%q}`+"\n", request.RequestKey))
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(&out)
+
+	oldTerminalCheck := progressWriterIsTerminal
+	var checked io.Writer
+	progressWriterIsTerminal = func(writer io.Writer) bool {
+		checked = writer
+		return false
+	}
+	t.Cleanup(func() { progressWriterIsTerminal = oldTerminalCheck })
+
+	if err := uploadAndSubmitGeminiBatch(
+		cmd, database, &fakeGeminiBatchAPI{}, batch.ID,
+		bytes.NewReader(line), int64(len(line)),
+	); err != nil {
+		t.Fatalf("uploadAndSubmitGeminiBatch() error = %v", err)
+	}
+	if checked != &out {
+		t.Fatalf("terminal check writer = %T, want command output writer", checked)
+	}
+	if strings.Contains(out.String(), "\x1b[") {
+		t.Fatalf("redirected upload output contains ANSI controls: %q", out.String())
+	}
+}
+
 func TestUploadHelperRestoresTTYAfterTransportPanic(t *testing.T) {
 	database, batch, request := createPreparedImageTestBatch(t, "panic")
 	line := []byte(fmt.Sprintf(`{"key":%q}`+"\n", request.RequestKey))
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
-	oldTerminalCheck := batchStdoutIsTerminal
-	batchStdoutIsTerminal = func() bool { return true }
-	t.Cleanup(func() { batchStdoutIsTerminal = oldTerminalCheck })
+	oldTerminalCheck := progressWriterIsTerminal
+	progressWriterIsTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { progressWriterIsTerminal = oldTerminalCheck })
 	var recovered any
 
 	output := captureStdout(t, func() {

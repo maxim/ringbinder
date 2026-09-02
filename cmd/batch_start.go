@@ -11,7 +11,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
 	"github.com/maxim/ringbinder/internal/progress"
@@ -31,13 +30,21 @@ type retryBatchGroup struct {
 	replacementOf *int64
 }
 
+// createGeminiBatchWork is the command boundary for the one durable
+// preparation commit. Keeping it replaceable lets command tests force that
+// boundary to fail without making database preparation itself UI-aware.
+var createGeminiBatchWork = func(
+	database *db.DB,
+	creations []db.GeminiBatchCreation,
+	blocked []db.GeminiBlockedRequest,
+	now time.Time,
+) ([]int64, error) {
+	return database.CreateGeminiBatchWork(creations, blocked, now)
+}
+
 type countingReadSeeker struct {
 	source io.ReadSeeker
 	onRead func(int)
-}
-
-var batchStdoutIsTerminal = func() bool {
-	return isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
 }
 
 func (reader *countingReadSeeker) Read(buffer []byte) (int, error) {
@@ -53,6 +60,7 @@ func (reader *countingReadSeeker) Seek(offset int64, whence int) (int64, error) 
 }
 
 func runBatchStart(cmd *cobra.Command, args []string) error {
+	ensureCommandContext(cmd)
 	limit, err := readOCRLimit(cmd)
 	if err != nil {
 		return err
@@ -63,22 +71,42 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 	}
 	defer command.Close()
 
+	out := commandStdout(cmd)
+	coordinator := newCommandProgress(cmd)
+	defer func() { coordinator.Finish(cmd.Context().Err() != nil) }()
+
+	selecting := coordinator.StartPhase(progress.PhaseOptions{
+		Label: "Selecting documents for Gemini batch OCR",
+	})
 	contents, err := command.database.PendingContentsForGeminiBatch()
 	if err != nil {
+		coordinator.ClosePhase(selecting)
 		return fmt.Errorf("query pending contents with unassigned pages: %w", err)
+	}
+	// The selection query does not take the command context. Check it as soon
+	// as it returns so cancellation cannot begin planning newly selected work.
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		coordinator.StopPhase(selecting)
+		return contextErr
 	}
 	if limit > 0 && limit < len(contents) {
 		contents = contents[:limit]
 	}
 	if len(contents) == 0 {
-		fmt.Println("No documents have unassigned pages pending Gemini batch OCR.")
-		return reportBatchBlockedSummary(command.database)
+		coordinator.ClosePhase(selecting)
+		fmt.Fprintln(out, "No documents have unassigned pages pending Gemini batch OCR.")
+		return reportBatchBlockedSummaryTo(out, command.database)
 	}
+	coordinator.CompletePhase(selecting)
 
+	preparing := coordinator.StartPhase(progress.PhaseOptions{
+		Label: "Preparing Gemini input", Total: len(contents), Unit: "documents", Detail: "0 requests",
+	})
 	planner := ocr.NewGeminiClient("", time.Now().UTC())
 	transport := newGeminiBatchAPI(command.apiKey)
 	group, err := newFreshBatchGroup()
 	if err != nil {
+		coordinator.ClosePhase(preparing)
 		return err
 	}
 	var groups []*freshBatchGroup
@@ -90,6 +118,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 	}()
 	var commandErrors []error
 	var blockedWork []db.GeminiBlockedRequest
+	requestCount := 0
 	sealGroup := func() error {
 		if len(group.plans) == 0 {
 			return nil
@@ -108,19 +137,28 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			break
 		}
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			coordinator.StopPhase(preparing)
+			return contextErr
+		}
+		preparing.SetCurrent(fmt.Sprintf("document %d", content.ID))
 		path, pathErr := matchingContentPath(command.database, content.ID, content.Checksum)
 		if pathErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: %v; run ringbinder sweep\n", pathErr)
+			coordinator.Warningf("warning: %v; run ringbinder sweep\n", pathErr)
+			preparing.Advance()
 			continue
 		}
+		preparing.SetCurrent(path)
 		fileType := classifyPath(path)
 		if fileType == "" {
-			fmt.Fprintf(os.Stderr, "warning: skipping unsupported OCR file %s\n", path)
+			coordinator.Warningf("warning: skipping unsupported OCR file %s\n", path)
+			preparing.Advance()
 			continue
 		}
 		contentStartGroup := len(groups)
 		contentStartSize := group.size
 		contentStartPlans := len(group.plans)
+		contentStartRequestCount := requestCount
 		var blockedPlans []db.GeminiBlockedRequest
 		missingRanges, prepareErr := command.database.MissingUnownedPageRanges(content.ID)
 		yield := func(request ocr.GeminiPreparedRequest) error {
@@ -151,6 +189,8 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 			}
 			group.size += int64(len(line))
 			group.plans = append(group.plans, plan)
+			requestCount++
+			preparing.SetDetail(fmt.Sprintf("%d requests", requestCount))
 			return nil
 		}
 		reject := func(sizeErr *ocr.GeminiRangeSizeError) error {
@@ -175,6 +215,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		// Nothing is persisted until every selected item is prepared. On
 		// cancellation, discard all in-memory groups instead of blocking work.
 		if contextErr := cmd.Context().Err(); contextErr != nil {
+			coordinator.StopPhase(preparing)
 			return contextErr
 		}
 		checksumErr := verifyContentPath(path, content.Checksum)
@@ -183,8 +224,12 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 				&group, &groups, contentStartGroup, contentStartSize, contentStartPlans,
 			); rollbackErr != nil {
 				commandErrors = append(commandErrors, rollbackErr)
+			} else {
+				requestCount = contentStartRequestCount
+				preparing.SetDetail(fmt.Sprintf("%d requests", requestCount))
 			}
-			fmt.Fprintf(os.Stderr, "warning: %v\n", checksumErr)
+			coordinator.Warningf("warning: %v\n", checksumErr)
+			preparing.Advance()
 			continue
 		}
 		blockedWork = append(blockedWork, blockedPlans...)
@@ -202,9 +247,13 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 				&group, &groups, contentStartGroup, contentStartSize, contentStartPlans,
 			); rollbackErr != nil {
 				commandErrors = append(commandErrors, rollbackErr)
+			} else {
+				requestCount = contentStartRequestCount
+				preparing.SetDetail(fmt.Sprintf("%d requests", requestCount))
 			}
-			fmt.Fprintf(os.Stderr, "warning: cannot prepare %s for Gemini batch OCR: %v\n", path, prepareErr)
+			coordinator.Warningf("warning: cannot prepare %s for Gemini batch OCR: %v\n", path, prepareErr)
 		}
+		preparing.Advance()
 	}
 	if err != nil {
 		commandErrors = append(commandErrors, err)
@@ -212,15 +261,20 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 		commandErrors = append(commandErrors, sealErr)
 	}
 	if len(groups) == 0 && len(blockedWork) == 0 {
+		coordinator.ClosePhase(preparing)
 		if len(commandErrors) == 0 {
-			fmt.Println("No valid pending page ranges could be prepared for Gemini batch OCR.")
+			fmt.Fprintln(out, "No valid pending page ranges could be prepared for Gemini batch OCR.")
 		}
-		if summaryErr := reportBatchBlockedSummary(command.database); summaryErr != nil {
+		if summaryErr := reportBatchBlockedSummaryTo(out, command.database); summaryErr != nil {
 			commandErrors = append(commandErrors, summaryErr)
 		}
 		return errors.Join(commandErrors...)
 	}
 
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		coordinator.StopPhase(preparing)
+		return contextErr
+	}
 	now := time.Now().UTC()
 	prices := ocr.GeminiBatchPrices(now)
 	creations := make([]db.GeminiBatchCreation, len(groups))
@@ -231,13 +285,21 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 			Requests: sealed.plans,
 		}
 	}
-	batchIDs, persistErr := command.database.CreateGeminiBatchWork(creations, blockedWork, now)
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		coordinator.StopPhase(preparing)
+		return contextErr
+	}
+	batchIDs, persistErr := createGeminiBatchWork(command.database, creations, blockedWork, now)
 	if persistErr != nil {
+		coordinator.ClosePhase(preparing)
 		commandErrors = append(commandErrors, fmt.Errorf("persist prepared Gemini batch work: %w", persistErr))
 		return errors.Join(commandErrors...)
 	}
+	// Prepared work becomes durable only after this transaction; its result is
+	// the preparation phase's completion rather than a duplicate status line.
+	coordinator.ClosePhase(preparing)
 	for i, batchID := range batchIDs {
-		fmt.Printf("Gemini batch %d prepared with %d request(s).\n", batchID, len(groups[i].plans))
+		fmt.Fprintf(out, "Gemini batch %d prepared with %d request(s).\n", batchID, len(groups[i].plans))
 	}
 	for i, batchID := range batchIDs {
 		if contextErr := cmd.Context().Err(); contextErr != nil {
@@ -245,10 +307,10 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 			break
 		}
 		uploadErr := uploadAndSubmitGeminiBatch(
-			cmd, command.database, transport, batchID, groups[i].file, groups[i].size,
+			cmd, command.database, transport, batchID, groups[i].file, groups[i].size, coordinator,
 		)
 		if uploadErr == nil {
-			fmt.Printf("Gemini batch %d submitted.\n", batchID)
+			fmt.Fprintf(out, "Gemini batch %d submitted.\n", batchID)
 			continue
 		}
 		commandErrors = append(commandErrors, fmt.Errorf("Gemini batch %d: %w", batchID, uploadErr))
@@ -256,7 +318,7 @@ func runBatchStart(cmd *cobra.Command, args []string) error {
 			break
 		}
 	}
-	if summaryErr := reportBatchBlockedSummary(command.database); summaryErr != nil {
+	if summaryErr := reportBatchBlockedSummaryTo(out, command.database); summaryErr != nil {
 		commandErrors = append(commandErrors, summaryErr)
 	}
 	return errors.Join(commandErrors...)
@@ -269,6 +331,7 @@ func uploadAndSubmitGeminiBatch(
 	batchID int64,
 	input io.ReadSeeker,
 	size int64,
+	coordinators ...*progressCoordinator,
 ) error {
 	batch, err := database.GetGeminiBatch(batchID)
 	if err != nil {
@@ -283,12 +346,24 @@ func uploadAndSubmitGeminiBatch(
 	if err := database.SetGeminiBatchUploadUnknown(batchID, time.Now().UTC()); err != nil {
 		return err
 	}
-	tracker := progress.NewUpload(os.Stdout, batchStdoutIsTerminal(), batchID, size)
-	defer tracker.Close()
+	coordinator := firstProgressCoordinator(coordinators)
+	var tracker *progress.UploadTracker
+	if coordinator != nil {
+		tracker = coordinator.StartUpload(batchID, size)
+		defer coordinator.CloseUpload(tracker)
+	} else {
+		out := commandStdout(cmd)
+		tracker = progress.NewUpload(out, progressWriterIsTerminal(out), batchID, size)
+		defer tracker.Close()
+	}
 	trackedInput := &countingReadSeeker{source: input, onRead: tracker.AddBytes}
 	remoteFile, err := transport.UploadJSONL(cmd.Context(), batch.DisplayName, trackedInput, size)
 	if err != nil {
-		tracker.Stopped()
+		if coordinator != nil {
+			coordinator.StopUpload(tracker)
+		} else {
+			tracker.Stopped()
+		}
 		// Once upload starts, cancellation can race with remote finalization even
 		// when a transport forgets to classify that uncertainty explicitly.
 		ambiguous := ocr.IsGeminiAmbiguousOperation(err) ||
@@ -300,11 +375,17 @@ func uploadAndSubmitGeminiBatch(
 		}
 		return err
 	}
-	tracker.Complete()
+	if coordinator != nil {
+		coordinator.CompleteUpload(tracker)
+	} else {
+		tracker.Complete()
+	}
+	// A successful upload can arrive alongside cancellation. Record it before
+	// returning so recovery knows the remote input exists and never uploads it twice.
 	if err := database.SetGeminiBatchUploaded(batchID, remoteFile.Name, time.Now().UTC()); err != nil {
 		return err
 	}
-	return submitUploadedGeminiBatch(cmd, database, transport, batchID)
+	return submitUploadedGeminiBatch(cmd, database, transport, batchID, coordinator)
 }
 
 func submitUploadedGeminiBatch(
@@ -312,6 +393,7 @@ func submitUploadedGeminiBatch(
 	database *db.DB,
 	transport geminiBatchAPI,
 	batchID int64,
+	coordinators ...*progressCoordinator,
 ) error {
 	batch, err := database.GetGeminiBatch(batchID)
 	if err != nil {
@@ -345,8 +427,22 @@ func submitUploadedGeminiBatch(
 	if err := database.SetGeminiBatchSubmissionUnknown(batchID, now); err != nil {
 		return err
 	}
+	coordinator := firstProgressCoordinator(coordinators)
+	var submitting *progress.Reporter
+	if coordinator != nil {
+		submitting = coordinator.StartPhase(progress.PhaseOptions{
+			Label: fmt.Sprintf("Submitting Gemini batch %d", batchID),
+		})
+	}
 	remote, err := transport.CreateBatch(cmd.Context(), batch.Model, batch.DisplayName, batch.InputFileName)
 	if err != nil {
+		if submitting != nil {
+			if cmd.Context().Err() != nil {
+				coordinator.StopPhase(submitting)
+			} else {
+				coordinator.ClosePhase(submitting)
+			}
+		}
 		if ocr.IsGeminiAmbiguousOperation(err) {
 			_ = database.SetGeminiBatchError(batchID, err.Error(), time.Now().UTC())
 			return err
@@ -366,9 +462,19 @@ func submitUploadedGeminiBatch(
 		state = db.GeminiBatchPending
 		remote.ErrorMessage = err.Error()
 	}
-	return database.SetGeminiBatchRemote(
+	// A successful submission can race with cancellation too; durable remote
+	// identity is required to reconcile it rather than submit a duplicate batch.
+	setErr := database.SetGeminiBatchRemote(
 		batchID, remote.Name, state, remote.OutputFileName, remote.ErrorMessage, time.Now().UTC(),
 	)
+	if submitting != nil {
+		if setErr != nil {
+			coordinator.ClosePhase(submitting)
+		} else {
+			coordinator.CompletePhase(submitting)
+		}
+	}
+	return setErr
 }
 
 func geminiBatchMembershipMatches(manifest []string, requests []db.GeminiBatchRequest) bool {

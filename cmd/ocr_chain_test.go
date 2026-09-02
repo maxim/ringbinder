@@ -356,6 +356,66 @@ func TestProcessOCRChainGlobalFailureCancelsRun(t *testing.T) {
 	}
 }
 
+func TestProcessOCRChainCancellationDoesNotAttemptQueuedDocuments(t *testing.T) {
+	database := openOCRChainTestDB(t)
+	_, globalPath := addOCRChainFile(t, database, "global-cancel.png", 1)
+	const workerCount = mistralConcurrency + geminiConcurrency
+	var queuedPath string
+	for i := 0; i < workerCount; i++ {
+		_, path := addOCRChainFile(t, database, fmt.Sprintf("queued-cancel-%02d.png", i), 1)
+		if i == workerCount-1 {
+			queuedPath = path
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slowStarted := make(chan struct{}, workerCount-1)
+	var attemptedMu sync.Mutex
+	attempted := make(map[string]bool)
+	provider := &fakeRangeProvider{fn: func(ctx context.Context, path string, start, end int) (ocr.RangeResult, error) {
+		attemptedMu.Lock()
+		attempted[path] = true
+		attemptedMu.Unlock()
+		if path == globalPath {
+			for range workerCount - 1 {
+				<-slowStarted
+			}
+			cancel()
+			return ocr.RangeResult{}, ocr.GlobalFailure(errors.New("controlled global failure"))
+		}
+		slowStarted <- struct{}{}
+		<-ctx.Done()
+		return ocr.RangeResult{}, ctx.Err()
+	}}
+	providers := testProviderChain(modelMistral, "requested", provider, workerCount)
+	var out, errOut bytes.Buffer
+	coordinator := newProgressCoordinator(&out, &errOut, false)
+	err := processOCRChain(
+		ctx, database, providers, []string{modelMistral}, 0,
+		&out, coordinator.ErrWriter(), coordinator,
+	)
+	coordinator.Finish(ctx.Err() != nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("processOCRChain() error = %v, want context cancellation", err)
+	}
+
+	attemptedMu.Lock()
+	attemptedCount := len(attempted)
+	queuedAttempted := attempted[queuedPath]
+	attemptedMu.Unlock()
+	if attemptedCount != workerCount || queuedAttempted || provider.callCount() != workerCount {
+		t.Fatalf(
+			"provider attempts = %d paths/%d calls; queued attempted = %t; want %d attempts without queued work",
+			attemptedCount, provider.callCount(), queuedAttempted, workerCount,
+		)
+	}
+	wantStopped := fmt.Sprintf("Stopped at %d/%d documents attempted: OCR", workerCount, workerCount+1)
+	if strings.Count(out.String(), "Stopped at") != 1 || !strings.Contains(out.String(), wantStopped) {
+		t.Fatalf("progress = %q, want stopped count %q without the queued document", out.String(), wantStopped)
+	}
+}
+
 func TestProcessOCRChainRejectsChecksumMutationBeforeCommit(t *testing.T) {
 	database := openOCRChainTestDB(t)
 	contentID, path := addOCRChainFile(t, database, "mutation.pdf", 1)
@@ -562,5 +622,63 @@ func testProviderChain(
 			provider:     provider,
 			slots:        make(chan struct{}, limit),
 		},
+	}
+}
+
+func TestProcessOCRChainNonTTYProgressUsesDocumentCounts(t *testing.T) {
+	database := openOCRChainTestDB(t)
+	_, _ = addOCRChainFile(t, database, "first.png", 1)
+	_, _ = addOCRChainFile(t, database, "second.png", 1)
+	provider := successfulRangeProvider("exact", 0)
+	providers := testProviderChain(modelMistral, "requested", provider, mistralConcurrency)
+	var out, errOut bytes.Buffer
+	coordinator := newProgressCoordinator(&out, &errOut, false)
+	if err := processOCRChain(
+		context.Background(), database, providers, []string{modelMistral}, 0,
+		&out, coordinator.ErrWriter(), coordinator,
+	); err != nil {
+		t.Fatalf("processOCRChain() error = %v", err)
+	}
+	coordinator.Finish(false)
+
+	got := out.String()
+	for _, want := range []string{
+		"Preparing OCR started: 0/2 documents inspected.",
+		"Selected: 2 documents, 2 missing pages",
+		"OCR started: 0/2 documents attempted.",
+		"Completed this run: 2 documents",
+		"Still pending: 0 documents, 0 pages",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("progress output missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "content item") || strings.Contains(got, "\x1b[") {
+		t.Fatalf("non-TTY OCR output was not durable document wording: %q", got)
+	}
+}
+
+func TestProcessOCRChainTTYProgressRedrawsWarnings(t *testing.T) {
+	database := openOCRChainTestDB(t)
+	_, _ = addOCRChainFile(t, database, "unsupported.txt", 1)
+	provider := successfulRangeProvider("exact", 0)
+	providers := testProviderChain(modelMistral, "requested", provider, mistralConcurrency)
+	var out, errOut bytes.Buffer
+	coordinator := newProgressCoordinator(&out, &errOut, true)
+	err := processOCRChain(
+		context.Background(), database, providers, []string{modelMistral}, 0,
+		&out, coordinator.ErrWriter(), coordinator,
+	)
+	coordinator.Finish(false)
+	if err == nil {
+		t.Fatal("processOCRChain() error = nil, want unsupported pending document")
+	}
+	if !strings.Contains(errOut.String(), "unsupported OCR file type") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "\x1b[?25l") || !strings.Contains(got, "\x1b[?25h") ||
+		!strings.Contains(got, "unsupported.txt") {
+		t.Fatalf("TTY OCR output did not render compact activity: %q", got)
 	}
 }

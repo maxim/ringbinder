@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
+	"github.com/maxim/ringbinder/internal/progress"
 	"github.com/spf13/cobra"
 )
 
@@ -45,6 +47,14 @@ type storedGeminiOutput struct {
 	length int
 }
 
+type geminiOutputSpool struct {
+	file             *os.File
+	byKey            map[string]db.GeminiBatchRequest
+	stored           map[string]storedGeminiOutput
+	duplicates       map[string]bool
+	validationErrors []error
+}
+
 type geminiOutputLine struct {
 	Key      string          `json:"key"`
 	Response json.RawMessage `json:"response"`
@@ -58,6 +68,7 @@ type geminiRequestError struct {
 }
 
 func runBatchContinue(cmd *cobra.Command, args []string) error {
+	ensureCommandContext(cmd)
 	command, err := openGeminiBatchCommand(cmd, true, true)
 	if err != nil {
 		return err
@@ -65,10 +76,19 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 	defer command.Close()
 	transport := newGeminiBatchAPI(command.apiKey)
 	planner := ocr.NewGeminiClient("", time.Now().UTC())
+	out := commandStdout(cmd)
+	coordinator := newCommandProgress(cmd)
+	defer func() { coordinator.Finish(cmd.Context().Err() != nil) }()
 
 	batches, err := command.database.ListGeminiBatches()
 	if err != nil {
 		return fmt.Errorf("list Gemini batches: %w", err)
+	}
+	var checking *progress.Reporter
+	if len(batches) > 0 {
+		checking = coordinator.StartPhase(progress.PhaseOptions{
+			Label: "Checking Gemini batches", Total: len(batches), Unit: "batches",
+		})
 	}
 	var totals batchContinueTotals
 	var commandErrors []error
@@ -78,10 +98,21 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 	// List order is newest-first for users; lifecycle advancement is oldest-first
 	// so long-running work is reconciled before newer submissions.
 	for i := len(batches) - 1; i >= 0; i-- {
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			commandErrors = append(commandErrors, contextErr)
+			globalFailure = true
+			break
+		}
 		batch := batches[i]
+		if checking != nil {
+			checking.SetCurrent(fmt.Sprintf("Gemini batch %d", batch.ID))
+		}
 		disposition, advanceErr := advanceGeminiBatch(
-			cmd, command.database, transport, planner, batch, &totals,
+			cmd, command.database, transport, planner, batch, &totals, coordinator,
 		)
+		if checking != nil && cmd.Context().Err() == nil {
+			checking.Advance()
+		}
 		if advanceErr == nil {
 			if disposition == batchAdvancePollOnly {
 				pollOnlyBatches++
@@ -101,6 +132,19 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 			break
 		}
 	}
+	if checking != nil {
+		if cmd.Context().Err() != nil {
+			if coordinator.StoppedOutcomeShown() {
+				coordinator.ClosePhase(checking)
+			} else {
+				coordinator.StopPhase(checking)
+			}
+		} else if len(commandErrors) == 0 {
+			coordinator.CompletePhase(checking)
+		} else {
+			coordinator.ClosePhase(checking)
+		}
+	}
 
 	if !globalFailure {
 		completed, retireErr := command.database.RetireCompletedGeminiRequests()
@@ -109,7 +153,9 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 		} else if completed > 0 {
 			didWork = true
 		}
-		retryFound, retryErrors := submitRetryableGeminiRequests(cmd, command.database, transport, planner)
+		retryFound, retryErrors := submitRetryableGeminiRequests(
+			cmd, command.database, transport, planner, coordinator,
+		)
 		if retryFound {
 			didWork = true
 		}
@@ -129,7 +175,7 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !globalFailure {
-		cleanupFound, cleanupErrors := retryGeminiCleanup(cmd, command.database, transport)
+		cleanupFound, cleanupErrors := retryGeminiCleanup(cmd, command.database, transport, coordinator)
 		if cleanupFound {
 			didWork = true
 		}
@@ -142,25 +188,25 @@ func runBatchContinue(cmd *cobra.Command, args []string) error {
 
 	if totals.accounted {
 		if totals.billing.Indeterminate {
-			fmt.Printf("Known batch OCR cost: %s (actual cost may be higher)\n", ocr.FormatCurrency(totals.billing.KnownCost))
+			fmt.Fprintf(out, "Known batch OCR cost: %s (actual cost may be higher)\n", ocr.FormatCurrency(totals.billing.KnownCost))
 		} else {
-			fmt.Printf("Batch OCR cost: %s\n", ocr.FormatCurrency(totals.billing.KnownCost))
+			fmt.Fprintf(out, "Batch OCR cost: %s\n", ocr.FormatCurrency(totals.billing.KnownCost))
 		}
 	}
 	if len(commandErrors) == 0 && !didWork {
 		if len(batches) == 0 && blockedSummary.Requests == 0 {
-			fmt.Println("No tracked Gemini batch work to continue.")
+			fmt.Fprintln(out, "No tracked Gemini batch work to continue.")
 		} else if pollOnlyBatches == len(batches) && len(batches) > 0 {
 			batchLabel := "batches"
 			if len(batches) == 1 {
 				batchLabel = "batch"
 			}
-			fmt.Printf("Checked %d Gemini %s; nothing ready to process.\n", len(batches), batchLabel)
+			fmt.Fprintf(out, "Checked %d Gemini %s; nothing ready to process.\n", len(batches), batchLabel)
 		}
 	}
-	printBatchBlockedSummary(blockedSummary)
+	printBatchBlockedSummaryTo(out, blockedSummary)
 	if len(commandErrors) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: batch continue completed with %d error(s)\n", len(commandErrors))
+		coordinator.Warningf("warning: batch continue completed with %d error(s)\n", len(commandErrors))
 	}
 	return errors.Join(commandErrors...)
 }
@@ -172,21 +218,23 @@ func advanceGeminiBatch(
 	planner *ocr.GeminiClient,
 	batch db.GeminiBatch,
 	totals *batchContinueTotals,
+	coordinators ...*progressCoordinator,
 ) (batchAdvanceDisposition, error) {
+	coordinator := firstProgressCoordinator(coordinators)
 	switch batch.State {
 	case db.GeminiBatchPrepared:
-		return batchAdvanceDidWork, resumePreparedGeminiBatch(cmd, database, transport, planner, batch)
+		return batchAdvanceDidWork, resumePreparedGeminiBatch(cmd, database, transport, planner, batch, coordinator)
 	case db.GeminiBatchUploadUnknown:
-		return batchAdvanceDidWork, adoptUnknownGeminiUpload(cmd, database, transport, batch)
+		return batchAdvanceDidWork, adoptUnknownGeminiUpload(cmd, database, transport, batch, coordinator)
 	case db.GeminiBatchUploaded:
-		return batchAdvanceDidWork, submitUploadedGeminiBatch(cmd, database, transport, batch.ID)
+		return batchAdvanceDidWork, submitUploadedGeminiBatch(cmd, database, transport, batch.ID, coordinator)
 	case db.GeminiBatchSubmissionUnknown:
 		return batchAdvanceDidWork, adoptUnknownGeminiSubmission(cmd, database, transport, batch)
 	case db.GeminiBatchSucceeded:
-		return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+		return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals, coordinator)
 	case db.GeminiBatchFailed, db.GeminiBatchExpired:
 		if batch.OutputFileName != "" {
-			return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+			return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals, coordinator)
 		}
 		return batchAdvanceDidWork, replaceOutputlessGeminiBatch(database, batch, totals)
 	case db.GeminiBatchCancelled:
@@ -198,7 +246,7 @@ func advanceGeminiBatch(
 		_, err := database.FinalizeGeminiBatch(batch.ID, time.Now().UTC())
 		return batchAdvanceDidWork, err
 	case db.GeminiBatchPending, db.GeminiBatchRunning, db.GeminiBatchCancelling:
-		return refreshAndHandleGeminiBatch(cmd, database, transport, batch, totals)
+		return refreshAndHandleGeminiBatch(cmd, database, transport, batch, totals, coordinator)
 	default:
 		return batchAdvanceDidWork, fmt.Errorf("unsupported local Gemini batch state %q", batch.State)
 	}
@@ -210,25 +258,66 @@ func resumePreparedGeminiBatch(
 	transport geminiBatchAPI,
 	planner *ocr.GeminiClient,
 	batch db.GeminiBatch,
+	coordinators ...*progressCoordinator,
 ) error {
 	requests, err := database.GeminiRequestsForBatch(batch.ID)
 	if err != nil {
 		return err
 	}
+	coordinator := firstProgressCoordinator(coordinators)
+	var regenerating *progress.Reporter
+	if coordinator != nil && len(requests) > 0 {
+		regenerating = coordinator.StartPhase(progress.PhaseOptions{
+			Label: fmt.Sprintf("Regenerating Gemini batch %d input", batch.ID),
+			Total: len(requests), Unit: "requests",
+		})
+	}
+	finishRegenerating := func(stopped bool, complete bool) {
+		if regenerating == nil {
+			return
+		}
+		if stopped {
+			coordinator.StopPhase(regenerating)
+		} else if complete {
+			coordinator.CompletePhase(regenerating)
+		} else {
+			coordinator.ClosePhase(regenerating)
+		}
+		regenerating = nil
+	}
 	input, err := newPrivateTempFile("ringbinder-gemini-input-")
 	if err != nil {
+		finishRegenerating(false, false)
 		return err
 	}
 	defer input.Close()
 	var size int64
 	for _, request := range requests {
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			finishRegenerating(true, false)
+			return contextErr
+		}
+		if regenerating != nil {
+			regenerating.SetCurrent(request.Path)
+		}
 		path, pathErr := matchingContentPath(database, request.ContentID, request.Checksum)
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			finishRegenerating(true, false)
+			return contextErr
+		}
 		if pathErr != nil {
 			if blockErr := database.BlockGeminiRequest(request.ID, pathErr.Error(), time.Now().UTC()); blockErr != nil {
+				finishRegenerating(false, false)
 				return blockErr
 			}
-			fmt.Fprintf(os.Stderr, "warning: %v\n", pathErr)
+			commandWarning(coordinator, commandStderr(cmd), "warning: %v\n", pathErr)
+			if regenerating != nil {
+				regenerating.Advance()
+			}
 			continue
+		}
+		if regenerating != nil {
+			regenerating.SetCurrent(path)
 		}
 		prepared, prepareErr := planner.PrepareRangeRequest(
 			cmd.Context(), path, request.FileType, request.PageStart, request.PageEnd,
@@ -236,34 +325,50 @@ func resumePreparedGeminiBatch(
 		// Cancellation belongs to the command, not this request. Keep its durable
 		// assignment unchanged so a later continue can resume it.
 		if contextErr := cmd.Context().Err(); contextErr != nil {
+			finishRegenerating(true, false)
 			return contextErr
 		}
 		if prepareErr == nil {
 			prepareErr = verifyContentPath(path, request.Checksum)
+			if contextErr := cmd.Context().Err(); contextErr != nil {
+				finishRegenerating(true, false)
+				return contextErr
+			}
 		}
 		if prepareErr != nil {
 			if blockErr := database.BlockGeminiRequest(request.ID, prepareErr.Error(), time.Now().UTC()); blockErr != nil {
+				finishRegenerating(false, false)
 				return blockErr
+			}
+			if regenerating != nil {
+				regenerating.Advance()
 			}
 			continue
 		}
 		line, err := marshalGeminiBatchLine(request.RequestKey, prepared.Body)
 		if err != nil {
+			finishRegenerating(false, false)
 			return err
 		}
 		if size+int64(len(line)) > ocr.GeminiBatchMaxInputBytes {
+			finishRegenerating(false, false)
 			return fmt.Errorf("regenerated input exceeds Gemini's batch input limit")
 		}
 		if _, err := input.Write(line); err != nil {
+			finishRegenerating(false, false)
 			return err
 		}
 		size += int64(len(line))
+		if regenerating != nil {
+			regenerating.Advance()
+		}
 	}
+	finishRegenerating(false, true)
 	if size == 0 {
 		_, err := database.FinalizeGeminiBatch(batch.ID, time.Now().UTC())
 		return err
 	}
-	return uploadAndSubmitGeminiBatch(cmd, database, transport, batch.ID, input, size)
+	return uploadAndSubmitGeminiBatch(cmd, database, transport, batch.ID, input, size, coordinator)
 }
 
 func adoptUnknownGeminiUpload(
@@ -271,6 +376,7 @@ func adoptUnknownGeminiUpload(
 	database *db.DB,
 	transport geminiBatchAPI,
 	batch db.GeminiBatch,
+	coordinators ...*progressCoordinator,
 ) error {
 	files, err := transport.ListFiles(cmd.Context())
 	if err != nil {
@@ -288,7 +394,7 @@ func adoptUnknownGeminiUpload(
 	if err := database.SetGeminiBatchUploaded(batch.ID, matches[0].Name, time.Now().UTC()); err != nil {
 		return err
 	}
-	return submitUploadedGeminiBatch(cmd, database, transport, batch.ID)
+	return submitUploadedGeminiBatch(cmd, database, transport, batch.ID, firstProgressCoordinator(coordinators))
 }
 
 func adoptUnknownGeminiSubmission(
@@ -326,8 +432,14 @@ func refreshAndHandleGeminiBatch(
 	transport geminiBatchAPI,
 	batch db.GeminiBatch,
 	totals *batchContinueTotals,
+	coordinators ...*progressCoordinator,
 ) (batchAdvanceDisposition, error) {
 	remote, err := transport.GetBatch(cmd.Context(), batch.RemoteName)
+	// A transport can return a completed response after its context is
+	// cancelled. Do not advance local ownership from that stale observation.
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		return batchAdvanceDidWork, contextErr
+	}
 	if err != nil {
 		if ocr.IsGeminiBatchNotFound(err) {
 			batch.LastError = "remote Gemini batch resource is no longer available"
@@ -362,10 +474,10 @@ func refreshAndHandleGeminiBatch(
 	case db.GeminiBatchPending, db.GeminiBatchRunning, db.GeminiBatchCancelling:
 		return batchAdvancePollOnly, nil
 	case db.GeminiBatchSucceeded:
-		return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+		return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals, coordinators...)
 	case db.GeminiBatchFailed, db.GeminiBatchExpired:
 		if batch.OutputFileName != "" {
-			return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals)
+			return batchAdvanceDidWork, accountSucceededGeminiBatch(cmd, database, transport, batch, totals, coordinators...)
 		}
 		return batchAdvanceDidWork, replaceOutputlessGeminiBatch(database, batch, totals)
 	case db.GeminiBatchCancelled:
@@ -408,9 +520,13 @@ func accountSucceededGeminiBatch(
 	transport geminiBatchAPI,
 	batch db.GeminiBatch,
 	totals *batchContinueTotals,
+	coordinators ...*progressCoordinator,
 ) error {
 	if batch.OutputFileName == "" {
 		remote, refreshErr := transport.GetBatch(cmd.Context(), batch.RemoteName)
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			return contextErr
+		}
 		if refreshErr != nil {
 			if ocr.IsGeminiBatchNotFound(refreshErr) {
 				return finalizeUnavailableGeminiOutput(
@@ -431,8 +547,30 @@ func accountSucceededGeminiBatch(
 			return err
 		}
 	}
+
+	coordinator := firstProgressCoordinator(coordinators)
+	var downloading *progress.Reporter
+	if coordinator != nil {
+		downloading = coordinator.StartPhase(progress.PhaseOptions{
+			Label: fmt.Sprintf("Downloading and validating Gemini batch %d output", batch.ID),
+		})
+	}
+	finishDownloading := func(stopped, complete bool) {
+		if downloading == nil {
+			return
+		}
+		if stopped {
+			coordinator.StopPhase(downloading)
+		} else if complete {
+			coordinator.CompletePhase(downloading)
+		} else {
+			coordinator.ClosePhase(downloading)
+		}
+		downloading = nil
+	}
 	body, err := transport.DownloadFile(cmd.Context(), batch.OutputFileName)
 	if err != nil {
+		finishDownloading(cmd.Context().Err() != nil, false)
 		if ocr.IsGeminiBatchNotFound(err) {
 			return finalizeUnavailableGeminiOutput(
 				database, batch, totals, "Gemini output file is no longer available",
@@ -441,12 +579,50 @@ func accountSucceededGeminiBatch(
 		return err
 	}
 	defer body.Close()
-	accountErr := accountGeminiOutput(body, database, batch, totals)
+
+	var importing *progress.Reporter
+	accountErr := accountGeminiOutputWithCallbacks(
+		cmd.Context(), body, database, batch, totals,
+		func(total int) {
+			finishDownloading(false, true)
+			if coordinator != nil && total > 0 {
+				importing = coordinator.StartPhase(progress.PhaseOptions{
+					Label: fmt.Sprintf("Importing Gemini batch %d output", batch.ID),
+					Total: total, Unit: "requests",
+				})
+			}
+		},
+		func() {
+			if importing != nil {
+				importing.Advance()
+			}
+		},
+	)
+	if downloading != nil {
+		finishDownloading(cmd.Context().Err() != nil, false)
+	}
+	if importing != nil {
+		if cmd.Context().Err() != nil {
+			coordinator.StopPhase(importing)
+		} else if accountErr == nil {
+			coordinator.CompletePhase(importing)
+		} else {
+			coordinator.ClosePhase(importing)
+		}
+	}
 	var incomplete *incompleteGeminiOutputError
 	if errors.As(accountErr, &incomplete) {
 		return accountErr
 	}
+	// A complete output can be staged one key at a time, but cancellation before
+	// bookkeeping must leave the immutable batch available for a later resume.
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		return errors.Join(accountErr, contextErr)
+	}
 	_, retireErr := database.RetireCompletedGeminiRequests()
+	if contextErr := cmd.Context().Err(); contextErr != nil {
+		return errors.Join(accountErr, retireErr, contextErr)
+	}
 	_, finalizeErr := database.FinalizeGeminiBatch(batch.ID, time.Now().UTC())
 	return errors.Join(accountErr, retireErr, finalizeErr)
 }
@@ -466,15 +642,50 @@ func finalizeUnavailableGeminiOutput(
 	return err
 }
 
+// accountGeminiOutput is the contextless test path; commands use
+// accountGeminiOutputWithCallbacks so imports remain cancellable.
 func accountGeminiOutput(
 	reader io.Reader,
 	database *db.DB,
 	batch db.GeminiBatch,
 	totals *batchContinueTotals,
 ) error {
-	requests, err := database.GeminiRequestsForBatch(batch.ID)
+	return accountGeminiOutputWithCallbacks(context.Background(), reader, database, batch, totals, nil, nil)
+}
+
+// accountGeminiOutputWithCallbacks keeps validation and writes separate. The
+// output is fully spooled before any request changes, so interruption while
+// downloading leaves the batch assignment resumable.
+func accountGeminiOutputWithCallbacks(
+	ctx context.Context,
+	reader io.Reader,
+	database *db.DB,
+	batch db.GeminiBatch,
+	totals *batchContinueTotals,
+	validated func(total int),
+	processed func(),
+) error {
+	spool, err := spoolGeminiOutput(ctx, reader, database, batch, totals)
 	if err != nil {
 		return err
+	}
+	defer spool.file.Close()
+	if validated != nil {
+		validated(len(batch.RequestKeys))
+	}
+	return applyGeminiOutput(ctx, spool, database, batch, totals, processed)
+}
+
+func spoolGeminiOutput(
+	ctx context.Context,
+	reader io.Reader,
+	database *db.DB,
+	batch db.GeminiBatch,
+	totals *batchContinueTotals,
+) (_ *geminiOutputSpool, err error) {
+	requests, err := database.GeminiRequestsForBatch(batch.ID)
+	if err != nil {
+		return nil, err
 	}
 	byKey := make(map[string]db.GeminiBatchRequest, len(requests))
 	for _, request := range requests {
@@ -490,65 +701,97 @@ func accountGeminiOutput(
 	// applying any response, without retaining provider payloads in SQLite.
 	output, err := newPrivateTempFile("ringbinder-gemini-output-")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer output.Close()
-	stored := make(map[string]storedGeminiOutput, len(requests))
-	duplicates := make(map[string]bool)
-	var validationErrors []error
+	defer func() {
+		if err != nil {
+			_ = output.Close()
+		}
+	}()
+	spool := &geminiOutputSpool{
+		file:       output,
+		byKey:      byKey,
+		stored:     make(map[string]storedGeminiOutput, len(requests)),
+		duplicates: make(map[string]bool),
+	}
 	var offset int64
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), ocr.GeminiBatchMaxResponseBytes+1)
-	for scanner.Scan() {
+	for {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, &incompleteGeminiOutputError{Err: contextErr}
+		}
+		if !scanner.Scan() {
+			break
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, &incompleteGeminiOutputError{Err: contextErr}
+		}
 		line := bytes.Clone(scanner.Bytes())
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		if len(line) > ocr.GeminiBatchMaxResponseBytes {
-			return blockOversizedGeminiOutput(database, batch, totals)
+			return nil, blockOversizedGeminiOutput(database, batch, totals)
 		}
 		var envelope struct {
 			Key string `json:"key"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil || envelope.Key == "" {
-			validationErrors = append(validationErrors, fmt.Errorf("malformed keyed Gemini output line"))
+			spool.validationErrors = append(spool.validationErrors, fmt.Errorf("malformed keyed Gemini output line"))
 			continue
 		}
 		if !manifest[envelope.Key] {
-			validationErrors = append(validationErrors, fmt.Errorf("Gemini output contains foreign key %q", envelope.Key))
+			spool.validationErrors = append(spool.validationErrors, fmt.Errorf("Gemini output contains foreign key %q", envelope.Key))
 			continue
 		}
 		if _, local := byKey[envelope.Key]; !local {
 			// Manifest-known keys can disappear when sweep cascades orphan content.
 			continue
 		}
-		if _, exists := stored[envelope.Key]; exists {
-			duplicates[envelope.Key] = true
+		if _, exists := spool.stored[envelope.Key]; exists {
+			spool.duplicates[envelope.Key] = true
 			continue
 		}
 		if _, err := output.Write(line); err != nil {
-			return err
+			return nil, err
 		}
-		stored[envelope.Key] = storedGeminiOutput{offset: offset, length: len(line)}
+		spool.stored[envelope.Key] = storedGeminiOutput{offset: offset, length: len(line)}
 		offset += int64(len(line))
 	}
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
-			return blockOversizedGeminiOutput(database, batch, totals)
+			return nil, blockOversizedGeminiOutput(database, batch, totals)
 		}
-		return &incompleteGeminiOutputError{Err: err}
+		return nil, &incompleteGeminiOutputError{Err: err}
 	}
-	for key, request := range byKey {
-		if duplicates[key] {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, &incompleteGeminiOutputError{Err: contextErr}
+	}
+	return spool, nil
+}
+
+func applyGeminiOutput(
+	ctx context.Context,
+	spool *geminiOutputSpool,
+	database *db.DB,
+	batch db.GeminiBatch,
+	totals *batchContinueTotals,
+	processed func(),
+) error {
+	validationErrors := append([]error(nil), spool.validationErrors...)
+	seen := make(map[string]bool, len(batch.RequestKeys))
+	applyRequest := func(key string, request db.GeminiBatchRequest) {
+		if spool.duplicates[key] {
 			totals.accounted = true
 			totals.billing.Indeterminate = true
 			_, err := database.RetryGeminiRequest(request.ID, "duplicate output key", time.Now().UTC())
 			if err != nil {
 				validationErrors = append(validationErrors, err)
 			}
-			continue
+			return
 		}
-		location, exists := stored[key]
+		location, exists := spool.stored[key]
 		if !exists {
 			totals.accounted = true
 			totals.billing.Indeterminate = true
@@ -556,16 +799,49 @@ func accountGeminiOutput(
 			if err != nil {
 				validationErrors = append(validationErrors, err)
 			}
-			continue
+			return
 		}
 		line := make([]byte, location.length)
-		if _, err := output.ReadAt(line, location.offset); err != nil {
+		if _, err := spool.file.ReadAt(line, location.offset); err != nil {
 			validationErrors = append(validationErrors, err)
-			continue
+			return
 		}
 		if err := accountGeminiOutputLine(line, database, batch, request, totals); err != nil {
 			validationErrors = append(validationErrors, err)
 		}
+	}
+	// Staging is deliberately resumable: keys applied before cancellation stay
+	// staged, while the untouched manifest suffix remains assigned for continue.
+	for _, key := range batch.RequestKeys {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return &incompleteGeminiOutputError{Err: contextErr}
+		}
+		if seen[key] {
+			if processed != nil {
+				processed()
+			}
+			continue
+		}
+		seen[key] = true
+		if request, local := spool.byKey[key]; local {
+			applyRequest(key, request)
+		}
+		// A manifest key whose local request disappeared is an intentional no-op,
+		// but it still advances the immutable manifest-count progress bar.
+		if processed != nil {
+			processed()
+		}
+	}
+	// Keep legacy/corrupt manifests recoverable: a still-owned request omitted
+	// from the manifest follows the pre-existing missing-output retry path.
+	for key, request := range spool.byKey {
+		if seen[key] {
+			continue
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return &incompleteGeminiOutputError{Err: contextErr}
+		}
+		applyRequest(key, request)
 	}
 	return errors.Join(validationErrors...)
 }
@@ -695,6 +971,7 @@ func submitRetryableGeminiRequests(
 	database *db.DB,
 	transport geminiBatchAPI,
 	planner *ocr.GeminiClient,
+	coordinators ...*progressCoordinator,
 ) (bool, []error) {
 	requests, err := database.RetryableGeminiRequests()
 	if err != nil {
@@ -703,11 +980,33 @@ func submitRetryableGeminiRequests(
 	if len(requests) == 0 {
 		return false, nil
 	}
-	if len(requests) > maxAutomaticRequestsPerContinue {
+	capped := len(requests) > maxAutomaticRequestsPerContinue
+	if capped {
 		requests = requests[:maxAutomaticRequestsPerContinue]
+	}
+	coordinator := firstProgressCoordinator(coordinators)
+	var preparing *progress.Reporter
+	if coordinator != nil {
+		preparing = coordinator.StartPhase(progress.PhaseOptions{
+			Label: "Preparing Gemini retry input", Total: len(requests), Unit: "selected requests",
+		})
+	}
+	finishPreparing := func(stopped, complete bool) {
+		if preparing == nil {
+			return
+		}
+		if stopped {
+			coordinator.StopPhase(preparing)
+		} else if complete {
+			coordinator.CompletePhase(preparing)
+		} else {
+			coordinator.ClosePhase(preparing)
+		}
+		preparing = nil
 	}
 	group, err := newRetryBatchGroup()
 	if err != nil {
+		finishPreparing(false, false)
 		return true, []error{err}
 	}
 	defer func() { _ = group.Close() }()
@@ -716,7 +1015,7 @@ func submitRetryableGeminiRequests(
 		if len(group.requestIDs) == 0 {
 			return false
 		}
-		flushErr := submitRetryBatchGroup(cmd, database, transport, group)
+		flushErr := submitRetryBatchGroup(cmd, database, transport, group, coordinator)
 		if flushErr != nil {
 			commandErrors = append(commandErrors, flushErr)
 		}
@@ -742,12 +1041,26 @@ func submitRetryableGeminiRequests(
 			stopped = true
 			break
 		}
+		if preparing != nil {
+			preparing.SetCurrent(request.Path)
+		}
 		path, pathErr := matchingContentPath(database, request.ContentID, request.Checksum)
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			commandErrors = append(commandErrors, contextErr)
+			stopped = true
+			break
+		}
 		if pathErr != nil {
 			if blockErr := database.BlockUnownedGeminiRequest(request.ID, pathErr.Error(), time.Now().UTC()); blockErr != nil {
 				commandErrors = append(commandErrors, blockErr)
 			}
+			if preparing != nil {
+				preparing.Advance()
+			}
 			continue
+		}
+		if preparing != nil {
+			preparing.SetCurrent(path)
 		}
 		prepared, prepareErr := planner.PrepareRangeRequest(
 			cmd.Context(), path, request.FileType, request.PageStart, request.PageEnd,
@@ -761,6 +1074,11 @@ func submitRetryableGeminiRequests(
 		}
 		if prepareErr == nil {
 			prepareErr = verifyContentPath(path, request.Checksum)
+			if contextErr := cmd.Context().Err(); contextErr != nil {
+				commandErrors = append(commandErrors, contextErr)
+				stopped = true
+				break
+			}
 		}
 		if prepareErr != nil {
 			if ocr.IsGeminiRangeSizeError(prepareErr) && request.PageEnd-request.PageStart > 1 {
@@ -772,11 +1090,17 @@ func submitRetryableGeminiRequests(
 			} else if blockErr := database.BlockUnownedGeminiRequest(request.ID, prepareErr.Error(), time.Now().UTC()); blockErr != nil {
 				commandErrors = append(commandErrors, blockErr)
 			}
+			if preparing != nil {
+				preparing.Advance()
+			}
 			continue
 		}
 		line, lineErr := marshalGeminiBatchLine(request.RequestKey, prepared.Body)
 		if lineErr != nil {
 			commandErrors = append(commandErrors, lineErr)
+			if preparing != nil {
+				preparing.Advance()
+			}
 			continue
 		}
 		if len(group.requestIDs) > 0 && !sameBatchLineage(group.replacementOf, request.PreviousBatchID) {
@@ -791,6 +1115,9 @@ func submitRetryableGeminiRequests(
 		}
 		if _, lineErr = group.file.Write(line); lineErr != nil {
 			commandErrors = append(commandErrors, lineErr)
+			if preparing != nil {
+				preparing.Advance()
+			}
 			continue
 		}
 		group.size += int64(len(line))
@@ -799,9 +1126,24 @@ func submitRetryableGeminiRequests(
 			group.replacementOf = &value
 		}
 		group.requestIDs = append(group.requestIDs, request.ID)
+		if preparing != nil {
+			preparing.Advance()
+		}
 	}
 	if err == nil && !stopped {
 		flush()
+	}
+	if cmd.Context().Err() != nil {
+		finishPreparing(true, false)
+	} else {
+		finishPreparing(false, !stopped && len(commandErrors) == 0)
+	}
+	if capped && !stopped && cmd.Context().Err() == nil {
+		commandProgressf(
+			coordinator,
+			commandStdout(cmd),
+			"More retryable Gemini requests remain; run `ringbinder batch continue` again.\n",
+		)
 	}
 	return true, commandErrors
 }
@@ -835,6 +1177,7 @@ func submitRetryBatchGroup(
 	database *db.DB,
 	transport geminiBatchAPI,
 	group *retryBatchGroup,
+	coordinators ...*progressCoordinator,
 ) error {
 	now := time.Now().UTC()
 	prices := ocr.GeminiBatchPrices(now)
@@ -846,14 +1189,22 @@ func submitRetryBatchGroup(
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Gemini retry batch %d prepared with %d request(s).\n", batchID, len(group.requestIDs))
-	return uploadAndSubmitGeminiBatch(cmd, database, transport, batchID, group.file, group.size)
+	coordinator := firstProgressCoordinator(coordinators)
+	commandProgressf(
+		coordinator,
+		commandStdout(cmd),
+		"Gemini retry batch %d prepared with %d request(s).\n",
+		batchID,
+		len(group.requestIDs),
+	)
+	return uploadAndSubmitGeminiBatch(cmd, database, transport, batchID, group.file, group.size, coordinator)
 }
 
 func retryGeminiCleanup(
 	cmd *cobra.Command,
 	database *db.DB,
 	transport geminiBatchAPI,
+	coordinators ...*progressCoordinator,
 ) (bool, []error) {
 	cleanup, err := database.ListGeminiCleanup()
 	if err != nil {
@@ -862,8 +1213,37 @@ func retryGeminiCleanup(
 	if len(cleanup) == 0 {
 		return false, nil
 	}
+	coordinator := firstProgressCoordinator(coordinators)
+	var cleaning *progress.Reporter
+	if coordinator != nil {
+		cleaning = coordinator.StartPhase(progress.PhaseOptions{
+			Label: "Cleaning up Gemini resources", Total: len(cleanup), Unit: "resources",
+		})
+	}
+	finishCleaning := func(stopped, complete bool) {
+		if cleaning == nil {
+			return
+		}
+		if stopped {
+			coordinator.StopPhase(cleaning)
+		} else if complete {
+			coordinator.CompletePhase(cleaning)
+		} else {
+			coordinator.ClosePhase(cleaning)
+		}
+		cleaning = nil
+	}
 	var commandErrors []error
+	stopped := false
 	for _, item := range cleanup {
+		if contextErr := cmd.Context().Err(); contextErr != nil {
+			commandErrors = append(commandErrors, contextErr)
+			stopped = true
+			break
+		}
+		if cleaning != nil {
+			cleaning.SetCurrent(item.ResourceName)
+		}
 		var deleteErr error
 		switch item.ResourceKind {
 		case "file":
@@ -877,24 +1257,32 @@ func retryGeminiCleanup(
 		if deleteErr == nil || ocr.IsGeminiBatchNotFound(deleteErr) || invalidDelete {
 			if err := database.DeleteGeminiCleanup(item.ID); err != nil {
 				commandErrors = append(commandErrors, err)
-				continue
-			}
-			// Retrying an identical delete cannot fix an invalid argument. Retire
-			// the detached cleanup row so it cannot poison every later continue.
-			if invalidDelete {
-				fmt.Fprintf(
-					os.Stderr,
+			} else if invalidDelete {
+				// Retrying an identical delete cannot fix an invalid argument. Retire
+				// the detached cleanup row so it cannot poison every later continue.
+				commandWarning(
+					coordinator,
+					commandStderr(cmd),
 					"warning: Gemini permanently rejected cleanup of %s %s; Ringbinder will not retry it\n",
-					item.ResourceKind, item.ResourceName,
+					item.ResourceKind,
+					item.ResourceName,
 				)
 			}
-			continue
+		} else {
+			_ = database.SetGeminiCleanupError(item.ID, deleteErr.Error(), time.Now().UTC())
+			commandErrors = append(commandErrors, fmt.Errorf("clean up Gemini %s %s: %w", item.ResourceKind, item.ResourceName, deleteErr))
 		}
-		_ = database.SetGeminiCleanupError(item.ID, deleteErr.Error(), time.Now().UTC())
-		commandErrors = append(commandErrors, fmt.Errorf("clean up Gemini %s %s: %w", item.ResourceKind, item.ResourceName, deleteErr))
+		if cleaning != nil {
+			cleaning.Advance()
+		}
 		if ocr.IsGeminiGlobalFailure(deleteErr) {
 			break
 		}
+	}
+	if stopped || cmd.Context().Err() != nil {
+		finishCleaning(true, false)
+	} else {
+		finishCleaning(false, len(commandErrors) == 0)
 	}
 	return true, commandErrors
 }

@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mattn/go-isatty"
 	"github.com/maxim/ringbinder/internal/checksum"
 	"github.com/maxim/ringbinder/internal/config"
 	"github.com/maxim/ringbinder/internal/db"
@@ -134,7 +133,7 @@ func runSweep(cmd *cobra.Command, args []string) error {
 		scanErr <- s.Scan(ctx, resolvedPaths, results)
 	}()
 
-	isTTY := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+	isTTY := progressStdoutIsTerminal()
 	var scanned atomic.Int64
 	stopSweepSpinner := func() {}
 	if isTTY {

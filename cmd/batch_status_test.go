@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,6 +140,9 @@ func TestBatchListJSONReportsBlockedWorkWithoutBatchHistory(t *testing.T) {
 	if err := cmd.Flags().Set("json", "true"); err != nil {
 		t.Fatal(err)
 	}
+	oldTerminalCheck := progressWriterIsTerminal
+	progressWriterIsTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { progressWriterIsTerminal = oldTerminalCheck })
 	var runErr error
 	output := captureStdout(t, func() { runErr = runBatchList(cmd, nil) })
 	if runErr != nil {
@@ -155,9 +162,179 @@ func TestBatchListJSONReportsBlockedWorkWithoutBatchHistory(t *testing.T) {
 	if len(fields) != 5 {
 		t.Fatalf("fields = %v, want exactly five documented keys", fields)
 	}
+	if strings.Contains(output, "\x1b[") {
+		t.Fatalf("JSON output contains terminal progress: %q", output)
+	}
 	if string(fields["batches"]) != "[]" || string(fields["refresh_errors"]) != "[]" ||
 		string(fields["blocked_requests"]) != "3" || string(fields["blocked_contents"]) != "2" {
 		t.Fatalf("fields = %v, want empty history and blocked counts 3/2", fields)
+	}
+}
+
+func TestBatchListHumanOutputShowsOneRefreshLifecycle(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	dbPath := filepath.Join(t.TempDir(), "list-progress.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, _ := addPreparedImageTestBatch(t, database, "list-progress")
+	if err := database.SetGeminiBatchRemote(
+		batch.ID, "batches/list-progress", db.GeminiBatchRunning, "", "", time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeGeminiBatchAPI{state: "JOB_STATE_RUNNING"}
+	oldFactory := newGeminiBatchAPI
+	newGeminiBatchAPI = func(string) geminiBatchAPI { return api }
+	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
+	cmd := commandWithDatabaseFlag(t, dbPath)
+	cmd.SetContext(context.Background())
+	cmd.Flags().String("model", "", "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("model", modelGemini); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	output := captureStdout(t, func() { runErr = runBatchList(cmd, nil) })
+	if runErr != nil {
+		t.Fatalf("runBatchList() error = %v", runErr)
+	}
+	if !strings.Contains(output, "Refreshing Gemini batches started: 0/1 batches.") ||
+		!strings.Contains(output, strconv.FormatInt(batch.ID, 10)+"\trunning") ||
+		strings.Contains(output, "\x1b[") {
+		t.Fatalf("human refresh output = %q", output)
+	}
+}
+
+func TestBatchListDoesNotReconcileCompletedResponseAfterCancellation(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	dbPath := filepath.Join(t.TempDir(), "cancelled-list-refresh.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, _ := addPreparedImageTestBatch(t, database, "cancelled-list-refresh")
+	if err := database.SetGeminiBatchRemote(
+		batch.ID, "batches/cancelled-list-refresh", db.GeminiBatchRunning, "", "", time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	api := &fakeGeminiBatchAPI{getFunc: func(context.Context, string) (ocr.GeminiRemoteBatch, error) {
+		cancel()
+		return ocr.GeminiRemoteBatch{
+			Name: "batches/cancelled-list-refresh", State: "JOB_STATE_SUCCEEDED", OutputFileName: "files/output",
+		}, nil
+	}}
+	oldFactory := newGeminiBatchAPI
+	newGeminiBatchAPI = func(string) geminiBatchAPI { return api }
+	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
+	cmd := commandWithDatabaseFlag(t, dbPath)
+	cmd.SetContext(ctx)
+	cmd.Flags().String("model", "", "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("model", modelGemini); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	_ = captureStdout(t, func() { runErr = runBatchList(cmd, nil) })
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("runBatchList() error = %v, want context cancellation", runErr)
+	}
+	if api.getCalls != 1 {
+		t.Fatalf("refresh calls = %d, want one", api.getCalls)
+	}
+
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	stored, err := database.GetGeminiBatch(batch.ID)
+	if err != nil || stored == nil || stored.State != db.GeminiBatchRunning || stored.OutputFileName != "" {
+		t.Fatalf("batch after cancelled refresh = %+v, %v; want unchanged running batch", stored, err)
+	}
+}
+
+func TestBatchCancelProgressCleansUpTTYOnSuccessAndError(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	oldTerminalCheck := progressWriterIsTerminal
+	progressWriterIsTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { progressWriterIsTerminal = oldTerminalCheck })
+	oldFactory := newGeminiBatchAPI
+	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
+
+	tests := []struct {
+		name        string
+		cancelError error
+	}{
+		{name: "success"},
+		{name: "error", cancelError: errors.New("remote cancellation rejected")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "cancel.db")
+			database, err := db.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch, _ := addPreparedImageTestBatch(t, database, "cancel-progress")
+			if err := database.SetGeminiBatchRemote(
+				batch.ID, "batches/cancel-progress", db.GeminiBatchRunning, "", "", time.Now().UTC(),
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			api := &fakeGeminiBatchAPI{cancelError: test.cancelError}
+			newGeminiBatchAPI = func(string) geminiBatchAPI { return api }
+			cmd := commandWithDatabaseFlag(t, dbPath)
+			cmd.SetContext(context.Background())
+			cmd.Flags().String("model", "", "")
+			if err := cmd.Flags().Set("model", modelGemini); err != nil {
+				t.Fatal(err)
+			}
+			var runErr error
+			output := captureStdout(t, func() { runErr = runBatchCancel(cmd, []string{strconv.FormatInt(batch.ID, 10)}) })
+			if !errors.Is(runErr, test.cancelError) {
+				t.Fatalf("runBatchCancel() error = %v, want %v", runErr, test.cancelError)
+			}
+			if !api.cancelRequested || !strings.Contains(output, "Requesting cancellation for Gemini batch ") ||
+				strings.Index(output, "\x1b[?25l") < 0 ||
+				strings.LastIndex(output, "\x1b[?25h") < strings.Index(output, "\x1b[?25l") {
+				t.Fatalf("cancel progress did not clean up its terminal display: %q", output)
+			}
+			if test.cancelError == nil {
+				if !strings.Contains(output, "Cancellation requested for Gemini batch ") {
+					t.Fatalf("success output = %q, want confirmation", output)
+				}
+			} else if strings.Contains(output, "Cancellation requested for Gemini batch ") {
+				t.Fatalf("error output = %q, must not confirm cancellation", output)
+			}
+
+			database, err = db.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := database.GetGeminiBatch(batch.ID)
+			_ = database.Close()
+			if err != nil || stored == nil || stored.State != db.GeminiBatchCancelling {
+				t.Fatalf("batch after cancellation attempt = %+v, %v; want durable cancelling intent", stored, err)
+			}
+		})
 	}
 }
 
@@ -208,8 +385,14 @@ func TestBatchListJSONEmitsCachedStaleEnvelopeOnGlobalRefreshFailure(t *testing.
 	if err := cmd.Flags().Set("json", "true"); err != nil {
 		t.Fatalf("set json: %v", err)
 	}
+	oldTerminalCheck := progressWriterIsTerminal
+	progressWriterIsTerminal = func(io.Writer) bool { return true }
+	t.Cleanup(func() { progressWriterIsTerminal = oldTerminalCheck })
 	var runErr error
-	output := captureStdout(t, func() { runErr = runBatchList(cmd, nil) })
+	var output string
+	stderr := captureStderr(t, func() {
+		output = captureStdout(t, func() { runErr = runBatchList(cmd, nil) })
+	})
 	if runErr == nil {
 		t.Fatal("runBatchList() error = nil, want partial refresh failure")
 	}
@@ -226,7 +409,13 @@ func TestBatchListJSONEmitsCachedStaleEnvelopeOnGlobalRefreshFailure(t *testing.
 		envelope.RefreshErrors[0].BatchID != nil {
 		t.Fatalf("envelope = %+v, want blocked counts and nullable global refresh error", envelope)
 	}
-	if api.downloadCalls != 0 || len(api.deleted) != 0 {
-		t.Fatalf("list performed lifecycle side effects: downloads=%d deletes=%v", api.downloadCalls, api.deleted)
+	if api.getCalls != 1 || api.downloadCalls != 0 || len(api.deleted) != 0 {
+		t.Fatalf("list refresh calls = %d, downloads=%d, deletes=%v; want one refresh and no lifecycle side effects", api.getCalls, api.downloadCalls, api.deleted)
+	}
+	if stderr != "warning: refresh Gemini batch "+strconv.FormatInt(batchID, 10)+": Gemini Batch API returned HTTP 401: bad key\n" {
+		t.Fatalf("stderr = %q, want the refresh warning only", stderr)
+	}
+	if strings.Contains(output, "warning:") || strings.Contains(output, "\x1b[") {
+		t.Fatalf("JSON stdout contains warning or terminal output: %q", output)
 	}
 }

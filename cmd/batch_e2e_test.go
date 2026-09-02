@@ -24,22 +24,36 @@ type fakeGeminiBatchAPI struct {
 	output                []byte
 	deleted               []string
 	cancelRequested       bool
+	cancelError           error
 	uploadCalls           int
 	uploadError           error
 	uploadReadBeforeError int64
+	uploadFunc            func(context.Context, string, io.ReadSeeker, int64) (ocr.GeminiRemoteFile, error)
 	createCalls           int
 	createError           error
+	createFunc            func(context.Context, string, string, string) (ocr.GeminiRemoteBatch, error)
+	createInputFiles      []string
 	remoteError           string
 	deleteErrors          map[string]error
 	downloadCalls         int
 	downloadError         error
 	getError              error
+	getCalls              int
+	getFunc               func(context.Context, string) (ocr.GeminiRemoteBatch, error)
 	files                 []ocr.GeminiRemoteFile
 	batches               []ocr.GeminiRemoteBatch
 }
 
-func (api *fakeGeminiBatchAPI) UploadJSONL(_ context.Context, _ string, source io.ReadSeeker, _ int64) (ocr.GeminiRemoteFile, error) {
+func (api *fakeGeminiBatchAPI) UploadJSONL(
+	ctx context.Context,
+	displayName string,
+	source io.ReadSeeker,
+	size int64,
+) (ocr.GeminiRemoteFile, error) {
 	api.uploadCalls++
+	if api.uploadFunc != nil {
+		return api.uploadFunc(ctx, displayName, source, size)
+	}
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return ocr.GeminiRemoteFile{}, err
 	}
@@ -68,8 +82,17 @@ func (api *fakeGeminiBatchAPI) UploadJSONL(_ context.Context, _ string, source i
 	return ocr.GeminiRemoteFile{Name: "files/input", DisplayName: "input"}, nil
 }
 
-func (api *fakeGeminiBatchAPI) CreateBatch(context.Context, string, string, string) (ocr.GeminiRemoteBatch, error) {
+func (api *fakeGeminiBatchAPI) CreateBatch(
+	ctx context.Context,
+	model string,
+	displayName string,
+	inputFileName string,
+) (ocr.GeminiRemoteBatch, error) {
 	api.createCalls++
+	api.createInputFiles = append(api.createInputFiles, inputFileName)
+	if api.createFunc != nil {
+		return api.createFunc(ctx, model, displayName, inputFileName)
+	}
 	if api.createError != nil {
 		return ocr.GeminiRemoteBatch{}, api.createError
 	}
@@ -78,7 +101,11 @@ func (api *fakeGeminiBatchAPI) CreateBatch(context.Context, string, string, stri
 	}, nil
 }
 
-func (api *fakeGeminiBatchAPI) GetBatch(context.Context, string) (ocr.GeminiRemoteBatch, error) {
+func (api *fakeGeminiBatchAPI) GetBatch(ctx context.Context, name string) (ocr.GeminiRemoteBatch, error) {
+	api.getCalls++
+	if api.getFunc != nil {
+		return api.getFunc(ctx, name)
+	}
 	if api.getError != nil {
 		return ocr.GeminiRemoteBatch{}, api.getError
 	}
@@ -103,7 +130,7 @@ func (api *fakeGeminiBatchAPI) ListFiles(context.Context) ([]ocr.GeminiRemoteFil
 
 func (api *fakeGeminiBatchAPI) CancelBatch(context.Context, string) error {
 	api.cancelRequested = true
-	return nil
+	return api.cancelError
 }
 
 func (api *fakeGeminiBatchAPI) DeleteBatch(_ context.Context, name string) error {

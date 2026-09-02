@@ -3,318 +3,416 @@ package progress
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
-const trackerSpinnerInterval = 80 * time.Millisecond
+const (
+	trackerSpinnerInterval = 80 * time.Millisecond
+	phaseBarWidth          = 30
+	maxActiveItems         = 3
+)
 
-type workerState struct {
-	filename string
-	active   bool
+// PhaseOptions describes one bounded or unbounded foreground operation.
+type PhaseOptions struct {
+	Label  string
+	Total  int
+	Unit   string
+	Detail string
 }
 
-// Tracker manages OCR progress rendering in TTY and non-TTY modes.
-type Tracker struct {
+type activeItem struct {
+	key  string
+	name string
+}
+
+// Renderer is the small terminal surface shared by phase and upload progress.
+// WriteAbove serializes a durable message with clearing and redrawing a live
+// terminal display.
+type Renderer interface {
+	Pause()
+	Resume()
+	WriteAbove(func())
+	Close()
+}
+
+// Reporter renders one compact progress phase. It deliberately reports one
+// stable unit chosen by its caller instead of inferring work from retries or
+// dynamically split requests.
+type Reporter struct {
 	mu sync.Mutex
 
 	out   io.Writer
 	isTTY bool
 
-	total   int
-	workers []workerState
+	label     string
+	unit      string
+	total     int
+	completed int
+	detail    string
+	current   string
+	active    []activeItem
 
 	start time.Time
 	now   func() time.Time
 
-	completed int
-	succeeded int
-	failed    int
-	skipped   int
-
 	renderedLines int
 	spinner       *Spinner
 	cursorHidden  bool
-	finished      bool
+	paused        bool
+	closed        bool
+	outcomeShown  bool
 }
 
-func New(out io.Writer, isTTY bool, total, concurrency int) *Tracker {
+// NewReporter starts rendering immediately. Non-terminal output gets one
+// durable start line and no per-item updates.
+func NewReporter(out io.Writer, isTTY bool, options PhaseOptions) *Reporter {
 	if out == nil {
 		out = io.Discard
 	}
-	if total < 0 {
-		total = 0
+	if options.Total < 0 {
+		options.Total = 0
 	}
-	if concurrency < 1 {
-		concurrency = 1
+	if options.Label == "" {
+		options.Label = "Working"
 	}
-
-	t := &Tracker{
-		out:     out,
-		isTTY:   isTTY,
-		total:   total,
-		workers: make([]workerState, concurrency),
-		start:   time.Now(),
-		now:     time.Now,
-	}
-	if isTTY {
-		t.spinner = NewSpinner(trackerSpinnerInterval, func() {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-			if t.finished {
-				return
-			}
-			t.renderLocked()
-		})
-
-		t.mu.Lock()
-		t.renderLocked()
-		t.mu.Unlock()
-	}
-	return t
-}
-
-func (t *Tracker) WorkerStart(slotID int, filename string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.finished {
-		return
-	}
-	if !t.validSlot(slotID) {
-		return
+	if options.Unit == "" {
+		options.Unit = "items"
 	}
 
-	t.workers[slotID] = workerState{
-		filename: truncate(filename, 50),
-		active:   true,
+	reporter := &Reporter{
+		out:    out,
+		isTTY:  isTTY,
+		label:  options.Label,
+		unit:   options.Unit,
+		total:  options.Total,
+		detail: options.Detail,
+		start:  time.Now(),
+		now:    time.Now,
 	}
-}
-
-func (t *Tracker) WorkerDone(slotID int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.finished {
-		return
-	}
-
-	filename := t.workerFilenameAndReset(slotID)
-	t.completed++
-	t.succeeded++
-
-	if !t.isTTY {
-		t.renderNonTTYLocked("OK", filename, "")
-	}
-}
-
-func (t *Tracker) WorkerError(slotID int, err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.finished {
-		return
+	if !isTTY {
+		fmt.Fprintln(out, reporter.startLine())
+		return reporter
 	}
 
-	filename := t.workerFilenameAndReset(slotID)
-	t.completed++
-	t.failed++
-
-	if !t.isTTY {
-		msg := ""
-		if err != nil {
-			msg = err.Error()
+	spinner := NewSpinner(trackerSpinnerInterval, func() {
+		reporter.mu.Lock()
+		defer reporter.mu.Unlock()
+		if reporter.closed || reporter.paused {
+			return
 		}
-		t.renderNonTTYLocked("FAIL", filename, msg)
-	}
+		reporter.renderLocked()
+	})
+	reporter.mu.Lock()
+	reporter.spinner = spinner
+	reporter.renderLocked()
+	reporter.mu.Unlock()
+	return reporter
 }
 
-func (t *Tracker) Skip(filename string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.finished {
+// Advance records one completed caller-defined unit.
+func (r *Reporter) Advance() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
 		return
 	}
-
-	t.completed++
-	t.skipped++
-	if !t.isTTY {
-		t.renderNonTTYLocked("SKIP", truncate(filename, 50), "")
+	if r.total == 0 || r.completed < r.total {
+		r.completed++
 	}
+	r.renderLocked()
 }
 
-func (t *Tracker) Finish() {
+// SetDetail replaces the concise, caller-defined status detail.
+func (r *Reporter) SetDetail(detail string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.detail = detail
+	r.renderLocked()
+}
+
+// SetCurrent sets the one context item used by serial phases.
+func (r *Reporter) SetCurrent(item string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.current = displayName(item)
+	r.renderLocked()
+}
+
+// StartItem adds or updates an active concurrent item. Rendering is capped at
+// three names so high OCR concurrency never expands the terminal layout.
+func (r *Reporter) StartItem(key, item string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	name := displayName(item)
+	for i := range r.active {
+		if r.active[i].key == key {
+			r.active[i].name = name
+			r.renderLocked()
+			return
+		}
+	}
+	r.active = append(r.active, activeItem{key: key, name: name})
+	r.renderLocked()
+}
+
+// FinishItem removes a concurrent item after its caller has completed an
+// attempted unit.
+func (r *Reporter) FinishItem(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	for i := range r.active {
+		if r.active[i].key == key {
+			r.active = append(r.active[:i], r.active[i+1:]...)
+			break
+		}
+	}
+	r.renderLocked()
+}
+
+// Pause clears the live display and restores the cursor while another phase
+// owns the terminal. The spinner keeps time but cannot redraw until Resume.
+func (r *Reporter) Pause() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.paused {
+		return
+	}
+	r.paused = true
+	r.clearRenderedLocked()
+	r.restoreCursorLocked()
+}
+
+// Resume redraws a paused live display.
+func (r *Reporter) Resume() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || !r.paused {
+		return
+	}
+	r.paused = false
+	r.renderLocked()
+}
+
+// Clear removes transient terminal lines without closing the phase.
+func (r *Reporter) Clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.paused {
+		return
+	}
+	r.clearRenderedLocked()
+}
+
+// WriteAbove clears a TTY display, runs write, and redraws under one reporter
+// lock. It is used for warnings and durable output emitted during a phase.
+func (r *Reporter) WriteAbove(write func()) {
+	if write == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.paused || !r.isTTY {
+		write()
+		return
+	}
+	r.clearRenderedLocked()
+	write()
+	r.renderLocked()
+}
+
+// Close stops rendering and restores the cursor. It is safe to defer, call
+// repeatedly, and use during panic cleanup.
+func (r *Reporter) Close() {
 	var spinner *Spinner
 
-	t.mu.Lock()
-	if t.finished {
-		t.mu.Unlock()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
 		return
 	}
-	t.finished = true
-	spinner = t.spinner
-	t.spinner = nil
-	t.mu.Unlock()
+	r.closed = true
+	spinner = r.spinner
+	r.spinner = nil
+	// Spinner.Stop waits for its render callback, which takes r.mu. Unlock
+	// before stopping it so concurrent cleanup cannot deadlock the reporter.
+	r.mu.Unlock()
 
 	if spinner != nil {
 		spinner.Stop()
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.isTTY {
-		t.clearRenderedLocked()
-		if t.cursorHidden {
-			fmt.Fprint(t.out, "\x1b[?25h")
-			t.cursorHidden = false
-		}
-	}
-	fmt.Fprintf(
-		t.out,
-		"OCR complete: %d succeeded, %d skipped, %d failed.\n",
-		t.succeeded,
-		t.skipped,
-		t.failed,
-	)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clearRenderedLocked()
+	r.restoreCursorLocked()
 }
 
-func (t *Tracker) validSlot(slotID int) bool {
-	return slotID >= 0 && slotID < len(t.workers)
+// Complete closes the phase and writes its one durable completion line.
+func (r *Reporter) Complete() {
+	r.Close()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outcomeShown {
+		return
+	}
+	r.outcomeShown = true
+	elapsed := formatDuration(r.now().Sub(r.start))
+	if r.total > 0 {
+		fmt.Fprintf(r.out, "%s complete: %d/%d %s · %s.\n", r.label, r.completed, r.total, r.unit, elapsed)
+		return
+	}
+	fmt.Fprintf(r.out, "%s complete · %s.\n", r.label, elapsed)
 }
 
-func (t *Tracker) workerFilenameAndReset(slotID int) string {
-	if !t.validSlot(slotID) {
-		return "(unknown)"
+// Stopped closes the phase and writes the one durable cancellation line.
+func (r *Reporter) Stopped() {
+	r.Close()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outcomeShown {
+		return
 	}
-	filename := t.workers[slotID].filename
-	t.workers[slotID] = workerState{}
-	if filename == "" {
-		return "(unknown)"
+	r.outcomeShown = true
+	elapsed := formatDuration(r.now().Sub(r.start))
+	if r.total > 0 {
+		fmt.Fprintf(r.out, "Stopped at %d/%d %s: %s · %s.\n", r.completed, r.total, r.unit, r.label, elapsed)
+		return
 	}
-	return filename
+	fmt.Fprintf(r.out, "Stopped: %s · %s.\n", r.label, elapsed)
 }
 
-func (t *Tracker) renderLocked() {
-	if !t.cursorHidden {
-		fmt.Fprint(t.out, "\x1b[?25l")
-		t.cursorHidden = true
+func (r *Reporter) startLine() string {
+	if r.total > 0 {
+		return fmt.Sprintf("%s started: %d/%d %s.", r.label, r.completed, r.total, r.unit)
+	}
+	return fmt.Sprintf("%s started.", r.label)
+}
+
+func (r *Reporter) renderLocked() {
+	if !r.isTTY || r.closed || r.paused {
+		return
+	}
+	if !r.cursorHidden {
+		fmt.Fprint(r.out, "\x1b[?25l")
+		r.cursorHidden = true
 	}
 
-	t.clearRenderedLocked()
-	lines := t.renderLinesLocked()
+	r.clearRenderedLocked()
+	lines := r.renderLinesLocked()
 	for _, line := range lines {
-		fmt.Fprintln(t.out, line)
+		fmt.Fprintln(r.out, line)
 	}
-	t.renderedLines = len(lines)
+	r.renderedLines = len(lines)
 }
 
-func (t *Tracker) clearRenderedLocked() {
-	if t.renderedLines == 0 {
+func (r *Reporter) clearRenderedLocked() {
+	if r.renderedLines == 0 {
 		return
 	}
 
-	fmt.Fprintf(t.out, "\x1b[%dA", t.renderedLines)
-	for i := 0; i < t.renderedLines; i++ {
-		fmt.Fprint(t.out, "\r\x1b[2K")
-		if i < t.renderedLines-1 {
-			fmt.Fprint(t.out, "\x1b[1B")
+	fmt.Fprintf(r.out, "\x1b[%dA", r.renderedLines)
+	for i := 0; i < r.renderedLines; i++ {
+		fmt.Fprint(r.out, "\r\x1b[2K")
+		if i < r.renderedLines-1 {
+			fmt.Fprint(r.out, "\x1b[1B")
 		}
 	}
-	if t.renderedLines > 1 {
-		fmt.Fprintf(t.out, "\x1b[%dA", t.renderedLines-1)
+	if r.renderedLines > 1 {
+		fmt.Fprintf(r.out, "\x1b[%dA", r.renderedLines-1)
 	}
-	t.renderedLines = 0
+	r.renderedLines = 0
 }
 
-func (t *Tracker) renderLinesLocked() []string {
-	completed := t.completed
-	if t.total > 0 && completed > t.total {
-		completed = t.total
+func (r *Reporter) restoreCursorLocked() {
+	if !r.cursorHidden {
+		return
 	}
+	fmt.Fprint(r.out, "\x1b[?25h")
+	r.cursorHidden = false
+}
 
-	percent := 100
-	if t.total > 0 {
-		percent = (completed * 100) / t.total
-	}
-
+func (r *Reporter) renderLinesLocked() []string {
 	spinner := ' '
-	if t.spinner != nil {
-		spinner = t.spinner.Frame()
+	if r.spinner != nil {
+		spinner = r.spinner.Frame()
 	}
-	line1 := fmt.Sprintf(
-		"%c OCR %d/%d (%d%%) · ETA %s",
-		spinner,
-		completed,
-		t.total,
-		percent,
-		t.etaLocked(),
-	)
+	status := fmt.Sprintf("%c %s", spinner, r.label)
+	if r.total > 0 {
+		status += fmt.Sprintf(" · %d/%d %s", r.completed, r.total, r.unit)
+	}
+	if r.detail != "" {
+		status += " · " + r.detail
+	}
+	status += " · " + formatDuration(r.now().Sub(r.start))
 
-	const barWidth = 30
-	filled := barWidth
-	if t.total > 0 {
-		filled = (completed * barWidth) / t.total
-	}
-	if filled < 0 {
-		filled = 0
-	}
-	if filled > barWidth {
-		filled = barWidth
-	}
-	line2 := fmt.Sprintf(
-		"  [%s%s]",
-		strings.Repeat("█", filled),
-		strings.Repeat("░", barWidth-filled),
-	)
-
-	lines := make([]string, 0, 3+len(t.workers))
-	lines = append(lines, line1, line2)
-	for i, worker := range t.workers {
-		if worker.active {
-			lines = append(lines, fmt.Sprintf("  %d: %s", i+1, truncate(worker.filename, 50)))
-			continue
+	lines := []string{status}
+	if r.total > 0 {
+		filled := (r.completed * phaseBarWidth) / r.total
+		if filled < 0 {
+			filled = 0
 		}
-		lines = append(lines, fmt.Sprintf("  %d: \x1b[2m(idle)\x1b[0m", i+1))
+		if filled > phaseBarWidth {
+			filled = phaseBarWidth
+		}
+		lines = append(lines, fmt.Sprintf(
+			"  [%s%s]",
+			strings.Repeat("█", filled),
+			strings.Repeat("░", phaseBarWidth-filled),
+		))
 	}
-	lines = append(
-		lines,
-		fmt.Sprintf("  ✓ %d  ✗ %d  ⊘ %d", t.succeeded, t.failed, t.skipped),
-	)
+	if current := r.currentLineLocked(); current != "" {
+		lines = append(lines, "  "+current)
+	}
 	return lines
 }
 
-func (t *Tracker) renderNonTTYLocked(status, filename, detail string) {
-	completed := t.completed
-	if t.total > 0 && completed > t.total {
-		completed = t.total
+func (r *Reporter) currentLineLocked() string {
+	if len(r.active) == 0 {
+		return r.current
 	}
-	if filename == "" {
-		filename = "(unknown)"
+	count := min(len(r.active), maxActiveItems)
+	names := make([]string, 0, count)
+	for _, item := range r.active[:count] {
+		if item.name != "" {
+			names = append(names, item.name)
+		}
 	}
-	if detail == "" {
-		fmt.Fprintf(t.out, "[%d/%d] %s: %s\n", completed, t.total, status, filename)
-		return
+	if len(names) == 0 {
+		return r.current
 	}
-	fmt.Fprintf(t.out, "[%d/%d] %s: %s (%s)\n", completed, t.total, status, filename, detail)
+	line := strings.Join(names, ", ")
+	if extra := len(r.active) - count; extra > 0 {
+		line += fmt.Sprintf(" +%d more", extra)
+	}
+	return line
 }
 
-func (t *Tracker) etaLocked() string {
-	processed := t.succeeded + t.failed
-	if processed == 0 {
-		return "--"
+func displayName(item string) string {
+	if item == "" {
+		return ""
 	}
-
-	remaining := t.total - t.completed
-	if remaining <= 0 {
-		return "0s"
+	base := filepath.Base(item)
+	if base == "." || base == string(filepath.Separator) {
+		base = item
 	}
-
-	elapsed := t.now().Sub(t.start)
-	if elapsed < 0 {
-		elapsed = 0
-	}
-
-	eta := time.Duration(float64(elapsed) / float64(processed) * float64(remaining))
-	return formatDuration(eta)
+	return truncate(base, 50)
 }
 
 func formatDuration(d time.Duration) string {

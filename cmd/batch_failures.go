@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -37,15 +38,23 @@ func loadBatchBlockedSummary(database *db.DB) (batchBlockedSummary, error) {
 }
 
 func reportBatchBlockedSummary(database *db.DB) error {
+	return reportBatchBlockedSummaryTo(os.Stdout, database)
+}
+
+func reportBatchBlockedSummaryTo(out io.Writer, database *db.DB) error {
 	summary, err := loadBatchBlockedSummary(database)
 	if err != nil {
 		return fmt.Errorf("summarize blocked Gemini requests: %w", err)
 	}
-	printBatchBlockedSummary(summary)
+	printBatchBlockedSummaryTo(out, summary)
 	return nil
 }
 
 func printBatchBlockedSummary(summary batchBlockedSummary) {
+	printBatchBlockedSummaryTo(os.Stdout, summary)
+}
+
+func printBatchBlockedSummaryTo(out io.Writer, summary batchBlockedSummary) {
 	if summary.Requests == 0 {
 		return
 	}
@@ -61,7 +70,8 @@ func printBatchBlockedSummary(summary batchBlockedSummary) {
 	if summary.Requests == 1 {
 		verb = "requires"
 	}
-	fmt.Printf(
+	fmt.Fprintf(
+		out,
 		"%d blocked Gemini batch OCR page %s across %d %s %s attention.\n",
 		summary.Requests,
 		rangeLabel,
@@ -69,7 +79,7 @@ func printBatchBlockedSummary(summary batchBlockedSummary) {
 		contentLabel,
 		verb,
 	)
-	fmt.Println("Run `ringbinder batch failures` for details and recovery commands.")
+	fmt.Fprintln(out, "Run `ringbinder batch failures` for details and recovery commands.")
 }
 
 func runBatchFailures(cmd *cobra.Command, args []string) error {

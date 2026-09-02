@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,8 +169,22 @@ func TestBatchStartSubmitsOnlySparseUnownedMissingRanges(t *testing.T) {
 	cmd := commandWithDatabaseFlag(t, databasePath)
 	cmd.SetContext(context.Background())
 	cmd.Flags().Int("limit", 0, "")
-	if err := runBatchStart(cmd, nil); err != nil {
-		t.Fatalf("runBatchStart() error = %v", err)
+	var runErr error
+	output := captureStdout(t, func() { runErr = runBatchStart(cmd, nil) })
+	if runErr != nil {
+		t.Fatalf("runBatchStart() error = %v", runErr)
+	}
+	for _, want := range []string{
+		"Selecting documents for Gemini batch OCR started.",
+		"Preparing Gemini input started: 0/1 documents.",
+		"Gemini batch 2 prepared with 2 request(s).",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("progress output missing %q: %q", want, output)
+		}
+	}
+	if strings.Contains(output, "\x1b[") {
+		t.Fatalf("non-TTY batch start output contains ANSI: %q", output)
 	}
 	if api.uploadCalls != 1 {
 		t.Fatalf("upload calls = %d, want 1", api.uploadCalls)

@@ -279,7 +279,7 @@ func TestRollbackFreshBatchContentRemovesEverySealedSegment(t *testing.T) {
 	}
 }
 
-func TestBatchStartCancellationDoesNotPersistPreparedWork(t *testing.T) {
+func TestBatchStartCancellationAfterSelectionQueryStopsBeforePreparation(t *testing.T) {
 	resetCommandState(t)
 	t.Setenv("GEMINI_API_KEY", "test-key")
 	path := filepath.Join(t.TempDir(), "cancel.png")
@@ -307,8 +307,9 @@ func TestBatchStartCancellationDoesNotPersistPreparedWork(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	api := &fakeGeminiBatchAPI{}
 	oldFactory := newGeminiBatchAPI
-	newGeminiBatchAPI = func(string) geminiBatchAPI { return &fakeGeminiBatchAPI{} }
+	newGeminiBatchAPI = func(string) geminiBatchAPI { return api }
 	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -319,8 +320,18 @@ func TestBatchStartCancellationDoesNotPersistPreparedWork(t *testing.T) {
 	if err := cmd.Flags().Set("model", modelGemini); err != nil {
 		t.Fatal(err)
 	}
-	if err := runBatchStart(cmd, nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("runBatchStart() error = %v, want context cancellation", err)
+	var runErr error
+	output := captureStdout(t, func() { runErr = runBatchStart(cmd, nil) })
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("runBatchStart() error = %v, want context cancellation", runErr)
+	}
+	if !strings.Contains(output, "Selecting documents for Gemini batch OCR started.") ||
+		!strings.Contains(output, "Stopped: Selecting documents for Gemini batch OCR ·") ||
+		strings.Contains(output, "Preparing Gemini input") {
+		t.Fatalf("selection cancellation output = %q, want only a stopped selection phase", output)
+	}
+	if api.uploadCalls != 0 || api.createCalls != 0 {
+		t.Fatalf("remote calls after cancelled selection = uploads %d, submissions %d; want none", api.uploadCalls, api.createCalls)
 	}
 
 	database, err = db.Open(dbPath)
@@ -337,6 +348,92 @@ func TestBatchStartCancellationDoesNotPersistPreparedWork(t *testing.T) {
 	}
 	if batches != 0 || requests != 0 {
 		t.Fatalf("batches = %d, requests = %d; want no persisted canceled work", batches, requests)
+	}
+}
+
+func TestBatchStartPersistenceFailureDoesNotReportOrSubmitPreparedWork(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	path := filepath.Join(t.TempDir(), "persist-failure.png")
+	if err := os.WriteFile(path, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := checksum.SHA256File(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "persist-failure.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentID, err := database.InsertContent(digest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := database.InsertDocument(path, contentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &fakeGeminiBatchAPI{}
+	oldFactory := newGeminiBatchAPI
+	newGeminiBatchAPI = func(string) geminiBatchAPI { return api }
+	t.Cleanup(func() { newGeminiBatchAPI = oldFactory })
+	oldCreate := createGeminiBatchWork
+	createGeminiBatchWork = func(
+		_ *db.DB,
+		creations []db.GeminiBatchCreation,
+		blocked []db.GeminiBlockedRequest,
+		_ time.Time,
+	) ([]int64, error) {
+		if len(creations) != 1 || len(creations[0].Requests) != 1 || len(blocked) != 0 {
+			t.Errorf("persistence received creations = %+v, blocked = %+v; want one prepared request", creations, blocked)
+		}
+		return nil, errors.New("forced persistence failure")
+	}
+	t.Cleanup(func() { createGeminiBatchWork = oldCreate })
+
+	cmd := commandWithDatabaseFlag(t, dbPath)
+	cmd.SetContext(context.Background())
+	cmd.Flags().String("model", "", "")
+	cmd.Flags().Int("limit", 0, "")
+	if err := cmd.Flags().Set("model", modelGemini); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	output := captureStdout(t, func() { runErr = runBatchStart(cmd, nil) })
+	if runErr == nil || !strings.Contains(runErr.Error(), "forced persistence failure") {
+		t.Fatalf("runBatchStart() error = %v, want forced persistence failure", runErr)
+	}
+	if api.uploadCalls != 0 || api.createCalls != 0 {
+		t.Fatalf("remote calls = uploads %d, submissions %d; want none", api.uploadCalls, api.createCalls)
+	}
+	for _, misleading := range []string{
+		"Preparing Gemini input complete", "Gemini batch 1 prepared", "Gemini batch 1 submitted", "\x1b[",
+	} {
+		if strings.Contains(output, misleading) {
+			t.Fatalf("persistence failure output = %q, must not contain %q", output, misleading)
+		}
+	}
+
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var batches, requests int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM gemini_batches`).Scan(&batches); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM gemini_batch_requests`).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 0 || requests != 0 {
+		t.Fatalf("persisted batches = %d, requests = %d; want none after failed commit", batches, requests)
 	}
 }
 

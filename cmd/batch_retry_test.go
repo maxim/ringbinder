@@ -66,7 +66,7 @@ func TestBatchRetryReportsWhenContentRemainsPending(t *testing.T) {
 			t.Fatalf("runBatchRetry() error = %v", err)
 		}
 	})
-	if !strings.Contains(output, "content item remains pending") {
+	if !strings.Contains(output, "document remains pending") {
 		t.Fatalf("retry output = %q, want pending status", output)
 	}
 
@@ -82,6 +82,83 @@ func TestBatchRetryReportsWhenContentRemainsPending(t *testing.T) {
 	request, err := database.GeminiRequestByID(requestID)
 	if err != nil || request == nil || request.State != db.GeminiRequestStaged {
 		t.Fatalf("request after partial completion = %+v, %v; want staged", request, err)
+	}
+}
+
+func TestBatchRetryDoesNotPersistLateProviderSuccessAfterCancellation(t *testing.T) {
+	resetCommandState(t)
+	t.Setenv("GEMINI_API_KEY", "test-key")
+	databasePath := filepath.Join(t.TempDir(), "cancel-retry.db")
+	documentPath := filepath.Join(t.TempDir(), "cancel-retry.png")
+	if err := os.WriteFile(documentPath, []byte("stable retry source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := checksum.SHA256File(documentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentID, err := database.InsertContent(digest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := database.InsertDocument(documentPath, contentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	requestID, err := database.CreateBlockedGeminiRequest(db.GeminiRequestPlan{
+		ContentID: contentID, RequestKey: "late-direct-retry", FileType: "png", PageStart: 0, PageEnd: 1,
+	}, "blocked", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	provider := &fakeRangeProvider{fn: func(_ context.Context, _ string, start, end int) (ocr.RangeResult, error) {
+		cancel()
+		return successfulRange("late-success", start, end, 0), nil
+	}}
+	oldFactory := newGeminiDirectProvider
+	newGeminiDirectProvider = func(string, time.Time) ocr.Provider { return provider }
+	t.Cleanup(func() { newGeminiDirectProvider = oldFactory })
+	cmd := commandWithDatabaseFlag(t, databasePath)
+	cmd.SetContext(ctx)
+	cmd.Flags().String("mode", "", "")
+	if err := cmd.Flags().Set("mode", "direct"); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	output := captureStdout(t, func() {
+		runErr = runBatchRetry(cmd, []string{strconv.FormatInt(requestID, 10)})
+	})
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("runBatchRetry() error = %v, want context cancellation", runErr)
+	}
+	if !strings.Contains(output, "Stopped at 0/1 page ranges: Direct retry OCR ·") {
+		t.Fatalf("cancellation progress = %q", output)
+	}
+
+	database, err = db.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var pages int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM pages WHERE content_id = ?`, contentID).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != 0 {
+		t.Fatalf("late provider pages persisted = %d, want 0", pages)
+	}
+	request, err := database.GeminiRequestByID(requestID)
+	if err != nil || request == nil || request.State != db.GeminiRequestBlocked {
+		t.Fatalf("request after cancellation = %+v, %v", request, err)
 	}
 }
 
@@ -172,7 +249,7 @@ func TestBatchRetryRetainsPartialPagesAndRetriesOnlyMissingRange(t *testing.T) {
 			t.Fatalf("second runBatchRetry() error = %v", err)
 		}
 	})
-	if !strings.Contains(output, "OCR completed for its content item") {
+	if !strings.Contains(output, "OCR completed for its document") {
 		t.Fatalf("second retry output = %q, want request-scoped completion", output)
 	}
 	provider.mu.Lock()

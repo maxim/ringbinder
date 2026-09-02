@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxim/ringbinder/internal/db"
 	"github.com/maxim/ringbinder/internal/ocr"
+	"github.com/maxim/ringbinder/internal/progress"
 )
 
 // Regular OCR uses independent fixed service limits. They intentionally are not
@@ -104,6 +107,18 @@ type rangeOutcome struct {
 	globalErr   error
 }
 
+type ocrProgressHooks struct {
+	itemPath   func(int64, string)
+	pagesSaved func(int)
+}
+
+func firstOCRProgressHook(hooks []*ocrProgressHooks) *ocrProgressHooks {
+	if len(hooks) == 0 {
+		return nil
+	}
+	return hooks[0]
+}
+
 func processOCRChain(
 	ctx context.Context,
 	database *db.DB,
@@ -112,36 +127,82 @@ func processOCRChain(
 	limit int,
 	out io.Writer,
 	errOut io.Writer,
+	coordinators ...*progressCoordinator,
 ) error {
+	var coordinator *progressCoordinator
+	if len(coordinators) > 0 {
+		coordinator = coordinators[0]
+	}
+
 	batch, err := pendingContentBatch(database, limit)
 	if err != nil {
 		return fmt.Errorf("query contents: %w", err)
 	}
 	if batch.excluded > 0 {
-		fmt.Fprintf(out, "Skipped %d content item(s) already managed by batch OCR.\n", batch.excluded)
+		fmt.Fprintf(out, "Skipped %d document(s) already managed by batch OCR.\n", batch.excluded)
 	}
 	if len(batch.contents) == 0 {
 		fmt.Fprintln(out, "No documents pending OCR.")
 		return nil
 	}
 	if batch.truncated {
-		fmt.Fprintf(out, "Processing %d of %d pending content item(s).\n", len(batch.contents), batch.total)
+		fmt.Fprintf(out, "Processing %d of %d pending document(s).\n", len(batch.contents), batch.total)
 	}
 
+	var preparing *progress.Reporter
+	if coordinator != nil {
+		preparing = coordinator.StartPhase(progress.PhaseOptions{
+			Label: "Preparing OCR", Total: len(batch.contents), Unit: "documents inspected",
+		})
+	}
 	selectedMissing := 0
 	for _, content := range batch.contents {
+		if contextErr := ctx.Err(); contextErr != nil {
+			if preparing != nil {
+				coordinator.StopPhase(preparing)
+			}
+			return contextErr
+		}
 		missing, queryErr := database.MissingPageIndexes(content.ID)
 		if queryErr != nil {
+			if preparing != nil {
+				coordinator.ClosePhase(preparing)
+			}
 			return fmt.Errorf("query missing pages for content %d: %w", content.ID, queryErr)
 		}
 		selectedMissing += len(missing)
+		if preparing != nil {
+			preparing.Advance()
+		}
 	}
-	fmt.Fprintf(out, "Selected: %d content items, %d missing pages\n", len(batch.contents), selectedMissing)
+	if preparing != nil {
+		// The selected-documents line below is this phase's durable result.
+		coordinator.ClosePhase(preparing)
+	}
+	fmt.Fprintf(out, "Selected: %d documents, %d missing pages\n", len(batch.contents), selectedMissing)
 
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	totals := newOCRRunTotals()
 	var writeMu sync.Mutex
+	var pagesSaved atomic.Int64
+	var processing *progress.Reporter
+	var hooks *ocrProgressHooks
+	if coordinator != nil {
+		processing = coordinator.StartPhase(progress.PhaseOptions{
+			Label: "OCR", Total: len(batch.contents), Unit: "documents attempted",
+			Detail: fmt.Sprintf("0/%d pages saved", selectedMissing),
+		})
+		hooks = &ocrProgressHooks{
+			itemPath: func(contentID int64, path string) {
+				processing.StartItem(strconv.FormatInt(contentID, 10), path)
+			},
+			pagesSaved: func(count int) {
+				saved := pagesSaved.Add(int64(count))
+				processing.SetDetail(fmt.Sprintf("%d/%d pages saved", saved, selectedMissing))
+			},
+		}
+	}
 	jobs := make(chan db.Content, len(batch.contents))
 	for _, content := range batch.contents {
 		jobs <- content
@@ -153,15 +214,46 @@ func processOCRChain(
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for content := range jobs {
-				processContentOCR(
-					runCtx, cancel, database, content, providers, models,
-					&writeMu, totals, errOut,
-				)
+			for {
+				// A buffered queue lets selection finish before providers begin. Check
+				// cancellation on both sides of receive so bypassed work is never
+				// reported as an attempted document.
+				if runCtx.Err() != nil {
+					return
+				}
+				select {
+				case <-runCtx.Done():
+					return
+				case content, open := <-jobs:
+					if !open || runCtx.Err() != nil {
+						return
+					}
+					key := strconv.FormatInt(content.ID, 10)
+					if processing != nil {
+						processing.StartItem(key, "document "+key)
+					}
+					processContentOCR(
+						runCtx, cancel, database, content, providers, models,
+						&writeMu, totals, errOut, hooks,
+					)
+					if processing != nil {
+						processing.FinishItem(key)
+						processing.Advance()
+					}
+				}
 			}
 		}()
 	}
 	workers.Wait()
+
+	if processing != nil {
+		if ctx.Err() != nil {
+			coordinator.StopPhase(processing)
+		} else {
+			// The OCR summary below is this phase's durable result.
+			coordinator.ClosePhase(processing)
+		}
+	}
 
 	completed := 0
 	remainingContent := 0
@@ -189,7 +281,7 @@ func processOCRChain(
 	}
 	if remainingPages > 0 {
 		return fmt.Errorf(
-			"%d selected content item(s) remain pending with %d missing page(s)",
+			"%d selected document(s) remain pending with %d missing page(s)",
 			remainingContent, remainingPages,
 		)
 	}
@@ -206,7 +298,9 @@ func processContentOCR(
 	writeMu *sync.Mutex,
 	totals *ocrRunTotals,
 	errOut io.Writer,
+	hooks ...*ocrProgressHooks,
 ) {
+	hook := firstOCRProgressHook(hooks)
 	ranges, err := database.MissingPageRanges(content.ID)
 	if err != nil {
 		cancel(fmt.Errorf("query missing ranges for content %d: %w", content.ID, err))
@@ -223,6 +317,9 @@ func processContentOCR(
 		totals.log(errOut, "content %d: %v", content.ID, err)
 		return
 	}
+	if hook != nil && hook.itemPath != nil {
+		hook.itemPath(content.ID, path)
+	}
 	fileType := classifyPath(path)
 	if fileType == "" {
 		totals.log(errOut, "%s: unsupported OCR file type", path)
@@ -235,7 +332,7 @@ func processContentOCR(
 		}
 		outcome := processOCRRange(
 			ctx, database, content, path, fileType, pageRange, 0,
-			providers, models, writeMu, totals, errOut,
+			providers, models, writeMu, totals, errOut, hooks...,
 		)
 		if outcome.globalErr != nil {
 			cancel(outcome.globalErr)
@@ -259,7 +356,9 @@ func processOCRRange(
 	writeMu *sync.Mutex,
 	totals *ocrRunTotals,
 	errOut io.Writer,
+	hooks ...*ocrProgressHooks,
 ) rangeOutcome {
+	hook := firstOCRProgressHook(hooks)
 	if err := ctx.Err(); err != nil {
 		return rangeOutcome{globalErr: err}
 	}
@@ -301,6 +400,9 @@ func processOCRRange(
 			return rangeOutcome{globalErr: fmt.Errorf("store OCR pages for %s: %w", path, writeErr)}
 		} else {
 			totals.addPages(result.Pages)
+			if hook != nil && hook.pagesSaved != nil {
+				hook.pagesSaved(len(result.Pages))
+			}
 		}
 	}
 	if err == nil {
@@ -331,7 +433,7 @@ func processOCRRange(
 			)
 			return processOCRSubranges(
 				ctx, database, content, path, fileType, remaining, modelIndex,
-				providers, models, writeMu, totals, errOut,
+				providers, models, writeMu, totals, errOut, hooks...,
 			)
 		}
 		if pageRange.End-pageRange.Start > 1 {
@@ -349,7 +451,7 @@ func processOCRRange(
 					{Start: pageRange.Start, End: mid},
 					{Start: mid, End: pageRange.End},
 				},
-				modelIndex, providers, models, writeMu, totals, errOut,
+				modelIndex, providers, models, writeMu, totals, errOut, hooks...,
 			)
 		}
 		if modelIndex+1 < len(models) {
@@ -361,7 +463,7 @@ func processOCRRange(
 			)
 			return processOCRRange(
 				ctx, database, content, path, fileType, pageRange, modelIndex+1,
-				providers, models, writeMu, totals, errOut,
+				providers, models, writeMu, totals, errOut, hooks...,
 			)
 		}
 		totals.log(
@@ -387,12 +489,13 @@ func processOCRSubranges(
 	writeMu *sync.Mutex,
 	totals *ocrRunTotals,
 	errOut io.Writer,
+	hooks ...*ocrProgressHooks,
 ) rangeOutcome {
 	var combined rangeOutcome
 	for _, pageRange := range ranges {
 		outcome := processOCRRange(
 			ctx, database, content, path, fileType, pageRange, modelIndex,
-			providers, models, writeMu, totals, errOut,
+			providers, models, writeMu, totals, errOut, hooks...,
 		)
 		if outcome.globalErr != nil || outcome.stopContent {
 			return outcome
@@ -492,7 +595,7 @@ func printOCRRunSummary(
 ) {
 	totals.mu.Lock()
 	defer totals.mu.Unlock()
-	fmt.Fprintf(out, "Completed this run: %d content items\n", completed)
+	fmt.Fprintf(out, "Completed this run: %d documents\n", completed)
 	fmt.Fprintln(out, "Pages completed this run:")
 	pageModels := sortedKeys(totals.pagesByModel)
 	if len(pageModels) == 0 {
@@ -502,7 +605,7 @@ func printOCRRunSummary(
 			fmt.Fprintf(out, "  %s: %d\n", model, totals.pagesByModel[model])
 		}
 	}
-	fmt.Fprintf(out, "Still pending: %d content items, %d pages\n", remainingContent, remainingPages)
+	fmt.Fprintf(out, "Still pending: %d documents, %d pages\n", remainingContent, remainingPages)
 
 	billingModels := sortedKeys(totals.billing)
 	if len(billingModels) == 0 {

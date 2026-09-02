@@ -26,6 +26,7 @@ type UploadTracker struct {
 	renderedLines int
 	spinner       *Spinner
 	cursorHidden  bool
+	paused        bool
 	closed        bool
 	outcomeShown  bool
 }
@@ -53,7 +54,7 @@ func NewUpload(out io.Writer, isTTY bool, batchID, total int64) *UploadTracker {
 	spinner := NewSpinner(trackerSpinnerInterval, func() {
 		tracker.mu.Lock()
 		defer tracker.mu.Unlock()
-		if tracker.closed {
+		if tracker.closed || tracker.paused {
 			return
 		}
 		tracker.renderLocked()
@@ -86,6 +87,49 @@ func (t *UploadTracker) AddBytes(count int) {
 	}
 }
 
+// Pause clears the live upload before another phase takes the terminal.
+func (t *UploadTracker) Pause() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.paused {
+		return
+	}
+	t.paused = true
+	t.clearRenderedLocked()
+	if t.cursorHidden {
+		fmt.Fprint(t.out, "\x1b[?25h")
+		t.cursorHidden = false
+	}
+}
+
+// Resume redraws an upload paused for a nested phase.
+func (t *UploadTracker) Resume() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || !t.paused {
+		return
+	}
+	t.paused = false
+	t.renderLocked()
+}
+
+// WriteAbove serializes a durable message with clearing and redrawing the
+// terminal upload display.
+func (t *UploadTracker) WriteAbove(write func()) {
+	if write == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.paused || !t.isTTY {
+		write()
+		return
+	}
+	t.clearRenderedLocked()
+	write()
+	t.renderLocked()
+}
+
 // Close stops rendering and restores the terminal. It is safe to call more
 // than once, including from a deferred panic-safety cleanup.
 func (t *UploadTracker) Close() {
@@ -99,6 +143,8 @@ func (t *UploadTracker) Close() {
 	t.closed = true
 	spinner = t.spinner
 	t.spinner = nil
+	// Spinner.Stop waits for its render callback, which takes t.mu. Unlock
+	// before stopping it so concurrent cleanup cannot deadlock the upload bar.
 	t.mu.Unlock()
 
 	if spinner != nil {
@@ -145,6 +191,9 @@ func (t *UploadTracker) Stopped() {
 }
 
 func (t *UploadTracker) renderLocked() {
+	if !t.isTTY || t.closed || t.paused {
+		return
+	}
 	if !t.cursorHidden {
 		fmt.Fprint(t.out, "\x1b[?25l")
 		t.cursorHidden = true

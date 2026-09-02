@@ -4,6 +4,8 @@ Notable changes to Ringbinder are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-02
+
 ### Changed
 
 - Use Gemini Flash 3.8 for all new work.
@@ -43,7 +45,8 @@ Notable changes to Ringbinder are documented here.
 - SQLite FTS5, trigram, and path search, plus page/context reading and JSON output for scripts and agents.
 - Homebrew installation on macOS and Linux.
 
-[Unreleased]: https://github.com/maxim/ringbinder/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/maxim/ringbinder/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/maxim/ringbinder/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/maxim/ringbinder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/maxim/ringbinder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/maxim/ringbinder/releases/tag/v0.1.0

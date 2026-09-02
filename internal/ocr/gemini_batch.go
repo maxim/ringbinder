@@ -33,6 +33,8 @@ type GeminiRemoteFile struct {
 type GeminiRemoteBatch struct {
 	Name           string
 	DisplayName    string
+	Model          string
+	InputFileName  string
 	State          string
 	OutputFileName string
 	ErrorMessage   string
@@ -399,16 +401,24 @@ func decodeGeminiRemoteBatch(reader io.Reader) (GeminiRemoteBatch, error) {
 	var raw struct {
 		Name        string `json:"name"`
 		DisplayName string `json:"displayName"`
-		State       string `json:"state"`
-		CreateTime  string `json:"createTime"`
-		UpdateTime  string `json:"updateTime"`
-		Metadata    struct {
+		Model       string `json:"model"`
+		InputConfig struct {
+			FileName string `json:"fileName"`
+		} `json:"inputConfig"`
+		State      string `json:"state"`
+		CreateTime string `json:"createTime"`
+		UpdateTime string `json:"updateTime"`
+		Metadata   struct {
 			Name        string `json:"name"`
 			DisplayName string `json:"displayName"`
-			State       string `json:"state"`
-			CreateTime  string `json:"createTime"`
-			UpdateTime  string `json:"updateTime"`
-			Output      struct {
+			Model       string `json:"model"`
+			InputConfig struct {
+				FileName string `json:"fileName"`
+			} `json:"inputConfig"`
+			State      string `json:"state"`
+			CreateTime string `json:"createTime"`
+			UpdateTime string `json:"updateTime"`
+			Output     struct {
 				ResponsesFile string `json:"responsesFile"`
 			} `json:"output"`
 		} `json:"metadata"`
@@ -436,6 +446,12 @@ func decodeGeminiRemoteBatch(reader io.Reader) (GeminiRemoteBatch, error) {
 	}
 	if raw.DisplayName == "" {
 		raw.DisplayName = raw.Metadata.DisplayName
+	}
+	if raw.Model == "" {
+		raw.Model = raw.Metadata.Model
+	}
+	if raw.InputConfig.FileName == "" {
+		raw.InputConfig.FileName = raw.Metadata.InputConfig.FileName
 	}
 	if raw.State == "" {
 		raw.State = raw.Metadata.State
@@ -473,6 +489,8 @@ func decodeGeminiRemoteBatch(reader io.Reader) (GeminiRemoteBatch, error) {
 	return GeminiRemoteBatch{
 		Name:           raw.Name,
 		DisplayName:    raw.DisplayName,
+		Model:          raw.Model,
+		InputFileName:  raw.InputConfig.FileName,
 		State:          raw.State,
 		OutputFileName: output,
 		ErrorMessage:   strings.Trim(message, ": "),

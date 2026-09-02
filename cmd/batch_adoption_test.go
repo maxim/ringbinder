@@ -93,30 +93,130 @@ func TestDeterministicCreateFailureBlocksInsteadOfRepeating(t *testing.T) {
 	}
 }
 
-func TestUnknownSubmissionAdoptsExactlyOneCurrentBatchResource(t *testing.T) {
-	database, batch := createAdoptionTestBatch(t, "submission")
-	if err := database.SetGeminiBatchUploaded(batch.ID, "files/input", time.Now().UTC()); err != nil {
-		t.Fatalf("SetGeminiBatchUploaded() error = %v", err)
+func TestUnknownSubmissionAdoptsExactlyOneProvenanceMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		remotes func(db.GeminiBatch) []ocr.GeminiRemoteBatch
+		adopts  bool
+	}{
+		{name: "zero"},
+		{
+			name: "one",
+			remotes: func(batch db.GeminiBatch) []ocr.GeminiRemoteBatch {
+				return []ocr.GeminiRemoteBatch{matchingRemoteBatch(batch, "batches/remote")}
+			},
+			adopts: true,
+		},
+		{
+			name: "multiple",
+			remotes: func(batch db.GeminiBatch) []ocr.GeminiRemoteBatch {
+				return []ocr.GeminiRemoteBatch{
+					matchingRemoteBatch(batch, "batches/one"),
+					matchingRemoteBatch(batch, "batches/two"),
+				}
+			},
+		},
+		{
+			name: "one among same-name decoys",
+			remotes: func(batch db.GeminiBatch) []ocr.GeminiRemoteBatch {
+				wrongModel := matchingRemoteBatch(batch, "batches/wrong-model")
+				wrongModel.Model = "models/gemini-3.8-flash"
+				wrongInput := matchingRemoteBatch(batch, "batches/wrong-input")
+				wrongInput.InputFileName = "files/other"
+				return []ocr.GeminiRemoteBatch{
+					wrongModel,
+					matchingRemoteBatch(batch, "batches/remote"),
+					wrongInput,
+				}
+			},
+			adopts: true,
+		},
+		{
+			name: "wrong model",
+			remotes: func(batch db.GeminiBatch) []ocr.GeminiRemoteBatch {
+				remote := matchingRemoteBatch(batch, "batches/wrong-model")
+				remote.Model = "models/gemini-3.8-flash"
+				return []ocr.GeminiRemoteBatch{remote}
+			},
+		},
+		{
+			name: "wrong input",
+			remotes: func(batch db.GeminiBatch) []ocr.GeminiRemoteBatch {
+				remote := matchingRemoteBatch(batch, "batches/wrong-input")
+				remote.InputFileName = "files/other"
+				return []ocr.GeminiRemoteBatch{remote}
+			},
+		},
+		{
+			name: "blank provenance",
+			remotes: func(batch db.GeminiBatch) []ocr.GeminiRemoteBatch {
+				remote := matchingRemoteBatch(batch, "batches/blank-model")
+				remote.Model = ""
+				return []ocr.GeminiRemoteBatch{remote}
+			},
+		},
 	}
-	if err := database.SetGeminiBatchSubmissionUnknown(batch.ID, time.Now().UTC()); err != nil {
-		t.Fatalf("SetGeminiBatchSubmissionUnknown() error = %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, batch := createAdoptionTestBatch(t, "submission-"+test.name)
+			batch.Model = "gemini-3.7-flash"
+			if _, err := database.Exec(`UPDATE gemini_batches SET model = ? WHERE id = ?`, batch.Model, batch.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.SetGeminiBatchUploaded(batch.ID, "files/input", time.Now().UTC()); err != nil {
+				t.Fatalf("SetGeminiBatchUploaded() error = %v", err)
+			}
+			now := time.Now().UTC()
+			prices := ocr.GeminiBatchPrices(now)
+			if err := database.ClaimGeminiBatchSubmission(
+				batch.ID, batch.Model, int64(prices.Input), int64(prices.Output), now,
+			); err != nil {
+				t.Fatalf("ClaimGeminiBatchSubmission() error = %v", err)
+			}
+			stored, err := database.GetGeminiBatch(batch.ID)
+			if err != nil || stored == nil {
+				t.Fatalf("GetGeminiBatch() = %+v, %v", stored, err)
+			}
+			batch = *stored
+			api := &fakeGeminiBatchAPI{}
+			if test.remotes != nil {
+				api.batches = test.remotes(batch)
+			}
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			err = adoptUnknownGeminiSubmission(cmd, database, api, batch)
+			if test.adopts {
+				if err != nil {
+					t.Fatalf("adoptUnknownGeminiSubmission() error = %v", err)
+				}
+				stored, err = database.GetGeminiBatch(batch.ID)
+				if err != nil || stored == nil || stored.State != db.GeminiBatchSucceeded ||
+					stored.RemoteName != "batches/remote" || stored.OutputFileName != "files/output" ||
+					stored.Model != "gemini-3.7-flash" {
+					t.Fatalf("adopted batch = %+v, %v", stored, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("adoptUnknownGeminiSubmission() error = nil")
+			}
+			stored, queryErr := database.GetGeminiBatch(batch.ID)
+			if queryErr != nil || stored == nil || stored.State != db.GeminiBatchSubmissionUnknown ||
+				stored.RemoteName != "" || stored.Model != "gemini-3.7-flash" {
+				t.Fatalf("unadopted batch = %+v, %v", stored, queryErr)
+			}
+			if api.createCalls != 0 {
+				t.Fatalf("CreateBatch calls = %d, want 0", api.createCalls)
+			}
+		})
 	}
-	api := &fakeGeminiBatchAPI{batches: []ocr.GeminiRemoteBatch{{
-		Name: "batches/remote", DisplayName: batch.DisplayName,
-		State: "BATCH_STATE_SUCCEEDED", OutputFileName: "files/output",
-	}}}
-	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
-	if err := adoptUnknownGeminiSubmission(cmd, database, api, batch); err != nil {
-		t.Fatalf("adoptUnknownGeminiSubmission() error = %v", err)
-	}
-	stored, err := database.GetGeminiBatch(batch.ID)
-	if err != nil {
-		t.Fatalf("GetGeminiBatch() error = %v", err)
-	}
-	if stored == nil || stored.State != db.GeminiBatchSucceeded ||
-		stored.RemoteName != "batches/remote" || stored.OutputFileName != "files/output" {
-		t.Fatalf("stored batch = %+v", stored)
+}
+
+func matchingRemoteBatch(batch db.GeminiBatch, name string) ocr.GeminiRemoteBatch {
+	return ocr.GeminiRemoteBatch{
+		Name: name, DisplayName: batch.DisplayName, Model: "models/" + batch.Model,
+		InputFileName: batch.InputFileName, State: "BATCH_STATE_SUCCEEDED",
+		OutputFileName: "files/output",
 	}
 }
 

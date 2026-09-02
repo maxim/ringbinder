@@ -30,6 +30,7 @@ type fakeGeminiBatchAPI struct {
 	uploadReadBeforeError int64
 	uploadFunc            func(context.Context, string, io.ReadSeeker, int64) (ocr.GeminiRemoteFile, error)
 	createCalls           int
+	createModels          []string
 	createError           error
 	createFunc            func(context.Context, string, string, string) (ocr.GeminiRemoteBatch, error)
 	createInputFiles      []string
@@ -89,6 +90,7 @@ func (api *fakeGeminiBatchAPI) CreateBatch(
 	inputFileName string,
 ) (ocr.GeminiRemoteBatch, error) {
 	api.createCalls++
+	api.createModels = append(api.createModels, model)
 	api.createInputFiles = append(api.createInputFiles, inputFileName)
 	if api.createFunc != nil {
 		return api.createFunc(ctx, model, displayName, inputFileName)

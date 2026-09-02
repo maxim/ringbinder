@@ -85,4 +85,16 @@ func TestResponseReportedModelTakesPrecedence(t *testing.T) {
 	if geminiPages[0].Model != "gemini-concrete-version" {
 		t.Fatalf("Gemini model = %q", geminiPages[0].Model)
 	}
+
+	geminiBody = []byte(`{
+		"candidates":[{"content":{"parts":[{"text":` + fmt.Sprintf("%q", payload) + `}]},"finishReason":"STOP","index":0}],
+		"usageMetadata":{"promptTokenCount":1}
+	}`)
+	geminiPages, err = decodeGeminiResults(geminiBody, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if geminiPages[0].Model != GeminiDirectModel {
+		t.Fatalf("Gemini fallback model = %q, want %q", geminiPages[0].Model, GeminiDirectModel)
+	}
 }

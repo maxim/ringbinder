@@ -31,13 +31,34 @@ func TestFormatCurrency_RoundsOnlyAtDisplayBoundary(t *testing.T) {
 func TestGeminiPrices_Boundary(t *testing.T) {
 	t.Parallel()
 
-	before := time.Date(2026, 12, 31, 23, 59, 59, 999_999_999, time.UTC)
-	if got, want := GeminiCost(before, 1, 1), Currency(4_500); got != want {
-		t.Fatalf("GeminiCost(before) = %d, want %d", got, want)
+	tests := []struct {
+		name   string
+		at     time.Time
+		direct GeminiTokenPrices
+		batch  GeminiTokenPrices
+	}{
+		{
+			name:   "before cutover",
+			at:     time.Date(2026, 12, 31, 23, 59, 59, 999_999_999, time.UTC),
+			direct: GeminiTokenPrices{Input: 750, Output: 3_750},
+			batch:  GeminiTokenPrices{Input: 375, Output: 1_875},
+		},
+		{
+			name:   "at cutover",
+			at:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+			direct: GeminiTokenPrices{Input: 1_500, Output: 7_500},
+			batch:  GeminiTokenPrices{Input: 750, Output: 3_750},
+		},
 	}
-	after := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	if got, want := GeminiCost(after, 1, 1), Currency(9_000); got != want {
-		t.Fatalf("GeminiCost(after) = %d, want %d", got, want)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := GeminiPrices(test.at); got != test.direct {
+				t.Fatalf("GeminiPrices(%v) = %+v, want %+v", test.at, got, test.direct)
+			}
+			if got := GeminiBatchPrices(test.at); got != test.batch {
+				t.Fatalf("GeminiBatchPrices(%v) = %+v, want %+v", test.at, got, test.batch)
+			}
+		})
 	}
 }
 

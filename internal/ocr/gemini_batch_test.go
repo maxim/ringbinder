@@ -475,6 +475,34 @@ func TestGeminiBatchDecodesCanonicalJobErrorCode(t *testing.T) {
 	}
 }
 
+func TestGeminiBatchDecodesAdoptionProvenance(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "top level",
+			body: `{"name":"batches/top","displayName":"display","model":"models/gemini-3.8-flash","inputConfig":{"fileName":"files/input"}}`,
+		},
+		{
+			name: "operation metadata",
+			body: `{"name":"batches/metadata","metadata":{"displayName":"display","model":"models/gemini-3.8-flash","inputConfig":{"fileName":"files/input"}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			batch, err := decodeGeminiRemoteBatch(strings.NewReader(test.body))
+			if err != nil {
+				t.Fatalf("decodeGeminiRemoteBatch() error = %v", err)
+			}
+			if batch.DisplayName != "display" || batch.Model != "models/gemini-3.8-flash" ||
+				batch.InputFileName != "files/input" {
+				t.Fatalf("batch provenance = %+v", batch)
+			}
+		})
+	}
+}
+
 func TestGeminiBatchListsEveryPage(t *testing.T) {
 	var fileCalls, batchCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -522,7 +550,7 @@ func TestDecodeGeminiBatchResultUsesFrozenPrices(t *testing.T) {
 		`{"candidates":[{"content":{"parts":[{"text":%q}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"thoughtsTokenCount":5}}`,
 		candidateJSON,
 	))
-	result, err := DecodeGeminiBatchResult(body, 1, GeminiTokenPrices{Input: 3, Output: 7})
+	result, err := DecodeGeminiBatchResult(body, 1, geminiModel, GeminiTokenPrices{Input: 3, Output: 7})
 	if err != nil {
 		t.Fatalf("DecodeGeminiBatchResult() error = %v", err)
 	}
@@ -531,5 +559,40 @@ func TestDecodeGeminiBatchResultUsesFrozenPrices(t *testing.T) {
 	}
 	if result.InputTokens == nil || *result.InputTokens != 10 || result.OutputTokens == nil || *result.OutputTokens != 25 {
 		t.Fatalf("tokens = input %v output %v", result.InputTokens, result.OutputTokens)
+	}
+}
+
+func TestDecodeGeminiBatchResultUsesAttemptModelFallback(t *testing.T) {
+	candidateJSON := `{"pages":[{"page_index":0,"transcription":"text","page_description":"page","visual_elements":[]}]}`
+	response := func(modelVersion string) []byte {
+		modelField := ""
+		if modelVersion != "" {
+			modelField = fmt.Sprintf(`"modelVersion":%q,`, modelVersion)
+		}
+		return []byte(fmt.Sprintf(
+			`{%s"candidates":[{"content":{"parts":[{"text":%q}]},"finishReason":"STOP","index":0}]}`,
+			modelField, candidateJSON,
+		))
+	}
+	prices := GeminiTokenPrices{}
+
+	result, err := DecodeGeminiBatchResult(response(""), 1, "gemini-3.7-flash", prices)
+	if err != nil {
+		t.Fatalf("DecodeGeminiBatchResult() error = %v", err)
+	}
+	if got := result.Pages[0].Model; got != "gemini-3.7-flash" {
+		t.Fatalf("fallback model = %q", got)
+	}
+
+	result, err = DecodeGeminiBatchResult(response("gemini-3.8-flash-20260902"), 1, "gemini-3.7-flash", prices)
+	if err != nil {
+		t.Fatalf("DecodeGeminiBatchResult() explicit model error = %v", err)
+	}
+	if got := result.Pages[0].Model; got != "gemini-3.8-flash-20260902" {
+		t.Fatalf("explicit model = %q", got)
+	}
+
+	if _, err := DecodeGeminiBatchResult(response(""), 1, " ", prices); err == nil || !strings.Contains(err.Error(), "no fallback model") {
+		t.Fatalf("blank fallback error = %v", err)
 	}
 }

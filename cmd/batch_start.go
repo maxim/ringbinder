@@ -418,13 +418,15 @@ func submitUploadedGeminiBatch(
 	}
 	now := time.Now().UTC()
 	prices := ocr.GeminiBatchPrices(now)
-	if err := database.SetGeminiBatchPrices(batchID, int64(prices.Input), int64(prices.Output), now); err != nil {
-		return err
-	}
+	// An uploaded but unsubmitted batch may predate a model upgrade. Snapshot
+	// the current model here so provenance records exactly what CreateBatch receives.
+	submissionModel := ocr.GeminiBatchModel
 	if contextErr := cmd.Context().Err(); contextErr != nil {
 		return contextErr
 	}
-	if err := database.SetGeminiBatchSubmissionUnknown(batchID, now); err != nil {
+	if err := database.ClaimGeminiBatchSubmission(
+		batchID, submissionModel, int64(prices.Input), int64(prices.Output), now,
+	); err != nil {
 		return err
 	}
 	coordinator := firstProgressCoordinator(coordinators)
@@ -434,7 +436,7 @@ func submitUploadedGeminiBatch(
 			Label: fmt.Sprintf("Submitting Gemini batch %d", batchID),
 		})
 	}
-	remote, err := transport.CreateBatch(cmd.Context(), batch.Model, batch.DisplayName, batch.InputFileName)
+	remote, err := transport.CreateBatch(cmd.Context(), submissionModel, batch.DisplayName, batch.InputFileName)
 	if err != nil {
 		if submitting != nil {
 			if cmd.Context().Err() != nil {

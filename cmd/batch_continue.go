@@ -409,12 +409,12 @@ func adoptUnknownGeminiSubmission(
 	}
 	matches := make([]ocr.GeminiRemoteBatch, 0, 1)
 	for _, remote := range batches {
-		if remote.DisplayName == batch.DisplayName {
+		if geminiBatchAdoptionMatches(batch, remote) {
 			matches = append(matches, remote)
 		}
 	}
 	if len(matches) != 1 {
-		return fmt.Errorf("ambiguous batch adoption found %d exact display-name matches; use batch forget to escape", len(matches))
+		return fmt.Errorf("ambiguous batch adoption found %d exact display/model/input matches; use batch forget to escape", len(matches))
 	}
 	state, err := ocr.NormalizeGeminiBatchState(matches[0].State)
 	if err != nil {
@@ -424,6 +424,23 @@ func adoptUnknownGeminiSubmission(
 		batch.ID, matches[0].Name, state, matches[0].OutputFileName,
 		matches[0].ErrorMessage, time.Now().UTC(),
 	)
+}
+
+// Display names are not unique. Require every immutable submission field so a
+// recovery scan cannot attach unrelated billable output; missing provenance
+// fails closed because it cannot establish identity safely.
+func geminiBatchAdoptionMatches(batch db.GeminiBatch, remote ocr.GeminiRemoteBatch) bool {
+	if batch.DisplayName == "" || batch.Model == "" || batch.InputFileName == "" ||
+		remote.DisplayName == "" || remote.Model == "" || remote.InputFileName == "" {
+		return false
+	}
+	return remote.DisplayName == batch.DisplayName &&
+		normalizeGeminiBatchModel(remote.Model) == normalizeGeminiBatchModel(batch.Model) &&
+		remote.InputFileName == batch.InputFileName
+}
+
+func normalizeGeminiBatchModel(model string) string {
+	return strings.TrimPrefix(strings.TrimSpace(model), "models/")
 }
 
 func refreshAndHandleGeminiBatch(
@@ -887,7 +904,11 @@ func accountGeminiOutputLine(
 		return err
 	}
 	prices := ocr.GeminiTokenPrices{Input: ocr.Currency(batch.InputPrice), Output: ocr.Currency(batch.OutputPrice)}
-	decoded, decodeErr := ocr.DecodeGeminiBatchResult(output.Response, request.PageEnd-request.PageStart, prices)
+	// Some batch responses omit modelVersion. Use the model snapshotted for this
+	// attempt, not today's default; a missing snapshot then fails closed.
+	decoded, decodeErr := ocr.DecodeGeminiBatchResult(
+		output.Response, request.PageEnd-request.PageStart, batch.Model, prices,
+	)
 	totals.accounted = true
 	totals.billing.Add(decoded.Billing)
 	if decodeErr != nil {

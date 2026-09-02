@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -41,6 +42,65 @@ func TestCreateGeminiBatchWorkPersistsAllTransportJobsAtomically(t *testing.T) {
 	}
 	if batches != 0 || requests != 0 {
 		t.Fatalf("batches = %d requests = %d, want full rollback", batches, requests)
+	}
+}
+
+func TestClaimGeminiBatchSubmissionUpdatesModelPricesAndStateOnce(t *testing.T) {
+	for _, remoteIdentity := range []string{"null", "empty"} {
+		t.Run(remoteIdentity, func(t *testing.T) {
+			database := openGeminiBatchTestDB(t)
+			contentID := insertGeminiBatchTestContent(t, database, "claim-"+remoteIdentity, 1, "/docs/claim.png")
+			now := time.Now().UTC()
+			batchID, err := database.CreateGeminiBatch(
+				"claim-"+remoteIdentity, "gemini-3.7-flash", 1, 2, nil,
+				[]GeminiRequestPlan{{
+					ContentID: contentID, RequestKey: "claim-" + remoteIdentity,
+					FileType: "png", PageStart: 0, PageEnd: 1,
+				}}, now,
+			)
+			if err != nil {
+				t.Fatalf("CreateGeminiBatch() error = %v", err)
+			}
+			if err := database.SetGeminiBatchUploaded(batchID, "files/input", now); err != nil {
+				t.Fatalf("SetGeminiBatchUploaded() error = %v", err)
+			}
+			if remoteIdentity == "empty" {
+				if _, err := database.Exec(`UPDATE gemini_batches SET remote_name = '' WHERE id = ?`, batchID); err != nil {
+					t.Fatalf("set legacy empty remote identity: %v", err)
+				}
+			}
+
+			if err := database.ClaimGeminiBatchSubmission(batchID, "gemini-3.8-flash", 8, 9, now.Add(time.Second)); err != nil {
+				t.Fatalf("ClaimGeminiBatchSubmission() error = %v", err)
+			}
+			claimed, err := database.GetGeminiBatch(batchID)
+			if err != nil {
+				t.Fatalf("GetGeminiBatch() error = %v", err)
+			}
+			if claimed == nil || claimed.State != GeminiBatchSubmissionUnknown ||
+				claimed.Model != "gemini-3.8-flash" || claimed.InputPrice != 8 || claimed.OutputPrice != 9 {
+				t.Fatalf("claimed batch = %+v", claimed)
+			}
+
+			err = database.ClaimGeminiBatchSubmission(batchID, "gemini-future", 80, 90, now.Add(2*time.Second))
+			if !errors.Is(err, ErrGeminiBatchSubmissionClaimLost) {
+				t.Fatalf("second claim error = %v, want ErrGeminiBatchSubmissionClaimLost", err)
+			}
+			unchanged, err := database.GetGeminiBatch(batchID)
+			if err != nil {
+				t.Fatalf("GetGeminiBatch() after lost claim error = %v", err)
+			}
+			if unchanged == nil || unchanged.State != claimed.State || unchanged.Model != claimed.Model ||
+				unchanged.InputPrice != claimed.InputPrice || unchanged.OutputPrice != claimed.OutputPrice {
+				t.Fatalf("lost claim changed batch from %+v to %+v", claimed, unchanged)
+			}
+		})
+	}
+
+	database := openGeminiBatchTestDB(t)
+	err := database.ClaimGeminiBatchSubmission(99_999, "gemini-3.8-flash", 8, 9, time.Now().UTC())
+	if err == nil || errors.Is(err, ErrGeminiBatchSubmissionClaimLost) {
+		t.Fatalf("missing batch claim error = %v", err)
 	}
 }
 

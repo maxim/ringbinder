@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +33,37 @@ type panicUploadAPI struct {
 type httpUploadAPI struct {
 	*fakeGeminiBatchAPI
 	endpoint string
+}
+
+type blockingCreateAPI struct {
+	*fakeGeminiBatchAPI
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (api *blockingCreateAPI) CreateBatch(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ string,
+) (ocr.GeminiRemoteBatch, error) {
+	api.mu.Lock()
+	api.calls++
+	calls := api.calls
+	api.mu.Unlock()
+	api.started <- struct{}{}
+	<-api.release
+	return ocr.GeminiRemoteBatch{
+		Name: fmt.Sprintf("batches/%d", calls), State: "JOB_STATE_PENDING",
+	}, nil
+}
+
+func (api *blockingCreateAPI) callCount() int {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	return api.calls
 }
 
 func (api *httpUploadAPI) UploadJSONL(
@@ -265,6 +298,121 @@ func TestCanceledSubmissionStaysUploaded(t *testing.T) {
 	}
 	if stored == nil || stored.State != db.GeminiBatchUploaded {
 		t.Fatalf("stored batch = %+v, want uploaded", stored)
+	}
+}
+
+func TestSubmissionUpgradesUnstartedBatchToCurrentModel(t *testing.T) {
+	database, batch, _ := createPreparedImageTestBatch(t, "upgrade-unstarted")
+	if _, err := database.Exec(
+		`UPDATE gemini_batches SET model = ?, input_price = ?, output_price = ? WHERE id = ?`,
+		"gemini-3.7-flash", 1, 2, batch.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetGeminiBatchUploaded(batch.ID, "files/input", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeGeminiBatchAPI{}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+
+	if err := submitUploadedGeminiBatch(cmd, database, api, batch.ID); err != nil {
+		t.Fatalf("submitUploadedGeminiBatch() error = %v", err)
+	}
+	if api.createCalls != 1 || len(api.createModels) != 1 || api.createModels[0] != "gemini-3.8-flash" {
+		t.Fatalf("CreateBatch calls = %d with models %v", api.createCalls, api.createModels)
+	}
+	stored, err := database.GetGeminiBatch(batch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prices := ocr.GeminiBatchPrices(time.Now().UTC())
+	if stored == nil || stored.Model != "gemini-3.8-flash" ||
+		stored.InputPrice != int64(prices.Input) || stored.OutputPrice != int64(prices.Output) {
+		t.Fatalf("stored batch = %+v, want current model and prices", stored)
+	}
+}
+
+func TestConcurrentBatchSubmissionCreatesOneRemoteJob(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent-submit.db")
+	setup, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, _ := addPreparedImageTestBatch(t, setup, "concurrent-submit")
+	if err := setup.SetGeminiBatchUploaded(batch.ID, "files/input", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := setup.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	release := make(chan struct{})
+	released := false
+	releaseCreate := func() {
+		if !released {
+			close(release)
+			released = true
+		}
+	}
+	defer releaseCreate()
+	api := &blockingCreateAPI{
+		fakeGeminiBatchAPI: &fakeGeminiBatchAPI{},
+		started:            make(chan struct{}, 2),
+		release:            release,
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, database := range []*db.DB{first, second} {
+		go func(database *db.DB) {
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			<-start
+			errs <- submitUploadedGeminiBatch(cmd, database, api, batch.ID)
+		}(database)
+	}
+	close(start)
+
+	select {
+	case <-api.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("neither contender reached CreateBatch")
+	}
+	var loserErr error
+	select {
+	case loserErr = <-errs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("both contenders reached CreateBatch; submission claim was not exclusive")
+	}
+	if !errors.Is(loserErr, db.ErrGeminiBatchSubmissionClaimLost) {
+		t.Fatalf("loser error = %v, want ErrGeminiBatchSubmissionClaimLost", loserErr)
+	}
+	claimed, err := second.GetGeminiBatch(batch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.State != db.GeminiBatchSubmissionUnknown ||
+		claimed.RemoteName != "" || claimed.Model != "gemini-3.8-flash" || api.callCount() != 1 {
+		t.Fatalf("claimed batch = %+v, CreateBatch calls = %d", claimed, api.callCount())
+	}
+
+	releaseCreate()
+	if winnerErr := <-errs; winnerErr != nil {
+		t.Fatalf("winner error = %v", winnerErr)
+	}
+	if api.callCount() != 1 {
+		t.Fatalf("CreateBatch calls = %d, want 1", api.callCount())
 	}
 }
 

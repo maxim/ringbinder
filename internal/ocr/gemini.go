@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	geminiEndpoint    = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
-	geminiModel       = "gemini-3.7-flash"
+	geminiModel       = "gemini-3.8-flash"
+	geminiEndpoint    = "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel + ":generateContent"
 	GeminiDirectModel = geminiModel
 
 	geminiMaxPDFPages      = 20
@@ -403,9 +403,10 @@ func (c *GeminiClient) OCRRangeResult(
 func DecodeGeminiBatchResult(
 	body []byte,
 	expectedPages int,
+	fallbackModel string,
 	prices GeminiTokenPrices,
 ) (GeminiDecodedResult, error) {
-	pages, err := decodeGeminiResults(body, expectedPages)
+	pages, err := decodeGeminiResultsWithModel(body, expectedPages, fallbackModel)
 	usage := geminiUsageFromBody(body)
 	result := GeminiDecodedResult{Pages: pages, Billing: BillingReport{Indeterminate: usage == nil}}
 	if usage != nil {
@@ -1032,6 +1033,10 @@ func isGeminiMaxTokens(err error) bool {
 }
 
 func decodeGeminiResults(body []byte, expectedPages int) ([]PageResult, error) {
+	return decodeGeminiResultsWithModel(body, expectedPages, geminiModel)
+}
+
+func decodeGeminiResultsWithModel(body []byte, expectedPages int, fallbackModel string) ([]PageResult, error) {
 	var response geminiResponse
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
@@ -1105,7 +1110,10 @@ func decodeGeminiResults(body []byte, expectedPages int) ([]PageResult, error) {
 	}
 	model := strings.TrimSpace(response.ModelVersion)
 	if model == "" {
-		model = geminiModel
+		model = strings.TrimSpace(fallbackModel)
+		if model == "" {
+			return nil, errors.New("Gemini response omitted modelVersion and no fallback model was provided")
+		}
 	}
 	indexes := make([]int, 0, len(pages))
 	for index := range pages {

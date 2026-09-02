@@ -18,13 +18,27 @@ import (
 	"time"
 )
 
+func TestGeminiProductionDefaults(t *testing.T) {
+	const model = "gemini-3.8-flash"
+	if GeminiDirectModel != model {
+		t.Fatalf("GeminiDirectModel = %q, want %q", GeminiDirectModel, model)
+	}
+	if GeminiBatchModel != model {
+		t.Fatalf("GeminiBatchModel = %q, want %q", GeminiBatchModel, model)
+	}
+	client := NewGeminiClient("test-key", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if client.endpoint != "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent" {
+		t.Fatalf("default endpoint = %q", client.endpoint)
+	}
+}
+
 func TestGeminiOCRFileRequestAndMarkdown(t *testing.T) {
 	input := filepath.Join(t.TempDir(), "scan.jpg")
 	if err := os.WriteFile(input, []byte("image"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1beta/models/gemini-3.7-flash:generateContent" {
+		if r.URL.Path != "/v1beta/models/gemini-3.8-flash:generateContent" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 		if got := r.Header.Get("x-goog-api-key"); got != "test-key" {
@@ -56,7 +70,7 @@ func TestGeminiOCRFileRequestAndMarkdown(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewGeminiClient("test-key", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	client.endpoint, client.sleep, client.randFloat64 = server.URL+"/v1beta/models/gemini-3.7-flash:generateContent", func(context.Context, time.Duration) error { return nil }, func() float64 { return 0 }
+	client.endpoint, client.sleep, client.randFloat64 = server.URL+"/v1beta/models/gemini-3.8-flash:generateContent", func(context.Context, time.Duration) error { return nil }, func() float64 { return 0 }
 	pages, report, err := client.OCRFile(context.Background(), input, "jpeg")
 	if err != nil {
 		t.Fatal(err)

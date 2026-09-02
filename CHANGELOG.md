@@ -6,6 +6,7 @@ Notable changes to Ringbinder are documented here.
 
 ### Changed
 
+- Use Gemini Flash 3.8 for all new work.
 - GitHub Releases now use the matching versioned changelog section, so release notes include direct commits as well as merged pull requests.
 
 ## [0.3.0] - 2026-09-02

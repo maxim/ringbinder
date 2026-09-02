@@ -681,6 +681,28 @@ func TestAccountGeminiOutputStagesValidatedPagesAndBatchBilling(t *testing.T) {
 	}
 }
 
+func TestAccountGeminiOutputUsesPersistedAttemptModelFallback(t *testing.T) {
+	database, batch, request := createOutputTestBatch(t, 0, 1)
+	batch.Model = "gemini-3.7-flash"
+	if _, err := database.Exec(`UPDATE gemini_batches SET model = ? WHERE id = ?`, batch.Model, batch.ID); err != nil {
+		t.Fatal(err)
+	}
+	line := successfulGeminiOutputLineWithModel(t, request.RequestKey, 0, 10, 20, 5, "")
+	var totals batchContinueTotals
+	if err := accountGeminiOutput(bytes.NewReader(line), database, batch, &totals); err != nil {
+		t.Fatalf("accountGeminiOutput() error = %v", err)
+	}
+	var canonicalModel string
+	if err := database.QueryRow(
+		`SELECT model FROM pages WHERE content_id = ? AND page_index = 0`, request.ContentID,
+	).Scan(&canonicalModel); err != nil {
+		t.Fatal(err)
+	}
+	if canonicalModel != "gemini-3.7-flash" {
+		t.Fatalf("canonical model = %q, want persisted attempt model", canonicalModel)
+	}
+}
+
 func TestAccountGeminiOutputRejectsDuplicateAndRetriesOnce(t *testing.T) {
 	database, batch, request := createOutputTestBatch(t, 0, 1)
 	line := successfulGeminiOutputLine(t, request.RequestKey, 0, 10, 20, 5)
@@ -1546,12 +1568,22 @@ func geminiMaxTokensOutputLine(t *testing.T, key string, input, candidate, think
 
 func successfulGeminiOutputLine(t *testing.T, key string, pageIndex int, input, candidate, thinking int64) []byte {
 	t.Helper()
+	return successfulGeminiOutputLineWithModel(t, key, pageIndex, input, candidate, thinking, "gemini-response-test")
+}
+
+func successfulGeminiOutputLineWithModel(
+	t *testing.T,
+	key string,
+	pageIndex int,
+	input, candidate, thinking int64,
+	model string,
+) []byte {
+	t.Helper()
 	payload := fmt.Sprintf(
 		`{"pages":[{"page_index":%d,"transcription":"text","page_description":"page","visual_elements":[]}]}`,
 		pageIndex,
 	)
 	response := map[string]any{
-		"modelVersion": "gemini-response-test",
 		"candidates": []any{map[string]any{
 			"content":      map[string]any{"parts": []any{map[string]any{"text": payload}}},
 			"finishReason": "STOP",
@@ -1560,6 +1592,9 @@ func successfulGeminiOutputLine(t *testing.T, key string, pageIndex int, input, 
 		"usageMetadata": map[string]any{
 			"promptTokenCount": input, "candidatesTokenCount": candidate, "thoughtsTokenCount": thinking,
 		},
+	}
+	if model != "" {
+		response["modelVersion"] = model
 	}
 	line, err := json.Marshal(map[string]any{"key": key, "response": response})
 	if err != nil {

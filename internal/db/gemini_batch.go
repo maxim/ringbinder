@@ -12,6 +12,8 @@ import (
 
 const maxGeminiBatchErrorBytes = 2_048
 
+var ErrGeminiBatchSubmissionClaimLost = errors.New("Gemini batch submission claim lost")
+
 const (
 	GeminiBatchPrepared          = "prepared"
 	GeminiBatchUploadUnknown     = "upload_unknown"
@@ -571,14 +573,6 @@ func (db *DB) SetGeminiBatchPrepared(batchID int64, message string, now time.Tim
 	)
 }
 
-func (db *DB) SetGeminiBatchPrices(batchID, inputPrice, outputPrice int64, now time.Time) error {
-	return db.updateGeminiBatch(
-		batchID,
-		`input_price = ?, output_price = ?, updated_at = ?`,
-		inputPrice, outputPrice, now.UTC().Format(time.RFC3339Nano),
-	)
-}
-
 func (db *DB) SetGeminiBatchUploadUnknown(batchID int64, now time.Time) error {
 	return db.updateGeminiBatch(
 		batchID,
@@ -595,11 +589,42 @@ func (db *DB) SetGeminiBatchUploaded(batchID int64, inputFileName string, now ti
 	)
 }
 
-func (db *DB) SetGeminiBatchSubmissionUnknown(batchID int64, now time.Time) error {
-	return db.updateGeminiBatch(
-		batchID,
-		`state = 'submission_unknown', last_error = '', updated_at = ?`,
-		now.UTC().Format(time.RFC3339Nano),
+// ClaimGeminiBatchSubmission atomically reserves the non-idempotent CreateBatch call.
+// submission_unknown makes a crash after the claim recoverable by remote adoption,
+// while snapshotting the submitted model and prices keeps later decoding and billing
+// tied to the attempt rather than to changing production defaults.
+func (db *DB) ClaimGeminiBatchSubmission(
+	batchID int64,
+	model string,
+	inputPrice, outputPrice int64,
+	now time.Time,
+) error {
+	res, err := db.Exec(`
+		UPDATE gemini_batches
+		SET state = 'submission_unknown', model = ?, input_price = ?, output_price = ?,
+			last_error = '', updated_at = ?
+		WHERE id = ? AND state = 'uploaded' AND COALESCE(remote_name, '') = ''
+	`, model, inputPrice, outputPrice, now.UTC().Format(time.RFC3339Nano), batchID)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 1 {
+		return nil
+	}
+	var exists bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM gemini_batches WHERE id = ?)`, batchID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("Gemini batch %d not found", batchID)
+	}
+	return fmt.Errorf(
+		"%w: Gemini batch %d submission is already claimed or the batch is no longer eligible",
+		ErrGeminiBatchSubmissionClaimLost, batchID,
 	)
 }
 

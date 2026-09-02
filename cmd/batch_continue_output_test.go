@@ -121,6 +121,11 @@ func TestBatchContinueDoesNotReportIdleAfterSubmittingDetachedRetry(t *testing.T
 		t.Fatal(err)
 	}
 	batch, request := addPreparedImageTestBatch(t, database, "retry-progress")
+	if _, err := database.Exec(
+		`UPDATE gemini_batches SET model = ? WHERE id = ?`, "gemini-3.7-flash", batch.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.RetryGeminiRequest(request.ID, "retry", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +149,81 @@ func TestBatchContinueDoesNotReportIdleAfterSubmittingDetachedRetry(t *testing.T
 	if strings.Contains(output, "No tracked Gemini batch work") || strings.Contains(output, "nothing ready") {
 		t.Fatalf("retry submission incorrectly reported idle: %q", output)
 	}
-	if api.uploadCalls != 1 {
-		t.Fatalf("upload calls = %d, want 1", api.uploadCalls)
+	if api.uploadCalls != 1 || len(api.createModels) != 1 || api.createModels[0] != "gemini-3.8-flash" {
+		t.Fatalf("remote calls = %d uploads with models %v", api.uploadCalls, api.createModels)
+	}
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var model string
+	var replacementOf int64
+	if err := database.QueryRow(
+		`SELECT model, replacement_of FROM gemini_batches ORDER BY id DESC LIMIT 1`,
+	).Scan(&model, &replacementOf); err != nil {
+		t.Fatal(err)
+	}
+	if model != "gemini-3.8-flash" || replacementOf != batch.ID {
+		t.Fatalf("retry batch model=%q replacement_of=%d, want gemini-3.8-flash and %d", model, replacementOf, batch.ID)
+	}
+}
+
+func TestBatchContinueBlankAttemptModelRetriesWithoutStagingAndAccountsUsage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "blank-attempt-model.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, request := addPreparedImageTestBatch(t, database, "blank-attempt-model")
+	if _, err := database.Exec(`UPDATE gemini_batches SET model = '' WHERE id = ?`, batch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetGeminiBatchRemote(
+		batch.ID, "batches/completed", db.GeminiBatchSucceeded, "files/output", "", time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	outputLine := successfulGeminiOutputLineWithModel(t, request.RequestKey, 0, 10, 20, 5, "")
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &fakeGeminiBatchAPI{output: outputLine}
+	output, runErr := runBatchContinueWithFake(t, dbPath, api)
+	if runErr != nil {
+		t.Fatalf("runBatchContinue() error = %v", runErr)
+	}
+	if !strings.Contains(output, "Batch OCR cost: $0.0001") {
+		t.Fatalf("output = %q, want usage-based billing", output)
+	}
+	if api.uploadCalls != 1 || api.createCalls != 1 {
+		t.Fatalf("retry remote calls = %d uploads and %d submissions, want one each", api.uploadCalls, api.createCalls)
+	}
+
+	database, err = db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	stored, err := database.GeminiRequestByID(request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.State != db.GeminiRequestAssigned || stored.AttemptCount != 1 || stored.BatchID == nil ||
+		!strings.Contains(stored.LastError, "no fallback model") {
+		t.Fatalf("retried request = %+v, want one assigned retry with the decode failure", stored)
+	}
+	batches, err := database.ListGeminiBatches()
+	if err != nil || len(batches) != 1 || batches[0].ID != *stored.BatchID {
+		t.Fatalf("batches = %+v, %v; want exactly the retry batch", batches, err)
+	}
+	var pages int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM pages WHERE content_id = ?`, request.ContentID).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != 0 {
+		t.Fatalf("canonical pages = %d, want none", pages)
 	}
 }
 

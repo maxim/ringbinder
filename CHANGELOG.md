@@ -6,7 +6,7 @@ Notable changes to Ringbinder are documented here.
 
 ### Added
 
-- Gemini Flash 3.7 is now supported for OCR and is recommended for the best results. Use Gemini by itself, or list Mistral second so Ringbinder can try it when Gemini says it cannot process a page.
+- Gemini Flash 3.7 is now supported for OCR and is recommended for the best results. Allow fallback to Mistral when Gemini refuses to process a page.
 - With Gemini also comes batch support. Gemini Batch API offers half-price processing for documents that can finish later. Ringbinder can submit jobs, resume them after an interruption, keep pages as they finish, retry only failed pages, and clean up uploaded files when the work is done.
 - `ringbinder cost` now shows a low-to-high price range based on the services you selected. `ringbinder batch cost` separately estimates Gemini's half-price batch processing. Both count only pages that still need OCR, and `--limit N` lets you preview a smaller set of documents.
 - Add support for `exclude` in the config file, to be able to exclude files from sweep. Any excludes added as command arguments are merged with the ones in the file.
@@ -14,9 +14,10 @@ Notable changes to Ringbinder are documented here.
 
 ### Changed
 
-- The `model` setting selects one OCR service or an ordered list, and `--model` can be repeated to set that order for one command. OCR concurrency settings and flags were removed because Ringbinder now chooses safe limits automatically.
+- The `--model` argument can now be repeated to set OCR fallback.
+- OCR concurrency settings and flags were removed because Ringbinder now chooses safe limits automatically.
 - Documents with unfinished OCR stay out of text search and `read` until every page is ready. You can still find them by filename and see that OCR is pending.
-- `--redo` was completely removed. To rebuild all OCR, use a separate database so your current searchable database remains available until the replacement is ready.
+- `--redo` was completely removed. To rebuild OCR use a separate database so your current searchable database remains available until the replacement is ready.
 
 ## [0.2.0] - 2026-08-13
 

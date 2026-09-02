@@ -1,6 +1,6 @@
 # Ringbinder
 
-Ringbinder makes PDFs and images on your computer searchable. It uses vision LLMs (like Gemini and Mistral) to read them and stores the resulting text in a local SQLite database. Your original files stay where they are and are never modified.
+Ringbinder makes PDFs and images on your computer searchable. It uses vision LLM APIs (Gemini and Mistral) to read documents, and store the resulting text in a local SQLite database. Your original files stay where they are and are never modified.
 
 Ringbinder supports Gemini Flash and Mistral OCR, staying up to date with their latest versions. At this time Gemini's quality is better, but their policy can refuse to process some documents, which is why Ringbinder supports fallback to another provider.
 

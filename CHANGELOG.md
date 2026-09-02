@@ -4,6 +4,10 @@ Notable changes to Ringbinder are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- GitHub Releases now use the matching versioned changelog section, so release notes include direct commits as well as merged pull requests.
+
 ## [0.3.0] - 2026-09-02
 
 ### Added

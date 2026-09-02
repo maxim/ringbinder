@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# < 1 || $# > 2 )); then
+  echo "Usage: scripts/release-notes VERSION [PREVIOUS_VERSION]" >&2
+  exit 2
+fi
+
+release_version=$1
+previous_version=${2:-}
+changelog=${CHANGELOG_FILE:-CHANGELOG.md}
+
+if [[ ! "$release_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "Version must match stable SemVer vMAJOR.MINOR.PATCH." >&2
+  exit 1
+fi
+if [[ -n "$previous_version" &&
+  ! "$previous_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "Previous version must match stable SemVer vMAJOR.MINOR.PATCH." >&2
+  exit 1
+fi
+
+version=${release_version#v}
+heading="## [$version] - YYYY-MM-DD"
+prefix="## [$version] - "
+heading_count=$(awk -v prefix="$prefix" '
+  function is_release_heading(line, date) {
+    if (index(line, prefix) != 1) {
+      return 0
+    }
+    date = substr(line, length(prefix) + 1)
+    return date ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/
+  }
+  is_release_heading($0) { count++ }
+  END { print count + 0 }
+' "$changelog")
+if [[ "$heading_count" != 1 ]]; then
+  echo "$changelog must contain exactly one $heading heading." >&2
+  exit 1
+fi
+
+# Command substitution removes trailing blank lines so GitHub receives one
+# canonical body regardless of spacing before the next changelog section.
+release_copy=$(awk -v prefix="$prefix" '
+  function is_release_heading(line, date) {
+    if (index(line, prefix) != 1) {
+      return 0
+    }
+    date = substr(line, length(prefix) + 1)
+    return date ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/
+  }
+  is_release_heading($0) {
+    in_release = 1
+    next
+  }
+  in_release && /^## \[/ { exit }
+  in_release && /^\[[^]]+\]:[[:space:]]/ { exit }
+  in_release && !started && /^[[:space:]]*$/ { next }
+  in_release {
+    started = 1
+    print
+  }
+' "$changelog")
+if ! grep -q '^- ' <<< "$release_copy"; then
+  echo "$heading must contain at least one release-note bullet." >&2
+  exit 1
+fi
+
+printf '%s\n' "$release_copy"
+if [[ -n "$previous_version" ]]; then
+  printf '\n**Full Changelog**: https://github.com/maxim/ringbinder/compare/%s...%s\n' \
+    "$previous_version" "$release_version"
+fi

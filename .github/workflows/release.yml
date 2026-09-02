@@ -24,6 +24,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      notes_start_version: ${{ steps.release.outputs.notes_start_version }}
       prior_latest_version: ${{ steps.release.outputs.prior_latest_version }}
       release_mode: ${{ steps.release.outputs.release_mode }}
       release_sha: ${{ steps.release.outputs.release_sha }}
@@ -78,6 +79,20 @@ jobs:
             latest_version=${sorted_tags[${#sorted_tags[@]}-1]}
           fi
 
+          notes_start_tags=()
+          for stable_tag in "${stable_tags[@]}"; do
+            if [[ "$stable_tag" != "$RELEASE_VERSION" ]]; then
+              notes_start_tags+=("$stable_tag")
+            fi
+          done
+          notes_start_version=""
+          if (( ${#notes_start_tags[@]} > 0 )); then
+            mapfile -t sorted_notes_start_tags < <(
+              printf '%s\n' "${notes_start_tags[@]}" | sort -V
+            )
+            notes_start_version=${sorted_notes_start_tags[${#sorted_notes_start_tags[@]}-1]}
+          fi
+
           if [[ -n "$release_tag_sha" ]]; then
             # Only the latest immutable publication can represent this run's interrupted work;
             # accepting an older tag after a later release would turn recovery into a replay.
@@ -116,11 +131,17 @@ jobs:
           fi
 
           {
+            echo "notes_start_version=$notes_start_version"
             echo "prior_latest_version=$latest_version"
             echo "release_mode=$release_mode"
             echo "release_sha=$release_sha"
             echo "version=$RELEASE_VERSION"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Validate release notes
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: scripts/release-notes "$RELEASE_VERSION" >/dev/null
 
       - name: Preflight Homebrew tap token
         # Ringbinder's GITHUB_TOKEN is repository-scoped, so the tap needs a dedicated token.
@@ -368,34 +389,57 @@ jobs:
       - name: Create or validate asset-free release
         env:
           GH_TOKEN: ${{ github.token }}
+          NOTES_START_VERSION: ${{ needs.validate.outputs.notes_start_version }}
           RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
           release_endpoint="repos/maxim/ringbinder/releases/tags/$RELEASE_VERSION"
           release_json="$RUNNER_TEMP/release.json"
+          release_notes="$RUNNER_TEMP/release-notes.md"
+          notes_renderer="$RUNNER_TEMP/release-notes"
+
+          # Recovery tests and publishes the protected tag's source with the
+          # repaired automation selected by the new workflow dispatch.
+          git show "${WORKFLOW_SHA}:scripts/release-notes" > "$notes_renderer"
+          chmod +x "$notes_renderer"
+
+          # GitHub's generated notes omit direct commits, so the versioned
+          # changelog section is the canonical release copy.
+          CHANGELOG_FILE=CHANGELOG.md "$notes_renderer" \
+            "$RELEASE_VERSION" "$NOTES_START_VERSION" > "$release_notes"
 
           if ! gh api "$release_endpoint" > "$release_json" 2>/dev/null; then
             if ! gh release create "$RELEASE_VERSION" \
               --repo maxim/ringbinder \
               --verify-tag \
               --title "Ringbinder $RELEASE_VERSION" \
-              --generate-notes; then
+              --notes-file "$release_notes"; then
               echo "Release creation was not confirmed; reconciling exact release state." >&2
             fi
             gh api "$release_endpoint" > "$release_json"
           fi
 
-          if ! jq -e --arg version "$RELEASE_VERSION" '
-            .tag_name == $version and
-            .draft == false and
-            .prerelease == false and
-            .immutable == true and
-            (.published_at | type == "string" and length > 0) and
-            (.assets | type == "array" and length == 0)
-          ' "$release_json" >/dev/null; then
-            echo "Existing release is not the exact published, immutable, zero-asset release." >&2
+          require_canonical_notes=true
+          case "$RELEASE_VERSION" in
+            # These immutable releases predate changelog-backed GitHub notes.
+            v0.1.0|v0.2.0|v0.3.0) require_canonical_notes=false ;;
+          esac
+          if ! jq -e \
+            --arg version "$RELEASE_VERSION" \
+            --argjson require_notes "$require_canonical_notes" \
+            --rawfile notes "$release_notes" '
+              .tag_name == $version and
+              .draft == false and
+              .prerelease == false and
+              .immutable == true and
+              ($require_notes == false or .body == $notes) and
+              (.published_at | type == "string" and length > 0) and
+              (.assets | type == "array" and length == 0)
+            ' "$release_json" >/dev/null; then
+            echo "Existing release does not exactly match the expected publication." >&2
             exit 1
           fi
 

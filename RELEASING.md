@@ -1,6 +1,6 @@
 # Releasing Ringbinder
 
-Ringbinder publishes stable releases through the manual **Release** GitHub Actions workflow. GitHub Releases contain release notes and GitHub's automatic source links only. Homebrew compiles the tagged source and is the supported installer on macOS and Linux.
+Ringbinder publishes stable releases through the manual **Release** GitHub Actions workflow. GitHub Releases copy the matching version section from `CHANGELOG.md`, append the full comparison link, and contain GitHub's automatic source links only. Homebrew compiles the tagged source and is the supported installer on macOS and Linux.
 
 Do not create production tags, GitHub Releases, or tap update branches manually. The workflow pins every release to the exact commit tested on both platforms.
 
@@ -115,9 +115,9 @@ HOMEBREW_NO_INSTALL_FROM_API=1 brew audit --strict maxim/tap/ringbinder
 
 The workflow:
 
-1. Captures the selected `main` SHA, validates stable SemVer ordering, and preflights the dedicated tap token.
+1. Captures the selected `main` SHA, validates stable SemVer ordering and the matching versioned changelog section, and preflights the dedicated tap token.
 2. Runs `go test ./...` plus an exact-version source-build smoke test on macOS and Linux.
-3. Rechecks the remote tag state, creates a protected tag when needed, and creates an immutable, zero-upload GitHub Release with `gh release create --verify-tag --generate-notes`.
+3. Rechecks the remote tag state, creates a protected tag when needed, and creates an immutable, zero-upload GitHub Release from the versioned changelog section.
 4. Uses a pinned Homebrew version and `brew bump-formula-pr --tag … --revision … --no-fork --no-browse`. Pinning keeps generated formula bytes reproducible across interrupted runs. Homebrew updates the source tag and commit and removes an old formula `revision` when the upstream version changes.
 5. Derives the expected formula bytes with the same Homebrew tooling, then accepts only the exact expected tap repository, branch, pull request, file, blob, and head commit.
 6. Updates an otherwise exact stale pull request from tap `main`, waits for fresh copies of both exact required checks, and squash-merges only the pinned head with `--match-head-commit`.
